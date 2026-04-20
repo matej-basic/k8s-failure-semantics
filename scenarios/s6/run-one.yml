@@ -1,0 +1,134 @@
+---
+# scenarios/s6/run-one.yml
+# Executes one iteration of the repeat-run study.
+# Resets the cluster state, runs S2 fault injection, then captures the
+# final recovery state for comparison.
+
+- name: "S6 Run {{ run_number }} — Reset cluster to clean state"
+  hosts: k8s_cluster
+  gather_facts: no
+  tasks:
+    - name: Delete and recreate test deployments to reset ownership state
+      shell: |
+        kubectl delete deployment nginx-stateless --ignore-not-found
+        kubectl delete statefulset postgres-stateful --ignore-not-found
+        sleep 10
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Redeploy test workloads
+      include_role:
+        name: k8s-install
+        tasks_from: deploy-workloads.yml
+      when: inventory_hostname == groups['control_plane'][0]
+
+    - name: Wait for all pods to be Running
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=nginx-stateless \
+          --timeout=90s 2>/dev/null
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 3
+      delay: 10
+      register: r
+      until: r.rc == 0
+
+- name: "S6 Run {{ run_number }} — Pre-fault snapshot"
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    snapshot_label: pre_fault
+  roles:
+    - role: metrics-collect
+
+- name: "S6 Run {{ run_number }} — Inject asymmetric worker isolation"
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    fault_type: network_asymmetric
+    target_host: worker1
+    direction: outbound
+    peer_hosts:
+      - cp1
+      - cp2
+      - cp3
+  roles:
+    - role: fault-inject
+
+- name: "S6 Run {{ run_number }} — Wait for eviction window"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - pause:
+        seconds: 150   # enough to trigger node-not-ready + pod eviction
+
+- name: "S6 Run {{ run_number }} — Mid-fault snapshot"
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    snapshot_label: mid_fault
+  roles:
+    - role: metrics-collect
+
+- name: "S6 Run {{ run_number }} — Lift fault"
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: "S6 Run {{ run_number }} — Wait for convergence"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - pause:
+        seconds: 120
+
+- name: "S6 Run {{ run_number }} — Post-recovery snapshot"
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    snapshot_label: post_recovery
+  roles:
+    - role: metrics-collect
+
+- name: "S6 Run {{ run_number }} — Extract final state for comparison"
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tasks:
+    - name: Capture final pod placement
+      shell: |
+        kubectl get pods --all-namespaces -o json \
+          | jq '[.items[] | {name: .metadata.name, node: .spec.nodeName, phase: .status.phase}]'
+      register: final_pod_placement
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Capture final lease holder
+      shell: |
+        kubectl get lease kube-controller-manager -n kube-system -o json \
+          | jq '.spec.holderIdentity'
+      register: final_lease_holder
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Write run summary
+      copy:
+        dest: "{{ run_results_dir }}/run_summary.json"
+        content: |
+          {
+            "run_number": {{ run_number }},
+            "final_pod_placement": {{ final_pod_placement.stdout }},
+            "final_lease_holder": {{ final_lease_holder.stdout }}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"

@@ -1,0 +1,54 @@
+---
+# roles/fault-inject/tasks/network-flap.yml
+# Intermittently flap connectivity between target_host and peer_hosts
+# Used for S12 (leader election storm)
+#
+# target_host: host whose connectivity will flap
+# peer_hosts: hosts to flap connectivity toward
+# flap_interval: seconds between each toggle (default: 10)
+# flap_count: number of on/off cycles (default: 6)
+
+- name: Set flap defaults
+  set_fact:
+    flap_interval: "{{ flap_interval | default(10) }}"
+    flap_count: "{{ flap_count | default(6) }}"
+
+- name: Resolve peer IPs
+  set_fact:
+    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+
+- name: Install flap script on target host
+  copy:
+    dest: /tmp/flap-fault.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      PEER_IPS="{{ peer_ips | join(' ') }}"
+      INTERVAL={{ flap_interval }}
+      CYCLES={{ flap_count }}
+      TAG="fault-inject-flap-{{ scenario_id }}"
+
+      for i in $(seq 1 $CYCLES); do
+        echo "[$(date -u +%H:%M:%S)] Flap cycle $i/$CYCLES — BLOCKING"
+        for ip in $PEER_IPS; do
+          iptables -A OUTPUT -d $ip -j DROP -m comment --comment "$TAG"
+          iptables -A INPUT -s $ip -j DROP -m comment --comment "$TAG"
+        done
+        sleep $INTERVAL
+        echo "[$(date -u +%H:%M:%S)] Flap cycle $i/$CYCLES — UNBLOCKING"
+        iptables-save | grep -v "$TAG" | iptables-restore
+        sleep $INTERVAL
+      done
+      echo "[$(date -u +%H:%M:%S)] Flap sequence complete"
+  when: inventory_hostname == target_host
+
+- name: Run flap script in background on target host
+  shell: nohup /tmp/flap-fault.sh > /tmp/flap-fault.log 2>&1 &
+  async: 0
+  poll: 0
+  when: inventory_hostname == target_host
+
+- name: Log flap fault started
+  debug:
+    msg: "FAULT INJECTED: network flap on {{ target_host }} — {{ flap_count }} cycles of {{ flap_interval }}s each"
+  when: inventory_hostname == target_host

@@ -1,0 +1,39 @@
+---
+# roles/fault-inject/tasks/main.yml
+# Dispatcher — include the appropriate fault task file
+
+- name: Inject network partition fault
+  include_tasks: network-partition.yml
+  when: fault_type == 'network_partition'
+
+- name: Inject asymmetric network fault
+  include_tasks: network-asymmetric.yml
+  when: fault_type == 'network_asymmetric'
+
+- name: Inject network delay fault
+  include_tasks: network-delay.yml
+  when: fault_type == 'network_delay'
+
+- name: Inject network flap fault
+  include_tasks: network-flap.yml
+  when: fault_type == 'network_flap'
+
+- name: Inject etcd latency via Toxiproxy
+  include_tasks: etcd-latency.yml
+  when: fault_type == 'etcd_latency'
+
+- name: Inject clock skew
+  include_tasks: clock-skew.yml
+  when: fault_type == 'clock_skew'
+
+- name: Inject memory pressure
+  include_tasks: memory-pressure.yml
+  when: fault_type == 'memory_pressure'
+
+- name: Trigger etcd compaction
+  include_tasks: etcd-compact.yml
+  when: fault_type == 'etcd_compact'
+
+- name: Tear down all faults
+  include_tasks: teardown.yml
+  when: fault_type == 'teardown'

@@ -1,0 +1,65 @@
+---
+# roles/k8s-install/tasks/control-plane-init.yml
+# Initialises the first control plane node
+
+- name: Copy etcd CA to control plane
+  copy:
+    src: "/tmp/etcd-pki/ca.crt"
+    dest: /etc/kubernetes/pki/etcd/ca.crt
+    mode: '0644'
+  tags: k8s-init
+
+- name: Write kubeadm init config
+  template:
+    src: kubeadm-init.yml.j2
+    dest: /tmp/kubeadm-init.yml
+  tags: k8s-init
+
+- name: Run kubeadm init
+  command: kubeadm init --config /tmp/kubeadm-init.yml --upload-certs
+  register: kubeadm_init_output
+  args:
+    creates: /etc/kubernetes/admin.conf
+  tags: k8s-init
+
+- name: Set up kubeconfig for root
+  shell: |
+    mkdir -p $HOME/.kube
+    cp /etc/kubernetes/admin.conf $HOME/.kube/config
+    chown root:root $HOME/.kube/config
+  args:
+    creates: /root/.kube/config
+
+- name: Install Calico CNI
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: Save join command and certificate key for other nodes
+  shell: |
+    kubeadm token create --print-join-command > /tmp/worker-join.sh
+    kubeadm init phase upload-certs --upload-certs 2>/dev/null \
+      | tail -1 > /tmp/cert-key.txt
+  changed_when: true
+
+- name: Fetch join command to observer
+  fetch:
+    src: /tmp/worker-join.sh
+    dest: /tmp/worker-join.sh
+    flat: yes
+
+- name: Fetch cert key to observer
+  fetch:
+    src: /tmp/cert-key.txt
+    dest: /tmp/cert-key.txt
+    flat: yes
+
+- name: Fetch admin kubeconfig to observer
+  fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: /tmp/admin.conf
+    flat: yes
+
+- name: Deploy test workloads
+  include_tasks: deploy-workloads.yml

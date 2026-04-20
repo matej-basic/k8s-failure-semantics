@@ -1,0 +1,21 @@
+---
+# roles/k8s-install/tasks/main.yml
+# Bootstraps the HA Kubernetes cluster with external etcd
+
+- name: Include etcd bootstrap tasks
+  include_tasks: etcd.yml
+  when: inventory_hostname in groups['etcd']
+
+- name: Include control plane init tasks (first node only)
+  include_tasks: control-plane-init.yml
+  when: inventory_hostname == groups['control_plane'][0]
+
+- name: Include control plane join tasks (remaining nodes)
+  include_tasks: control-plane-join.yml
+  when:
+    - inventory_hostname in groups['control_plane']
+    - inventory_hostname != groups['control_plane'][0]
+
+- name: Include worker join tasks
+  include_tasks: worker-join.yml
+  when: inventory_hostname in groups['workers']

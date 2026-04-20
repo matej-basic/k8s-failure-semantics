@@ -1,0 +1,34 @@
+---
+# roles/fault-inject/tasks/network-partition.yml
+# Symmetric partition: DROP all traffic between target_host and peer_hosts
+
+# target_host: the host being isolated (inventory hostname)
+# peer_hosts: list of inventory hostnames to block traffic to/from
+# partition_ports: optional list of ports to restrict to (empty = all traffic)
+
+- name: Resolve peer IPs
+  set_fact:
+    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+
+- name: Block outbound traffic to peers
+  iptables:
+    chain: OUTPUT
+    destination: "{{ item }}"
+    jump: DROP
+    comment: "fault-inject-partition-{{ scenario_id }}"
+  loop: "{{ peer_ips }}"
+  when: inventory_hostname == target_host
+
+- name: Block inbound traffic from peers
+  iptables:
+    chain: INPUT
+    source: "{{ item }}"
+    jump: DROP
+    comment: "fault-inject-partition-{{ scenario_id }}"
+  loop: "{{ peer_ips }}"
+  when: inventory_hostname == target_host
+
+- name: Log partition injected
+  debug:
+    msg: "FAULT INJECTED: symmetric partition on {{ target_host }} isolating {{ peer_hosts | join(', ') }}"
+  when: inventory_hostname == target_host

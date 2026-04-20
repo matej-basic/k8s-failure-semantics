@@ -1,0 +1,167 @@
+---
+# scenarios/s2/playbook.yml
+# S2: Asymmetric worker isolation
+#
+# What it does:
+#   worker1 can receive traffic from the control plane, but cannot send
+#   traffic back to it. This is the classic "half-open" partition — the
+#   kubelet heartbeats time out on the control plane, but worker1 continues
+#   receiving (and accepting) pod placements.
+#
+# What we measure:
+#   - Whether the control plane marks worker1 NotReady despite it being alive
+#   - Whether pods on worker1 continue running after the node is declared failed
+#   - Whether pods are rescheduled to other nodes while originals still run (I1)
+#   - Whether endpoints still include worker1's pods after eviction (I2, I3)
+#   - Divergence between kubelet local belief and control-plane belief
+
+- name: S2 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s2
+    scenario_name: "Asymmetric worker isolation"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Verify cluster is healthy
+      shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+      register: not_ready_count
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready_count.stdout | int > 0
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Record which pods are running on worker1 before fault
+      shell: |
+        kubectl get pods --all-namespaces \
+          --field-selector spec.nodeName=worker1 -o json \
+          | jq '[.items[] | {name: .metadata.name, namespace: .metadata.namespace, phase: .status.phase}]'
+      register: worker1_pods_prefault
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save pre-fault pod list
+      copy:
+        dest: "{{ results_dir }}/worker1_pods_prefault.json"
+        content: "{{ worker1_pods_prefault.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S2 — Inject outbound block on worker1 (cannot reach control plane)
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s2
+    fault_type: network_asymmetric
+    target_host: worker1
+    direction: outbound
+    peer_hosts:
+      - cp1
+      - cp2
+      - cp3
+      - etcd1
+      - etcd2
+      - etcd3
+  roles:
+    - role: fault-inject
+
+- name: S2 — Poll observer state every 30s during fault window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_60 }
+
+    # node-monitor-grace-period is 40s by default — by t+60 the node
+    # should be marked NotReady. By t+120 eviction should begin.
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_120 }
+
+    # Capture state at eviction window
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_180 }
+
+- name: S2 — Check for dual ownership (pods still running on worker1 AND rescheduled)
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  tasks:
+    - name: List actually-running containers on worker1 during partition
+      shell: crictl ps -o json | jq '[.containers[] | {name: .metadata.name, state: .state}]'
+      register: worker1_actual_containers
+
+    - name: Save worker1 actual container state
+      copy:
+        dest: "{{ results_dir }}/worker1_actual_containers_during_fault.json"
+        content: "{{ worker1_actual_containers.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S2 — Tear down asymmetric block
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s2
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S2 — Post-fault recovery snapshots
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t30 }
+
+    - pause: { seconds: 90 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t120 }
+
+    - pause: { seconds: 120 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t240 }
+
+- name: S2 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"

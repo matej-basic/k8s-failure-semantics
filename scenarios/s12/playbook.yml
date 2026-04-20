@@ -1,0 +1,191 @@
+---
+# scenarios/s12/playbook.yml
+# S12: Leader election storm under intermittent connectivity
+#
+# What it does:
+#   Scripts flapping iptables rules on cp1's connection to cp2 and cp3.
+#   Connectivity drops for 10s, recovers for 10s, 6 cycles (2 minutes total).
+#   Each reconnect re-triggers lease competition between controller-manager
+#   instances on the three control-plane nodes.
+#
+# What we measure:
+#   - Number of distinct lease holders observed over the fault window (I1)
+#   - Whether two nodes simultaneously believe they hold the lease
+#   - Whether controller-manager takes duplicate actions during lease churn
+#   - Event storm rate correlated to each flap cycle
+#   - Whether any lease ends up in an un-renewed stuck state
+
+- name: S12 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s12
+    scenario_name: "Leader election storm under intermittent connectivity"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Record initial lease holders
+      shell: |
+        kubectl get leases -n kube-system -o json \
+          | jq '[.items[] | {name: .metadata.name, holder: .spec.holderIdentity, renewTime: .spec.renewTime}]'
+      register: initial_leases
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save initial leases
+      copy:
+        dest: "{{ results_dir }}/leases_initial.json"
+        content: "{{ initial_leases.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S12 — Start continuous lease watch on observer
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s12
+  tasks:
+    - name: Install lease watcher script
+      copy:
+        dest: /tmp/lease-watch.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          OUT="{{ results_dir }}/lease_watch.jsonl"
+          export KUBECONFIG=/tmp/admin.conf
+          while true; do
+            CM=$(kubectl get lease kube-controller-manager -n kube-system \
+              -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)
+            SCHED=$(kubectl get lease kube-scheduler -n kube-system \
+              -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)
+            echo "{\"ts\": \"$(date -u +%H:%M:%S)\", \"cm_holder\": \"$CM\", \"sched_holder\": \"$SCHED\"}" >> $OUT
+            sleep 2
+          done
+
+    - name: Start lease watcher in background
+      shell: nohup /tmp/lease-watch.sh > /dev/null 2>&1 &
+      async: 0
+      poll: 0
+
+- name: S12 — Inject intermittent connectivity flap on cp1
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s12
+    fault_type: network_flap
+    target_host: cp1
+    peer_hosts:
+      - cp2
+      - cp3
+    flap_interval: 10
+    flap_count: 6
+  roles:
+    - role: fault-inject
+
+- name: S12 — Observe during and immediately after flap sequence
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s12
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: flap_t30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: flap_t60 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: flap_t90 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: flap_t120 }
+
+    # Wait for flap sequence to complete (6 cycles × 20s = 120s total)
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_flap_t30 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_flap_t90 }
+
+- name: S12 — Stop lease watcher and analyze
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s12
+  tasks:
+    - name: Stop lease watcher
+      shell: pkill -f lease-watch.sh 2>/dev/null || true
+
+    - name: Analyze lease holder changes from watch log
+      shell: |
+        cat {{ results_dir }}/lease_watch.jsonl \
+          | jq -s '
+            . as $all |
+            {
+              total_samples: length,
+              distinct_cm_holders: ([.[].cm_holder] | unique),
+              cm_holder_changes: (
+                reduce range(1; length) as $i (
+                  0;
+                  if $all[$i].cm_holder != $all[$i-1].cm_holder then . + 1 else . end
+                )
+              ),
+              distinct_sched_holders: ([.[].sched_holder] | unique),
+              sched_holder_changes: (
+                reduce range(1; length) as $i (
+                  0;
+                  if $all[$i].sched_holder != $all[$i-1].sched_holder then . + 1 else . end
+                )
+              )
+            }'
+      register: lease_analysis
+
+    - name: Save lease analysis
+      copy:
+        dest: "{{ results_dir }}/lease_analysis.json"
+        content: "{{ lease_analysis.stdout }}"
+
+- name: S12 — Tear down any residual fault rules
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s12
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S12 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s12
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

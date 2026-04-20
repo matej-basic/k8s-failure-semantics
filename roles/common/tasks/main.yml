@@ -1,0 +1,183 @@
+---
+# roles/common/tasks/main.yml
+# Installs all prerequisites on every cluster host
+
+- name: Disable swap
+  command: swapoff -a
+  changed_when: false
+
+- name: Disable swap permanently
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\sswap\s.*)$'
+    replace: '# \1'
+
+- name: Load required kernel modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Persist kernel modules
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+- name: Set sysctl params for Kubernetes
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { key: net.bridge.bridge-nf-call-iptables,  value: 1 }
+    - { key: net.bridge.bridge-nf-call-ip6tables, value: 1 }
+    - { key: net.ipv4.ip_forward,                 value: 1 }
+
+- name: Install base packages
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - iproute2
+      - iptables
+      - ipset
+      - jq
+      - python3
+      - python3-pip
+      - net-tools
+      - tcpdump
+      - stress-ng
+      - chrony
+      - ntp
+    state: present
+    update_cache: yes
+
+- name: Install containerd
+  apt:
+    name: containerd
+    state: present
+
+- name: Configure containerd
+  shell: |
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Enable and start containerd
+  systemd:
+    name: containerd
+    enabled: yes
+    state: started
+
+- name: Add Kubernetes apt repository key
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes apt repository
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+
+- name: Install kubeadm, kubelet, kubectl
+  apt:
+    name:
+      - "kubelet={{ k8s_version }}-*"
+      - "kubeadm={{ k8s_version }}-*"
+      - "kubectl={{ k8s_version }}-*"
+    state: present
+    update_cache: yes
+
+- name: Hold Kubernetes packages at current version
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Install etcdctl
+  shell: |
+    ETCD_VER={{ etcd_version }}
+    curl -fsSL https://github.com/etcd-io/etcd/releases/download/v${ETCD_VER}/etcd-v${ETCD_VER}-linux-amd64.tar.gz \
+      | tar xz -C /tmp
+    mv /tmp/etcd-v${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/etcdctl
+    chmod +x /usr/local/bin/etcdctl
+  args:
+    creates: /usr/local/bin/etcdctl
+
+- name: Install Toxiproxy server and CLI
+  shell: |
+    curl -fsSL https://github.com/Shopify/toxiproxy/releases/download/v2.7.0/toxiproxy-server-linux-amd64 \
+      -o /usr/local/bin/toxiproxy-server
+    curl -fsSL https://github.com/Shopify/toxiproxy/releases/download/v2.7.0/toxiproxy-cli-linux-amd64 \
+      -o /usr/local/bin/toxiproxy-cli
+    chmod +x /usr/local/bin/toxiproxy-server /usr/local/bin/toxiproxy-cli
+  args:
+    creates: /usr/local/bin/toxiproxy-server
+
+- name: Install Toxiproxy systemd service
+  copy:
+    dest: /etc/systemd/system/toxiproxy.service
+    content: |
+      [Unit]
+      Description=Toxiproxy
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/toxiproxy-server -host 0.0.0.0 -port {{ toxiproxy_api_port }}
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Install node_exporter for Prometheus
+  shell: |
+    curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz \
+      | tar xz -C /tmp
+    mv /tmp/node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+    chmod +x /usr/local/bin/node_exporter
+  args:
+    creates: /usr/local/bin/node_exporter
+
+- name: Install node_exporter systemd service
+  copy:
+    dest: /etc/systemd/system/node_exporter.service
+    content: |
+      [Unit]
+      Description=Prometheus Node Exporter
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/node_exporter
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start node_exporter
+  systemd:
+    name: node_exporter
+    daemon_reload: yes
+    enabled: yes
+    state: started
+
+- name: Create results directory
+  file:
+    path: "{{ results_base }}"
+    state: directory
+    mode: '0755'

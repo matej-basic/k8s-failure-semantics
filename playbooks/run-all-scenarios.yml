@@ -1,0 +1,150 @@
+---
+# playbooks/run-all-scenarios.yml
+# Runs all scenarios in sequence with pre-flight health checks between each.
+# Pass --tags "s1,s3,s11" to run a subset.
+
+- name: Pre-run cluster health check
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tags: always
+  tasks:
+    - name: All nodes must be Ready before any scenario starts
+      shell: |
+        NOT_READY=$(kubectl get nodes --no-headers | grep -v " Ready" | wc -l)
+        echo $NOT_READY
+      register: not_ready
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready.stdout | int > 0
+
+    - name: etcd must be healthy
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint health --write-out=table
+      delegate_to: "{{ groups['etcd'][0] }}"
+
+- name: S1 — Symmetric control-plane partition
+  import_playbook: ../scenarios/s1/playbook.yml
+  tags: s1
+
+- name: Post-S1 health check
+  import_playbook: _health-check.yml
+  tags: s1
+
+- name: S2 — Asymmetric worker isolation
+  import_playbook: ../scenarios/s2/playbook.yml
+  tags: s2
+
+- name: Post-S2 health check
+  import_playbook: _health-check.yml
+  tags: s2
+
+- name: S3 — etcd write-latency degradation
+  import_playbook: ../scenarios/s3/playbook.yml
+  tags: s3
+
+- name: Post-S3 health check
+  import_playbook: _health-check.yml
+  tags: s3
+
+- name: S4 — Clock skew on control plane
+  import_playbook: ../scenarios/s4/playbook.yml
+  tags: s4
+
+- name: Post-S4 health check
+  import_playbook: _health-check.yml
+  tags: s4
+
+- name: S5 — API disruption under multiple controllers
+  import_playbook: ../scenarios/s5/playbook.yml
+  tags: s5
+
+- name: Post-S5 health check
+  import_playbook: _health-check.yml
+  tags: s5
+
+- name: S6 — Repeat-run recovery study
+  import_playbook: ../scenarios/s6/playbook.yml
+  tags: s6
+
+- name: Post-S6 health check
+  import_playbook: _health-check.yml
+  tags: s6
+
+- name: S8 — Partition + storage lag (composed)
+  import_playbook: ../scenarios/s8/playbook.yml
+  tags: s8
+
+- name: Post-S8 health check
+  import_playbook: _health-check.yml
+  tags: s8
+
+- name: S11 — Kubelet partition with pod lifecycle divergence
+  import_playbook: ../scenarios/s11/playbook.yml
+  tags: s11
+
+- name: Post-S11 health check
+  import_playbook: _health-check.yml
+  tags: s11
+
+- name: S12 — Leader election storm
+  import_playbook: ../scenarios/s12/playbook.yml
+  tags: s12
+
+- name: Post-S12 health check
+  import_playbook: _health-check.yml
+  tags: s12
+
+- name: S15 — Graceful termination race
+  import_playbook: ../scenarios/s15/playbook.yml
+  tags: s15
+
+- name: Post-S15 health check
+  import_playbook: _health-check.yml
+  tags: s15
+
+- name: S17 — etcd compaction + watch history gap
+  import_playbook: ../scenarios/s17/playbook.yml
+  tags: s17
+
+- name: Post-S17 health check
+  import_playbook: _health-check.yml
+  tags: s17
+
+- name: S18 — Node pressure eviction race
+  import_playbook: ../scenarios/s18/playbook.yml
+  tags: s18
+
+- name: Post-S18 health check
+  import_playbook: _health-check.yml
+  tags: s18
+
+- name: S19 — Split etcd quorum
+  import_playbook: ../scenarios/s19/playbook.yml
+  tags: s19
+
+- name: Post-S19 health check
+  import_playbook: _health-check.yml
+  tags: s19
+
+- name: Generate combined results report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  tags: always
+  tasks:
+    - name: Run cross-scenario analysis
+      script: ../scripts/aggregate-results.sh {{ results_base }}
+      register: aggregate_report
+
+    - name: Save aggregate report
+      copy:
+        dest: "{{ results_base }}/aggregate_report.json"
+        content: "{{ aggregate_report.stdout }}"
+
+    - name: Print summary
+      debug:
+        msg: "All scenarios complete. Results in {{ results_base }}"

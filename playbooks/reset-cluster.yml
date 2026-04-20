@@ -1,0 +1,78 @@
+---
+# playbooks/reset-cluster.yml
+# Hard-resets the entire cluster back to a clean state.
+# Use after a scenario leaves the cluster unrecoverable.
+# Does NOT re-provision — just resets kubeadm and reruns the install role.
+
+- name: Tear down all fault injections first
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: reset
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: Reset Kubernetes on all cluster nodes
+  hosts: k8s_cluster
+  gather_facts: no
+  tasks:
+    - name: Run kubeadm reset
+      shell: kubeadm reset --force
+      ignore_errors: yes
+
+    - name: Flush iptables completely
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+
+    - name: Remove CNI config
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/cni/net.d
+        - /opt/cni/bin
+      ignore_errors: yes
+
+    - name: Remove kubelet state
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/kubelet
+        - /etc/kubernetes
+      ignore_errors: yes
+
+- name: Reset etcd data
+  hosts: etcd
+  gather_facts: no
+  tasks:
+    - name: Stop etcd
+      systemd:
+        name: etcd
+        state: stopped
+      ignore_errors: yes
+
+    - name: Wipe etcd data directory
+      file:
+        path: "{{ etcd_data_dir }}"
+        state: absent
+
+    - name: Recreate etcd data directory
+      file:
+        path: "{{ etcd_data_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Restart etcd
+      systemd:
+        name: etcd
+        state: started
+
+- name: Re-bootstrap cluster
+  import_playbook: setup-cluster.yml

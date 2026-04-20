@@ -1,0 +1,126 @@
+---
+# roles/k8s-install/tasks/deploy-workloads.yml
+# Deploys the standard stateless and stateful workloads used by all scenarios
+
+- name: Deploy stateless nginx workload
+  shell: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: nginx-stateless
+      namespace: default
+      labels:
+        app: nginx-stateless
+    spec:
+      replicas: 3
+      selector:
+        matchLabels:
+          app: nginx-stateless
+      template:
+        metadata:
+          labels:
+            app: nginx-stateless
+        spec:
+          terminationGracePeriodSeconds: 30
+          containers:
+          - name: nginx
+            image: nginx:1.25
+            ports:
+            - containerPort: 80
+            readinessProbe:
+              httpGet:
+                path: /
+                port: 80
+              initialDelaySeconds: 5
+              periodSeconds: 5
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: nginx-stateless
+      namespace: default
+    spec:
+      selector:
+        app: nginx-stateless
+      ports:
+      - port: 80
+        targetPort: 80
+    EOF
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: Deploy stateful PostgreSQL workload
+  shell: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: postgres-config
+      namespace: default
+    data:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: postgres-stateful
+      namespace: default
+    spec:
+      serviceName: postgres-stateful
+      replicas: 1
+      selector:
+        matchLabels:
+          app: postgres-stateful
+      template:
+        metadata:
+          labels:
+            app: postgres-stateful
+        spec:
+          terminationGracePeriodSeconds: 60
+          containers:
+          - name: postgres
+            image: postgres:15
+            ports:
+            - containerPort: 5432
+            envFrom:
+            - configMapRef:
+                name: postgres-config
+            volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumeClaimTemplates:
+      - metadata:
+          name: data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: postgres-stateful
+      namespace: default
+    spec:
+      clusterIP: None
+      selector:
+        app: postgres-stateful
+      ports:
+      - port: 5432
+    EOF
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: Wait for stateless deployment to be ready
+  shell: |
+    kubectl rollout status deployment/nginx-stateless --timeout=120s
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  retries: 3
+  delay: 10
+  register: result
+  until: result.rc == 0

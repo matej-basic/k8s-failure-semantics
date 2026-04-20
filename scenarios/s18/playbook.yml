@@ -1,0 +1,222 @@
+---
+# scenarios/s18/playbook.yml
+# S18: Node pressure eviction vs controller rescheduling race
+#
+# What it does:
+#   Applies memory pressure on worker3 using stress-ng to trigger kubelet
+#   memory-pressure eviction. Simultaneously, the controller-manager watches
+#   the same pods and may attempt to reschedule them based on its own
+#   (slightly delayed) node-condition view.
+#
+# What we measure:
+#   - Whether eviction-driven pod deletion and controller-driven rescheduling
+#     race to produce duplicate placements (I1)
+#   - Time between kubelet eviction and controller-manager becoming aware
+#   - Whether the rescheduled pods land on already-pressured nodes
+#   - Whether endpoint state is consistent during the eviction/reschedule window
+#   - Node condition transition timing (MemoryPressure → NotReady → Ready)
+
+- name: S18 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s18
+    scenario_name: "Node pressure eviction vs controller rescheduling race"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Ensure test pods are running and spread across workers
+      shell: |
+        kubectl get pods -l app=nginx-stateless -o json \
+          | jq '[.items[] | {name: .metadata.name, node: .spec.nodeName}]'
+      register: pod_spread
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Record memory available on worker3
+      shell: |
+        free -m | jq -Rn 'input | split("\n") | .[1] | split(" ") | map(select(. != "")) |
+          {total: .[1]|tonumber, used: .[2]|tonumber, available: .[6]|tonumber}'
+      register: worker3_mem
+      ignore_errors: yes
+
+    - name: Save pre-fault state
+      copy:
+        dest: "{{ results_dir }}/prefault_state.json"
+        content: |
+          {
+            "pod_spread": {{ pod_spread.stdout }},
+            "worker3_memory_mb": {{ worker3_mem.stdout | default('null') }}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S18 — Start continuous pod placement watcher on observer
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - name: Install pod watcher script
+      copy:
+        dest: /tmp/pod-watch.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          OUT="{{ results_dir }}/pod_placement_watch.jsonl"
+          export KUBECONFIG=/tmp/admin.conf
+          while true; do
+            kubectl get pods -l app=nginx-stateless -o json 2>/dev/null \
+              | jq --arg ts "$(date -u +%H:%M:%S)" \
+                '{ts: $ts, pods: [.items[] | {name: .metadata.name, node: .spec.nodeName, phase: .status.phase}]}' \
+              >> $OUT
+            sleep 1
+          done
+
+    - name: Start pod watcher
+      shell: nohup /tmp/pod-watch.sh > /dev/null 2>&1 &
+      async: 0
+      poll: 0
+
+- name: S18 — Inject memory pressure on worker3
+  hosts: worker3
+  gather_facts: no
+  vars:
+    scenario_id: s18
+    fault_type: memory_pressure
+    target_host: worker3
+    duration_seconds: 120
+  roles:
+    - role: fault-inject
+
+- name: S18 — Observe eviction and rescheduling race
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - pause: { seconds: 20 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: pressure_t20 }
+
+    - pause: { seconds: 20 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: pressure_t40 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: pressure_t70 }
+
+    - pause: { seconds: 50 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: pressure_t120 }
+
+- name: S18 — Check for duplicate pod instances during pressure window
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - name: Count total nginx pod instances (should be exactly 3)
+      shell: |
+        kubectl get pods -l app=nginx-stateless --all-namespaces -o json \
+          | jq '{
+              total: .items | length,
+              by_node: [.items | group_by(.spec.nodeName)[] |
+                {node: .[0].spec.nodeName, count: length}],
+              by_phase: [.items | group_by(.status.phase)[] |
+                {phase: .[0].status.phase, count: length}]
+            }'
+      register: pod_count_check
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save pod count check
+      copy:
+        dest: "{{ results_dir }}/pod_count_during_pressure.json"
+        content: "{{ pod_count_check.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S18 — Wait for stress-ng to finish and worker3 to recover
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - pause:
+        seconds: 60
+
+- name: S18 — Post-pressure recovery snapshots
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_pressure_t0 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_pressure_t60 }
+
+- name: S18 — Stop pod watcher and analyze placement history
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - shell: pkill -f pod-watch.sh 2>/dev/null || true
+
+    - name: Analyze pod placement timeline for duplicates
+      shell: |
+        cat {{ results_dir }}/pod_placement_watch.jsonl \
+          | jq -s '[.[] | {ts: .ts, total_pods: (.pods | length),
+                            nodes_with_multiple: ([.pods | group_by(.node)[] |
+                              select(length > 1) | .[0].node])}]
+                  | {
+                      max_concurrent_pods: (map(.total_pods) | max),
+                      timestamps_with_extras: [.[] | select(.total_pods > 3) | .ts],
+                      nodes_ever_doubled: ([.[].nodes_with_multiple[]] | unique)
+                    }'
+      register: placement_analysis
+
+    - name: Save placement analysis
+      copy:
+        dest: "{{ results_dir }}/placement_analysis.json"
+        content: "{{ placement_analysis.stdout }}"
+
+- name: S18 — Clean up stress-ng if still running
+  hosts: worker3
+  gather_facts: no
+  vars:
+    scenario_id: s18
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S18 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s18
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

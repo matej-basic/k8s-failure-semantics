@@ -1,0 +1,43 @@
+---
+# roles/fault-inject/tasks/network-asymmetric.yml
+# One-way block: target_host cannot reach peer_hosts, but peer_hosts can reach target_host
+# This simulates the asymmetric isolation scenario (S2, S3)
+
+# target_host: the host that loses outbound reachability
+# peer_hosts: list of hosts that become unreachable from target_host
+# direction: 'outbound' (default) | 'inbound'
+
+- name: Set default direction
+  set_fact:
+    direction: "{{ direction | default('outbound') }}"
+
+- name: Resolve peer IPs
+  set_fact:
+    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+
+- name: Block outbound traffic only (asymmetric — target cannot reach peers)
+  iptables:
+    chain: OUTPUT
+    destination: "{{ item }}"
+    jump: DROP
+    comment: "fault-inject-asymmetric-{{ scenario_id }}"
+  loop: "{{ peer_ips }}"
+  when:
+    - inventory_hostname == target_host
+    - direction == 'outbound'
+
+- name: Block inbound traffic only (asymmetric — peers cannot reach target)
+  iptables:
+    chain: INPUT
+    source: "{{ item }}"
+    jump: DROP
+    comment: "fault-inject-asymmetric-{{ scenario_id }}"
+  loop: "{{ peer_ips }}"
+  when:
+    - inventory_hostname == target_host
+    - direction == 'inbound'
+
+- name: Log asymmetric fault injected
+  debug:
+    msg: "FAULT INJECTED: asymmetric {{ direction }} block on {{ target_host }} toward {{ peer_hosts | join(', ') }}"
+  when: inventory_hostname == target_host

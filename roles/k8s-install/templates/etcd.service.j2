@@ -1,0 +1,34 @@
+[Unit]
+Description=etcd
+Documentation=https://github.com/etcd-io/etcd
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/etcd \
+  --name={{ inventory_hostname }} \
+  --data-dir={{ etcd_data_dir }} \
+  --listen-client-urls=https://0.0.0.0:2379 \
+  --advertise-client-urls=https://{{ ansible_host }}:2379 \
+  --listen-peer-urls=https://0.0.0.0:2380 \
+  --initial-advertise-peer-urls=https://{{ ansible_host }}:2380 \
+  --initial-cluster={% for host in groups['etcd'] %}{{ host }}=https://{{ hostvars[host]['ansible_host'] }}:2380{% if not loop.last %},{% endif %}{% endfor %} \
+  --initial-cluster-token=k8s-etcd-cluster \
+  --initial-cluster-state=new \
+  --cert-file={{ etcd_cert_dir }}/server.crt \
+  --key-file={{ etcd_cert_dir }}/server.key \
+  --client-cert-auth=true \
+  --trusted-ca-file={{ etcd_cert_dir }}/ca.crt \
+  --peer-cert-file={{ etcd_cert_dir }}/peer.crt \
+  --peer-key-file={{ etcd_cert_dir }}/peer.key \
+  --peer-client-cert-auth=true \
+  --peer-trusted-ca-file={{ etcd_cert_dir }}/ca.crt \
+  --auto-compaction-retention=8 \
+  --metrics=extensive \
+  --listen-metrics-urls=http://0.0.0.0:2381
+Restart=always
+RestartSec=10s
+LimitNOFILE=40000
+
+[Install]
+WantedBy=multi-user.target

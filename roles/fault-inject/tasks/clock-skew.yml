@@ -1,0 +1,34 @@
+---
+# roles/fault-inject/tasks/clock-skew.yml
+# Inject clock skew on target_host by stopping NTP and manually advancing/skewing the clock
+#
+# target_host: host to skew
+# skew_seconds: amount to advance clock by (default: 120 — enough to break leases)
+# restore_on_teardown: whether teardown should sync clock back (default: true)
+
+- name: Set skew defaults
+  set_fact:
+    skew_seconds: "{{ skew_seconds | default(120) }}"
+
+- name: Stop chrony/NTP to allow manual clock manipulation
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - chrony
+    - ntp
+    - systemd-timesyncd
+  ignore_errors: yes
+  when: inventory_hostname == target_host
+
+- name: Advance system clock by skew_seconds
+  shell: |
+    current=$(date +%s)
+    new=$((current + {{ skew_seconds }}))
+    date -s "@${new}"
+  when: inventory_hostname == target_host
+
+- name: Log clock skew injected
+  debug:
+    msg: "FAULT INJECTED: clock advanced by {{ skew_seconds }}s on {{ target_host }}"
+  when: inventory_hostname == target_host

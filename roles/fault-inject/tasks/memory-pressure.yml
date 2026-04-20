@@ -1,0 +1,30 @@
+---
+# roles/fault-inject/tasks/memory-pressure.yml
+# Inject memory pressure on a worker node to trigger kubelet eviction
+# Used for S18 (node pressure eviction vs controller rescheduling race)
+#
+# target_host: worker node to pressurise
+# memory_bytes: bytes to allocate (default: 90% of available RAM)
+# duration_seconds: how long to hold pressure (default: fault_duration)
+
+- name: Set memory pressure defaults
+  set_fact:
+    duration_seconds: "{{ duration_seconds | default(fault_duration) }}"
+
+- name: Get available memory on target
+  shell: awk '/MemAvailable/ {print int($2 * 0.85) "K"}' /proc/meminfo
+  register: avail_mem
+  when: inventory_hostname == target_host
+
+- name: Run stress-ng memory stressor in background
+  shell: |
+    nohup stress-ng --vm 1 --vm-bytes {{ avail_mem.stdout }} \
+      --vm-method zero-one --timeout {{ duration_seconds }}s \
+      > /tmp/stress-ng.log 2>&1 &
+    echo $! > /tmp/stress-ng.pid
+  when: inventory_hostname == target_host
+
+- name: Log memory pressure injected
+  debug:
+    msg: "FAULT INJECTED: memory pressure (~85% RAM) on {{ target_host }} for {{ duration_seconds }}s"
+  when: inventory_hostname == target_host

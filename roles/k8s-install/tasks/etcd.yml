@@ -1,0 +1,100 @@
+---
+# roles/k8s-install/tasks/etcd.yml
+# Bootstraps the external etcd cluster
+
+- name: Create etcd directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0700'
+  loop:
+    - /etc/etcd/pki
+    - /var/lib/etcd
+
+- name: Generate etcd CA (on first etcd node only)
+  when: inventory_hostname == groups['etcd'][0]
+  shell: |
+    cd /etc/etcd/pki
+    # CA
+    openssl genrsa -out ca.key 4096
+    openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 \
+      -subj "/CN=etcd-ca" -out ca.crt
+    # Server cert (SANs for all etcd members)
+    openssl genrsa -out server.key 4096
+    openssl req -new -key server.key \
+      -subj "/CN=etcd-server" -out server.csr \
+      -config <(cat /etc/ssl/openssl.cnf <(printf "[SAN]\nsubjectAltName=IP:127.0.0.1,{% for host in groups['etcd'] %}IP:{{ hostvars[host]['ansible_host'] }},{% endfor %}IP:{{ api_vip }}"))
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+      -CAcreateserial -out server.crt -days 365 -sha256 \
+      -extfile <(printf "subjectAltName=IP:127.0.0.1,{% for host in groups['etcd'] %}IP:{{ hostvars[host]['ansible_host'] }},{% endfor %}IP:{{ api_vip }}")
+    # Peer cert
+    openssl genrsa -out peer.key 4096
+    openssl req -new -key peer.key -subj "/CN=etcd-peer" -out peer.csr
+    openssl x509 -req -in peer.csr -CA ca.crt -CAkey ca.key \
+      -CAcreateserial -out peer.crt -days 365 -sha256
+  args:
+    creates: /etc/etcd/pki/ca.crt
+
+- name: Fetch etcd CA and certs from first etcd node
+  when: inventory_hostname == groups['etcd'][0]
+  fetch:
+    src: "/etc/etcd/pki/{{ item }}"
+    dest: "/tmp/etcd-pki/{{ item }}"
+    flat: yes
+  loop:
+    - ca.crt
+    - ca.key
+    - server.crt
+    - server.key
+    - peer.crt
+    - peer.key
+
+- name: Distribute etcd certs to other etcd nodes
+  when: inventory_hostname != groups['etcd'][0]
+  copy:
+    src: "/tmp/etcd-pki/{{ item }}"
+    dest: "/etc/etcd/pki/{{ item }}"
+    mode: '0600'
+  loop:
+    - ca.crt
+    - ca.key
+    - server.crt
+    - server.key
+    - peer.crt
+    - peer.key
+
+- name: Install etcd binary
+  shell: |
+    ETCD_VER={{ etcd_version }}
+    curl -fsSL https://github.com/etcd-io/etcd/releases/download/v${ETCD_VER}/etcd-v${ETCD_VER}-linux-amd64.tar.gz \
+      | tar xz -C /tmp
+    mv /tmp/etcd-v${ETCD_VER}-linux-amd64/etcd /usr/local/bin/etcd
+    chmod +x /usr/local/bin/etcd
+  args:
+    creates: /usr/local/bin/etcd
+
+- name: Write etcd systemd service
+  template:
+    src: etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+    mode: '0644'
+
+- name: Enable and start etcd
+  systemd:
+    name: etcd
+    daemon_reload: yes
+    enabled: yes
+    state: started
+
+- name: Wait for etcd to be healthy
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints=https://{{ ansible_host }}:2379 \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      endpoint health
+  register: etcd_health
+  retries: 12
+  delay: 10
+  until: etcd_health.rc == 0

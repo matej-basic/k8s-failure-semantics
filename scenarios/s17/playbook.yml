@@ -1,0 +1,258 @@
+---
+# scenarios/s17/playbook.yml
+# S17: etcd compaction + watch history gap
+#
+# What it does:
+#   1. Isolates the controller-manager on cp1 from etcd (port 2379 blocked)
+#   2. Waits for cp1's informer watch streams to fall behind
+#   3. Triggers a manual etcd compact + defrag at the current revision
+#      (invalidating any resume tokens cp1 holds)
+#   4. Restores connectivity — cp1's controller-manager gets an
+#      ERR_COMPACTED error and must relist
+#   5. Measures what cp1 does during and after the forced relist window
+#
+# What we measure:
+#   - Whether cp1 emits duplicate reconcile actions during relist (I5)
+#   - How long the relist takes (revision catch-up time)
+#   - Whether any object is reconciled against a pre-compaction version
+#   - Whether the forced relist causes a write storm (amplification)
+#   - Whether invariants hold throughout the relist window
+
+- name: S17 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s17
+    scenario_name: "etcd compaction + watch history gap"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Record initial etcd revision
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint status --write-out=json | jq '.[0].Status.header.revision'
+      register: initial_revision
+      delegate_to: "{{ groups['etcd'][0] }}"
+      run_once: true
+
+    - name: Save initial revision
+      copy:
+        dest: "{{ results_dir }}/initial_revision.txt"
+        content: "{{ initial_revision.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S17 — Start API write pump to advance etcd revision rapidly
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - name: Install revision pump script
+      copy:
+        dest: /tmp/rev-pump.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          for i in $(seq 1 200); do
+            kubectl annotate configmap kube-proxy -n kube-system \
+              "pump-$i=$(date +%s%N)" --overwrite 2>/dev/null || true
+            sleep 0.1
+          done
+          echo "pump complete"
+
+    - name: Run revision pump in background
+      shell: nohup /tmp/rev-pump.sh > /tmp/rev-pump.log 2>&1 &
+      async: 0
+      poll: 0
+
+    - pause:
+        seconds: 10
+
+- name: S17 — Isolate cp1 controller-manager from etcd
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s17
+    isolate_host: cp1
+    fault_type: etcd_compact
+  tasks:
+    - name: Block cp1 outbound to etcd port 2379
+      iptables:
+        chain: OUTPUT
+        protocol: tcp
+        destination_port: 2379
+        destination: "{{ item }}"
+        jump: DROP
+        comment: "fault-inject-compact-{{ scenario_id }}"
+      loop: "{{ groups['etcd'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+    - debug:
+        msg: "cp1 isolated from etcd — watch streams will fall behind"
+
+- name: S17 — Wait for watch stream to fall behind, then compact
+  hosts: "{{ groups['etcd'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - pause:
+        seconds: 20
+
+    - name: Get current revision for compaction
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint status --write-out=json | jq '.[0].Status.header.revision'
+      register: compact_revision
+
+    - name: Compact etcd at current revision
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          compact {{ compact_revision.stdout }}
+
+    - name: Defragment all etcd members
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints=https://{{ hostvars[item]['ansible_host'] }}:2379 \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          defrag
+      loop: "{{ groups['etcd'] }}"
+
+    - name: Save compact revision
+      copy:
+        dest: "{{ results_dir }}/compact_revision.txt"
+        content: "{{ compact_revision.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+    - debug:
+        msg: "etcd compacted at revision {{ compact_revision.stdout }}"
+
+- name: S17 — Take snapshot while cp1 is still isolated (pre-reconnect)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s17
+    snapshot_label: pre_reconnect
+  roles:
+    - role: metrics-collect
+
+- name: S17 — Restore cp1 etcd connectivity and capture relist behavior
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - name: Record reconnect timestamp
+      set_fact:
+        reconnect_ts: "{{ lookup('pipe', 'date -u +%H:%M:%S.%3N') }}"
+
+    - name: Remove iptables block
+      shell: |
+        iptables-save | grep -v "fault-inject-compact-{{ scenario_id }}" \
+          | iptables-restore
+
+    - name: Save reconnect timestamp
+      copy:
+        dest: "{{ results_dir }}/reconnect_ts.txt"
+        content: "{{ reconnect_ts }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S17 — Observe relist window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - pause: { seconds: 10 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: relist_t10 }
+
+    - pause: { seconds: 20 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: relist_t30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: relist_t60 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: relist_t120 }
+
+- name: S17 — Check controller-manager logs on cp1 for relist events
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - name: Extract relist/ERR_COMPACTED log lines from kube-controller-manager
+      shell: |
+        journalctl -u kubelet --since "5 minutes ago" 2>/dev/null \
+          | grep -i -E "compacted|relist|watcherror|resourceVersion" \
+          | tail -50
+      register: cm_relist_logs
+      ignore_errors: yes
+
+    - name: Also check controller-manager pod logs
+      shell: |
+        kubectl logs -n kube-system \
+          $(kubectl get pods -n kube-system -l component=kube-controller-manager \
+            --field-selector spec.nodeName=cp1 -o name 2>/dev/null | head -1) \
+          --since=5m 2>/dev/null \
+          | grep -i -E "compacted|relist|watch.*error|too old" \
+          | tail -50
+      register: cm_pod_logs
+      ignore_errors: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save controller-manager relist logs
+      copy:
+        dest: "{{ results_dir }}/cm_relist_logs.txt"
+        content: |
+          === journalctl ===
+          {{ cm_relist_logs.stdout }}
+          === pod logs ===
+          {{ cm_pod_logs.stdout }}
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S17 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s17
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

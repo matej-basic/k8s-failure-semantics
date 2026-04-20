@@ -1,0 +1,239 @@
+---
+# scenarios/s15/playbook.yml
+# S15: Graceful termination race with traffic routing
+#
+# What it does:
+#   Sends continuous HTTP traffic to the nginx-stateless service.
+#   Then deletes one of the nginx pods and precisely measures how long
+#   after readiness turns false the service continues routing traffic to it.
+#   Captures the exact window between lifecycle signal and data-plane update.
+#
+# What we measure:
+#   - Duration (ms) between pod deletion and endpoint removal
+#   - Duration (ms) between endpoint removal and kube-proxy rule update
+#   - HTTP error rate during the grace period (5xx from terminated pod)
+#   - Whether the endpoint controller and kube-proxy converge simultaneously
+#     or sequentially — and how far apart (I2)
+#   - Whether any requests reach the pod after it has stopped responding
+
+- name: S15 — Pre-flight and baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s15
+    scenario_name: "Graceful termination race with traffic routing"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Ensure nginx-stateless has 3 running pods
+      shell: |
+        kubectl rollout status deployment/nginx-stateless --timeout=60s
+        kubectl get pods -l app=nginx-stateless -o json \
+          | jq '[.items[] | {name: .metadata.name, node: .spec.nodeName, phase: .status.phase}]'
+      register: nginx_pods
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save pre-test pod list
+      copy:
+        dest: "{{ results_dir }}/nginx_pods_prefault.json"
+        content: "{{ nginx_pods.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S15 — Start continuous traffic generator on observer
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - name: Install hey HTTP load tester if not present
+      shell: |
+        which hey 2>/dev/null || \
+        curl -fsSL https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64 \
+          -o /usr/local/bin/hey && chmod +x /usr/local/bin/hey
+      args:
+        creates: /usr/local/bin/hey
+
+    - name: Get service ClusterIP
+      shell: |
+        kubectl get svc nginx-stateless -o jsonpath='{.spec.clusterIP}'
+      register: svc_ip
+      environment:
+        KUBECONFIG: /tmp/admin.conf
+
+    - name: Start traffic generator (background, logs response codes)
+      shell: |
+        nohup bash -c '
+          SVC_IP="{{ svc_ip.stdout }}"
+          OUT="{{ results_dir }}/traffic_log.jsonl"
+          while true; do
+            CODE=$(curl -sk --max-time 2 http://$SVC_IP/ -o /dev/null -w "%{http_code}" 2>/dev/null)
+            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"http_code\": $CODE}" >> $OUT
+            sleep 0.1
+          done
+        ' > /dev/null 2>&1 &
+        echo $! > /tmp/traffic-gen.pid
+
+- name: S15 — Select target pod and record its IP
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - name: Pick first nginx pod for deletion
+      shell: |
+        kubectl get pods -l app=nginx-stateless -o json \
+          | jq -r '.items[0].metadata.name'
+      register: target_pod_name
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Get target pod IP
+      shell: |
+        kubectl get pod {{ target_pod_name.stdout }} -o jsonpath='{.status.podIP}'
+      register: target_pod_ip
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save target pod info
+      copy:
+        dest: "{{ results_dir }}/target_pod.json"
+        content: |
+          {"name": "{{ target_pod_name.stdout }}", "ip": "{{ target_pod_ip.stdout }}"}
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S15 — Start endpoint watcher (records when pod IP leaves endpoints)
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - name: Get target pod IP from saved file
+      shell: cat {{ results_dir }}/target_pod.json | jq -r '.ip'
+      register: target_ip
+
+    - name: Start endpoint membership watcher
+      shell: |
+        TARGET_IP="{{ target_ip.stdout }}"
+        OUT="{{ results_dir }}/endpoint_watch.jsonl"
+        export KUBECONFIG=/tmp/admin.conf
+        nohup bash -c '
+          while true; do
+            IN_EP=$(kubectl get endpoints nginx-stateless -o json 2>/dev/null \
+              | jq --arg ip "'"$TARGET_IP"'" \
+                "[.subsets[]?.addresses[]? | select(.ip == \$ip)] | length")
+            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"target_in_endpoints\": $IN_EP}" >> '"$OUT"'
+            sleep 0.5
+          done
+        ' > /dev/null 2>&1 &
+        echo $! > /tmp/ep-watcher.pid
+
+- name: S15 — DELETE the target pod (record precise timestamp)
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - name: Read target pod name
+      shell: cat {{ results_dir }}/target_pod.json | jq -r '.name'
+      register: target_pod_name
+      delegate_to: "{{ groups['observer'][0] }}"
+
+    - name: Record deletion timestamp and delete pod
+      shell: |
+        DELETE_TS=$(date -u +%H:%M:%S.%3N)
+        kubectl delete pod {{ target_pod_name.stdout }} --grace-period=30
+        echo $DELETE_TS
+      register: delete_ts
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save deletion timestamp
+      copy:
+        dest: "{{ results_dir }}/pod_deletion_ts.txt"
+        content: "{{ delete_ts.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S15 — Observe for 60s post-deletion
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_delete_t15 }
+
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_delete_t30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_delete_t60 }
+
+- name: S15 — Stop traffic generator and endpoint watcher
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - shell: |
+        kill $(cat /tmp/traffic-gen.pid) 2>/dev/null || true
+        kill $(cat /tmp/ep-watcher.pid) 2>/dev/null || true
+
+    - name: Analyze traffic log for errors during grace window
+      shell: |
+        cat {{ results_dir }}/traffic_log.jsonl \
+          | jq -s '{
+              total_requests: length,
+              errors_5xx: [.[] | select(.http_code >= 500)] | length,
+              errors_000: [.[] | select(.http_code == 0)] | length,
+              success_200: [.[] | select(.http_code == 200)] | length
+            }'
+      register: traffic_analysis
+
+    - name: Save traffic analysis
+      copy:
+        dest: "{{ results_dir }}/traffic_analysis.json"
+        content: "{{ traffic_analysis.stdout }}"
+
+    - name: Find first timestamp where target left endpoints
+      shell: |
+        cat {{ results_dir }}/endpoint_watch.jsonl \
+          | jq -r 'select(.target_in_endpoints == 0) | .ts' \
+          | head -1
+      register: endpoint_removal_ts
+
+    - name: Save endpoint removal timestamp
+      copy:
+        dest: "{{ results_dir }}/endpoint_removal_ts.txt"
+        content: "{{ endpoint_removal_ts.stdout }}"
+
+- name: S15 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s15
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

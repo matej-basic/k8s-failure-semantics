@@ -1,0 +1,134 @@
+---
+# scenarios/s8/playbook.yml
+# S8: Partition + storage lag (composed fault)
+#
+# What it does:
+#   1. Injects 600ms etcd write latency via Toxiproxy on all etcd members
+#   2. Simultaneously partitions worker2 from the control plane
+#   The combination means: the node eviction machinery is already slow
+#   (writes can't commit fast) AND a worker is isolated.
+#
+# What we measure:
+#   - Whether the composed fault produces qualitatively worse divergence
+#     than either S2 or S3 in isolation
+#   - Whether etcd write latency delays or prevents the node eviction write
+#   - Whether controller-manager produces duplicate eviction records (I1)
+#   - Amplification index vs S3 alone
+
+- name: S8 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s8
+    scenario_name: "Partition + storage lag (composed)"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S8 — Phase 1: Inject etcd write latency
+  hosts: etcd
+  gather_facts: no
+  vars:
+    scenario_id: s8
+    fault_type: etcd_latency
+    latency_ms: 600
+    latency_jitter_ms: 150
+    toxicity: 1.0
+  roles:
+    - role: fault-inject
+
+- name: S8 — Snapshot after latency only (before partition)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s8
+    snapshot_label: after_latency_only
+  tasks:
+    - pause: { seconds: 15 }
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S8 — Phase 2: Add worker2 partition (now both faults active)
+  hosts: worker2
+  gather_facts: no
+  vars:
+    scenario_id: s8
+    fault_type: network_asymmetric
+    target_host: worker2
+    direction: outbound
+    peer_hosts:
+      - cp1
+      - cp2
+      - cp3
+      - etcd1
+      - etcd2
+      - etcd3
+  roles:
+    - role: fault-inject
+
+- name: S8 — Observe composed fault window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s8
+  tasks:
+    - pause: { seconds: 45 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: composed_t45 }
+
+    - pause: { seconds: 45 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: composed_t90 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: composed_t150 }
+
+- name: S8 — Tear down all faults
+  hosts: k8s_cluster:etcd:control_plane
+  gather_facts: no
+  vars:
+    scenario_id: s8
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S8 — Post-fault recovery
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s8
+  tasks:
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t60 }
+
+    - pause: { seconds: 120 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t180 }
+
+- name: S8 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s8
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

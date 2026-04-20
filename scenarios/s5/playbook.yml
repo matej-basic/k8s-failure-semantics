@@ -1,0 +1,240 @@
+---
+# scenarios/s5/playbook.yml
+# S5: Transient API disruption under multiple controllers
+#
+# What it does:
+#   Deploys 2 additional custom no-op reconciler deployments that watch
+#   and update the nginx-stateless deployment continuously, then blocks
+#   all access to the API server for 45 seconds. All reconcilers queue
+#   retries simultaneously. Measures amplification on reconnect.
+#
+# What we measure:
+#   - API server event rate spike after reconnect (amplification index)
+#   - etcd transaction rate during and after the disruption
+#   - Number of duplicate/conflicting object updates in the event window
+#   - Whether the nginx deployment reaches a contradictory state (I5)
+#   - Controller retry storm duration
+
+- name: S5 — Deploy additional reconcilers
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s5
+    scenario_name: "API disruption under multiple controllers"
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Deploy custom reconciler pods (simulate operator churn)
+      shell: |
+        kubectl apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: reconciler-alpha
+          namespace: default
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: reconciler-alpha
+          template:
+            metadata:
+              labels:
+                app: reconciler-alpha
+            spec:
+              serviceAccountName: default
+              containers:
+              - name: reconciler
+                image: bitnami/kubectl:1.29
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    while true; do
+                      kubectl annotate deployment nginx-stateless \
+                        reconciler-alpha-ts="$(date +%s)" --overwrite 2>/dev/null || true
+                      sleep 5
+                    done
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: reconciler-beta
+          namespace: default
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: reconciler-beta
+          template:
+            metadata:
+              labels:
+                app: reconciler-beta
+            spec:
+              serviceAccountName: default
+              containers:
+              - name: reconciler
+                image: bitnami/kubectl:1.29
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    while true; do
+                      kubectl annotate deployment nginx-stateless \
+                        reconciler-beta-ts="$(date +%s)" --overwrite 2>/dev/null || true
+                      sleep 3
+                    done
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for reconcilers to start reconciling
+      pause:
+        seconds: 30
+
+- name: S5 — Pre-fault baseline snapshot
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s5
+    snapshot_label: pre_fault
+  roles:
+    - role: metrics-collect
+
+- name: S5 — Collect baseline API event rate
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - name: Measure baseline API event rate (events per 10s)
+      shell: |
+        kubectl get events --all-namespaces -w --output-watch-events=true \
+          2>/dev/null &
+        WPID=$!
+        sleep 10
+        kill $WPID 2>/dev/null
+        wait $WPID 2>/dev/null
+        echo "baseline_event_window_complete"
+      async: 15
+      poll: 0
+      register: event_watcher
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: S5 — Inject API server disruption (block port 6443 on all control plane nodes)
+  hosts: control_plane
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - name: Block API server port from all workers and external access
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: 6443
+        source: "{{ item }}"
+        jump: DROP
+        comment: "fault-inject-api-block-{{ scenario_id }}"
+      loop: "{{ groups['workers'] | map('extract', hostvars, 'ansible_host') | list
+               + [hostvars[groups['observer'][0]]['ansible_host']] }}"
+
+- name: S5 — Wait during API disruption
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - pause:
+        seconds: 45
+
+- name: S5 — Lift API disruption
+  hosts: control_plane
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - name: Remove API block rules
+      shell: |
+        iptables-save | grep -v "fault-inject-api-block-{{ scenario_id }}" | iptables-restore
+
+- name: S5 — Capture amplification burst (immediate post-reconnect)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: reconnect_t0 }
+
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: reconnect_t15 }
+
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: reconnect_t30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: reconnect_t60 }
+
+- name: S5 — Measure post-reconnect API annotation churn
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - name: Count annotation updates on nginx-stateless in reconnect window
+      shell: |
+        kubectl get events -n default \
+          --field-selector involvedObject.name=nginx-stateless,reason=ScalingReplicaSet \
+          -o json | jq '.items | length'
+      register: churn_count
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Count total events in reconnect window
+      shell: |
+        kubectl get events --all-namespaces -o json \
+          | jq '[.items[] | select(.lastTimestamp > "{{ snapshot_ts | default("") }}")] | length'
+      register: total_event_count
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Save amplification metrics
+      copy:
+        dest: "{{ results_dir }}/amplification_metrics.json"
+        content: |
+          {
+            "nginx_churn_events": {{ churn_count.stdout | default(0) }},
+            "total_events_post_reconnect": {{ total_event_count.stdout | default(0) }}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S5 — Clean up extra reconcilers
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tasks:
+    - shell: |
+        kubectl delete deployment reconciler-alpha reconciler-beta --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: S5 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s5
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

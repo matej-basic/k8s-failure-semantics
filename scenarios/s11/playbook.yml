@@ -1,0 +1,197 @@
+---
+# scenarios/s11/playbook.yml
+# S11: Kubelet partition with pod lifecycle divergence
+#
+# What it does:
+#   Blocks worker1's kubelet from reaching the API server only (port 6443).
+#   The kubelet continues running all its existing pods. The control plane
+#   eventually marks worker1 NotReady and may delete/reschedule pods.
+#   The kubelet never receives the deletion signals.
+#
+# What we measure:
+#   - Divergence between pod phase in the API (Terminating/Failed/Gone)
+#     and actual container state on the node (running)
+#   - Whether the pod is rescheduled and runs in duplicate (I1)
+#   - Whether endpoints are cleaned up while pod still serves traffic (I2)
+#   - Whether the node-level belief ever reconciles after reconnect (I3)
+#   - How long after reconnect before the kubelet receives and acts on deletions
+
+- name: S11 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s11
+    scenario_name: "Kubelet partition with pod lifecycle divergence"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Record pods running on worker1 before fault
+      shell: |
+        kubectl get pods --all-namespaces \
+          --field-selector spec.nodeName=worker1 -o json \
+          | jq '[.items[] | {name: .metadata.name, ns: .metadata.namespace,
+                             uid: .metadata.uid, phase: .status.phase}]'
+      register: prefault_pods
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save pre-fault pod list
+      copy:
+        dest: "{{ results_dir }}/pods_on_worker1_prefault.json"
+        content: "{{ prefault_pods.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S11 — Block kubelet→API port only (not all traffic)
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - name: Block worker1 outbound to API server port 6443 only
+      iptables:
+        chain: OUTPUT
+        protocol: tcp
+        destination_port: 6443
+        destination: "{{ item }}"
+        jump: DROP
+        comment: "fault-inject-kubelet-partition-{{ scenario_id }}"
+      loop: "{{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+    - debug:
+        msg: "FAULT INJECTED: kubelet→API blocked on worker1 (port 6443 only)"
+
+- name: S11 — Poll divergence state every 30s
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    # At t+40s the node should be NotReady (past grace period)
+    - pause: { seconds: 40 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_40 }
+
+    # At t+70s eviction should begin
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_70 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_130 }
+
+- name: S11 — Capture divergence: API view vs node reality
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - name: List actually running containers on worker1 while partitioned
+      shell: |
+        crictl ps -o json 2>/dev/null \
+          | jq '[.containers[] | {
+              id: .id,
+              name: .metadata.name,
+              state: .state,
+              pod: .labels."io.kubernetes.pod.name",
+              namespace: .labels."io.kubernetes.pod.namespace"
+            }]'
+      register: node_reality
+
+    - name: Save node-reality snapshot
+      copy:
+        dest: "{{ results_dir }}/worker1_node_reality_during_partition.json"
+        content: "{{ node_reality.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S11 — Compare API view to node reality
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - name: Get API view of worker1 pods
+      shell: |
+        kubectl get pods --all-namespaces \
+          --field-selector spec.nodeName=worker1 -o json \
+          | jq '[.items[] | {name: .metadata.name, phase: .status.phase,
+                             deletionTimestamp: .metadata.deletionTimestamp}]'
+      register: api_pod_view
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save API pod view
+      copy:
+        dest: "{{ results_dir }}/worker1_api_view_during_partition.json"
+        content: "{{ api_pod_view.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S11 — Lift kubelet partition and measure reconciliation lag
+  hosts: worker1
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - name: Record time of partition lift
+      set_fact:
+        partition_lift_ts: "{{ lookup('pipe', 'date -u +%H:%M:%S') }}"
+
+    - name: Remove iptables block
+      shell: |
+        iptables-save | grep -v "fault-inject-kubelet-partition-{{ scenario_id }}" \
+          | iptables-restore
+
+    - name: Save lift timestamp
+      copy:
+        dest: "{{ results_dir }}/partition_lift_ts.txt"
+        content: "{{ partition_lift_ts }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S11 — Capture reconciliation lag after reconnect
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_reconnect_t15 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_reconnect_t45 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_reconnect_t105 }
+
+- name: S11 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s11
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

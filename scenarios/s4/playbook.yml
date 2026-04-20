@@ -1,0 +1,146 @@
+---
+# scenarios/s4/playbook.yml
+# S4: Clock skew on selected control-plane components
+#
+# What it does:
+#   Advances the clock on cp1 by 120 seconds (enough to invalidate its
+#   lease renewals from the perspective of other nodes, and vice versa).
+#   NTP is stopped to hold the skew for the fault duration.
+#
+# What we measure:
+#   - Whether cp1's API server is excluded from the VIP rotation
+#   - Whether cp1 loses or steals the controller-manager/scheduler lease
+#   - Whether worker nodes report false NotReady due to cert/token skew
+#   - Whether leases are expired prematurely by other components
+#   - Whether the leader election produces contradictory beliefs (I1)
+
+- name: S4 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s4
+    scenario_name: "Clock skew on control-plane node"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Record current system times across all nodes
+      shell: date -u +%Y-%m-%dT%H:%M:%SZ
+      register: node_time
+
+    - name: Save node times
+      copy:
+        dest: "{{ results_dir }}/node_times_prefault.json"
+        content: |
+          {
+            {% for host in groups['control_plane'] + groups['workers'] + groups['etcd'] %}
+            "{{ host }}": "{{ hostvars[host]['node_time']['stdout'] | default('unknown') }}"{% if not loop.last %},{% endif %}
+            {% endfor %}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S4 — Inject clock skew on cp1
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s4
+    fault_type: clock_skew
+    target_host: cp1
+    skew_seconds: 120
+  roles:
+    - role: fault-inject
+
+- name: S4 — Monitor lease behavior during skew
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s4
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_60 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_120 }
+
+- name: S4 — Collect lease timeline from cp1's perspective
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s4
+  tasks:
+    - name: Check cp1 local time and lease claims
+      shell: |
+        echo "LOCAL_TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "CM_LEASE:"
+        kubectl get lease kube-controller-manager -n kube-system -o json \
+          --server=https://127.0.0.1:6443 \
+          --certificate-authority=/etc/kubernetes/pki/ca.crt \
+          --client-certificate=/etc/kubernetes/pki/admin.crt \
+          --client-key=/etc/kubernetes/pki/admin.key \
+          2>/dev/null | jq '{holder: .spec.holderIdentity, renewTime: .spec.renewTime}'
+      register: cp1_lease_view
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Save cp1 lease view
+      copy:
+        dest: "{{ results_dir }}/cp1_lease_view_during_skew.json"
+        content: "{{ cp1_lease_view.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S4 — Tear down clock skew (re-sync time)
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s4
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S4 — Post-fault recovery snapshots
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s4
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t30 }
+
+    - pause: { seconds: 90 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t120 }
+
+- name: S4 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s4
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

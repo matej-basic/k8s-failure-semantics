@@ -1,0 +1,12 @@
+---
+# roles/k8s-install/tasks/worker-join.yml
+# Joins worker nodes to the cluster
+
+- name: Read join command from observer
+  set_fact:
+    join_cmd: "{{ lookup('file', '/tmp/worker-join.sh') | trim }}"
+
+- name: Join as worker node
+  shell: "{{ join_cmd }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf

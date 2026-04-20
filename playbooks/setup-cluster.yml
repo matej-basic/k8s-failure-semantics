@@ -1,0 +1,52 @@
+---
+# playbooks/setup-cluster.yml
+# Run this once to build the entire cluster from bare hosts.
+
+- name: Install prerequisites on all hosts
+  hosts: k8s_cluster:etcd
+  gather_facts: yes
+  roles:
+    - role: common
+
+- name: Bootstrap Kubernetes cluster
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  roles:
+    - role: k8s-install
+
+- name: Copy admin kubeconfig to observer
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  tasks:
+    - name: Copy kubeconfig
+      copy:
+        src: /tmp/admin.conf
+        dest: /tmp/admin.conf
+        mode: '0600'
+
+    - name: Install kubectl on observer
+      apt:
+        name: kubectl
+        state: present
+        update_cache: yes
+
+    - name: Set KUBECONFIG environment for root
+      lineinfile:
+        path: /root/.bashrc
+        line: "export KUBECONFIG=/tmp/admin.conf"
+
+    - name: Create results base directory
+      file:
+        path: "{{ results_base }}"
+        state: directory
+        mode: '0755'
+
+    - name: Verify cluster is reachable from observer
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: /tmp/admin.conf
+      register: node_list
+
+    - name: Print node list
+      debug:
+        msg: "{{ node_list.stdout }}"

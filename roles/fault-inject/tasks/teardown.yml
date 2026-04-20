@@ -1,0 +1,58 @@
+---
+# roles/fault-inject/tasks/teardown.yml
+# Removes ALL injected faults on the host: iptables rules, tc qdiscs,
+# Toxiproxy toxics, clock skew, stress-ng processes.
+# Run on every host in the play to guarantee a clean state.
+
+- name: Remove all fault-inject iptables rules (OUTPUT)
+  shell: |
+    iptables-save | grep -v "fault-inject" | iptables-restore
+  ignore_errors: yes
+
+- name: Remove all tc qdiscs on primary interface
+  shell: |
+    tc qdisc del dev {{ interface | default('eth0') }} root 2>/dev/null || true
+  ignore_errors: yes
+
+- name: Remove all Toxiproxy toxics on etcd proxy
+  shell: |
+    for toxic in $({{ toxiproxy_cli }} inspect etcd-proxy 2>/dev/null \
+        | jq -r '.toxics[].name' 2>/dev/null); do
+      {{ toxiproxy_cli }} toxic remove etcd-proxy --toxicName "$toxic"
+    done
+  ignore_errors: yes
+  when: inventory_hostname in groups['etcd']
+
+- name: Restore API server etcd endpoints to direct (non-Toxiproxy) ports
+  shell: |
+    for member_ip in {{ groups['etcd'] | map('extract', hostvars, 'ansible_host') | join(' ') }}; do
+      sed -i "s|https://${member_ip}:{{ toxiproxy_etcd_port }}|https://${member_ip}:2379|g" \
+        /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null || true
+    done
+  ignore_errors: yes
+  when: inventory_hostname in groups['control_plane']
+
+- name: Kill any running stress-ng processes
+  shell: |
+    if [ -f /tmp/stress-ng.pid ]; then
+      kill $(cat /tmp/stress-ng.pid) 2>/dev/null || true
+      rm -f /tmp/stress-ng.pid
+    fi
+    pkill -f stress-ng 2>/dev/null || true
+  ignore_errors: yes
+
+- name: Kill any running flap scripts
+  shell: |
+    pkill -f flap-fault.sh 2>/dev/null || true
+  ignore_errors: yes
+
+- name: Resync clock via chrony
+  shell: |
+    systemctl start chrony 2>/dev/null || true
+    systemctl start systemd-timesyncd 2>/dev/null || true
+    chronyc makestep 2>/dev/null || true
+  ignore_errors: yes
+
+- name: Log teardown complete
+  debug:
+    msg: "TEARDOWN COMPLETE on {{ inventory_hostname }}: all faults removed"

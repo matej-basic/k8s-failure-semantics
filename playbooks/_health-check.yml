@@ -1,0 +1,76 @@
+---
+# playbooks/_health-check.yml
+# Run between scenarios to verify the cluster has recovered cleanly.
+# Fails hard if any node is NotReady or etcd has lost a member.
+
+- name: Inter-scenario health check
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tasks:
+    - name: Wait up to 5 minutes for all nodes to be Ready
+      shell: |
+        kubectl get nodes --no-headers | grep -v " Ready" | wc -l
+      register: not_ready
+      retries: 30
+      delay: 10
+      until: not_ready.stdout | int == 0
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Verify all expected nodes are present
+      shell: |
+        kubectl get nodes --no-headers | wc -l
+      register: node_count
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: node_count.stdout | int < 6
+
+    - name: Verify controller-manager lease is held
+      shell: |
+        HOLDER=$(kubectl get lease kube-controller-manager -n kube-system \
+          -o jsonpath='{.spec.holderIdentity}')
+        test -n "$HOLDER"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 12
+      delay: 10
+      register: cm_lease_check
+      until: cm_lease_check.rc == 0
+
+    - name: Verify test deployments are healthy
+      shell: |
+        kubectl rollout status deployment/nginx-stateless --timeout=60s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 3
+      delay: 10
+      register: rollout_check
+      until: rollout_check.rc == 0
+
+    - name: Tear down any residual fault injections cluster-wide
+      include_role:
+        name: fault-inject
+      vars:
+        fault_type: teardown
+        scenario_id: cleanup
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s_cluster'] + groups['etcd'] }}"
+
+- name: Health check — etcd
+  hosts: "{{ groups['etcd'][0] }}"
+  gather_facts: no
+  tasks:
+    - name: Verify all etcd members are healthy
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint health --write-out=json \
+          | jq 'all(.[]; .health == true)'
+      register: etcd_all_healthy
+      failed_when: etcd_all_healthy.stdout | trim != 'true'
+      retries: 12
+      delay: 10
+      until: etcd_all_healthy.rc == 0

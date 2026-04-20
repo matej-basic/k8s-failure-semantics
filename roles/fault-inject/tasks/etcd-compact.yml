@@ -1,0 +1,65 @@
+---
+# roles/fault-inject/tasks/etcd-compact.yml
+# Trigger etcd compaction while a controller is isolated
+# Used for S17 (etcd compaction + watch history gap)
+#
+# isolate_host: controller-manager host to isolate from etcd during compaction
+# compact_revision_lag: how many revisions behind current to compact to (default: 0 = current)
+
+- name: Set compaction defaults
+  set_fact:
+    compact_revision_lag: "{{ compact_revision_lag | default(0) }}"
+
+- name: Get current etcd revision
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints={{ etcd_endpoints }} \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      endpoint status --write-out=json \
+      | jq '.[0].Status.header.revision'
+  register: current_revision
+  delegate_to: "{{ groups['etcd'][0] }}"
+  run_once: true
+
+- name: Isolate target controller from etcd before compaction
+  iptables:
+    chain: OUTPUT
+    destination: "{{ item }}"
+    destination_port: 2379
+    protocol: tcp
+    jump: DROP
+    comment: "fault-inject-compact-{{ scenario_id }}"
+  loop: "{{ groups['etcd'] | map('extract', hostvars, 'ansible_host') | list }}"
+  when: inventory_hostname == isolate_host
+
+- name: Pause to let watch streams fall behind
+  pause:
+    seconds: 15
+
+- name: Trigger etcd compaction at current revision
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints={{ etcd_endpoints }} \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      compact {{ current_revision.stdout | int - compact_revision_lag | int }}
+  delegate_to: "{{ groups['etcd'][0] }}"
+  run_once: true
+
+- name: Also defragment etcd to make compaction effective
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints=https://{{ ansible_host }}:2379 \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      defrag
+  when: inventory_hostname in groups['etcd']
+
+- name: Log compaction injected
+  debug:
+    msg: "FAULT INJECTED: etcd compacted at revision {{ current_revision.stdout }}; {{ isolate_host }} isolated from etcd"
+  run_once: true

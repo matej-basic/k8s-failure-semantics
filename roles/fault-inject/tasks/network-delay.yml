@@ -1,0 +1,37 @@
+---
+# roles/fault-inject/tasks/network-delay.yml
+# Inject packet delay using tc netem on a specific interface toward peer_hosts
+#
+# target_host: host to inject delay on
+# peer_hosts: list of destination hosts to delay toward
+# delay_ms: base delay in milliseconds (default: 200)
+# jitter_ms: jitter in milliseconds (default: 50)
+# interface: network interface (default: eth0)
+
+- name: Set delay defaults
+  set_fact:
+    delay_ms: "{{ delay_ms | default(200) }}"
+    jitter_ms: "{{ jitter_ms | default(50) }}"
+    interface: "{{ interface | default('eth0') }}"
+
+- name: Resolve peer IPs
+  set_fact:
+    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+
+- name: Create root qdisc for delay injection
+  shell: |
+    tc qdisc add dev {{ interface }} root handle 1: prio priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 || true
+    tc qdisc add dev {{ interface }} parent 1:3 handle 30: netem delay {{ delay_ms }}ms {{ jitter_ms }}ms distribution normal || true
+  when: inventory_hostname == target_host
+
+- name: Add delay filter per peer IP
+  shell: |
+    tc filter add dev {{ interface }} parent 1:0 protocol ip u32 \
+      match ip dst {{ item }}/32 flowid 1:3
+  loop: "{{ peer_ips }}"
+  when: inventory_hostname == target_host
+
+- name: Log delay fault injected
+  debug:
+    msg: "FAULT INJECTED: {{ delay_ms }}ms ± {{ jitter_ms }}ms delay on {{ target_host }} toward {{ peer_hosts | join(', ') }}"
+  when: inventory_hostname == target_host

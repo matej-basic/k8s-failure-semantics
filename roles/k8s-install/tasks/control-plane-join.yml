@@ -1,0 +1,30 @@
+---
+# roles/k8s-install/tasks/control-plane-join.yml
+# Joins cp2 and cp3 as additional control plane nodes
+
+- name: Read join command
+  set_fact:
+    join_cmd: "{{ lookup('file', '/tmp/worker-join.sh') }}"
+    cert_key: "{{ lookup('file', '/tmp/cert-key.txt') | trim }}"
+
+- name: Distribute etcd CA cert to this control plane node
+  copy:
+    src: "/tmp/etcd-pki/ca.crt"
+    dest: /etc/kubernetes/pki/etcd/ca.crt
+    mode: '0644'
+
+- name: Join as control plane node
+  shell: |
+    {{ join_cmd }} \
+      --control-plane \
+      --certificate-key {{ cert_key }} \
+      --apiserver-advertise-address {{ ansible_host }}
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Set up kubeconfig for root on this node
+  shell: |
+    mkdir -p $HOME/.kube
+    cp /etc/kubernetes/admin.conf $HOME/.kube/config
+  args:
+    creates: /root/.kube/config

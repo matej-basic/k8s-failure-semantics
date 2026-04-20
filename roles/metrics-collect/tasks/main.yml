@@ -1,0 +1,252 @@
+---
+# roles/metrics-collect/tasks/main.yml
+# Collects a single observer state snapshot.
+# Call repeatedly (via loop + pause) to build a time-indexed trace.
+#
+# snapshot_label: string label for this snapshot (e.g. 'pre_fault', 't+30', 'post_convergence')
+# results_dir: where to write output files
+
+- name: Ensure results directory exists
+  file:
+    path: "{{ results_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: Collect snapshot timestamp
+  set_fact:
+    snapshot_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+  run_once: true
+
+# ── etcd observer ────────────────────────────────────────────────────────────
+
+- name: Collect etcd member health and leader status
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints={{ etcd_endpoints }} \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      endpoint status --write-out=json 2>/dev/null
+  register: etcd_status
+  delegate_to: "{{ groups['etcd'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+- name: Collect etcd current revision
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+      --endpoints={{ etcd_endpoints }} \
+      --cacert={{ etcd_cert_dir }}/ca.crt \
+      --cert={{ etcd_cert_dir }}/server.crt \
+      --key={{ etcd_cert_dir }}/server.key \
+      endpoint status --write-out=json 2>/dev/null \
+      | jq '[.[].Status.header.revision] | max'
+  register: etcd_revision
+  delegate_to: "{{ groups['etcd'][0] }}"
+  run_once: true
+  ignore_errors: yes
+
+# ── Kubernetes API observer ──────────────────────────────────────────────────
+
+- name: Collect node conditions from API server
+  shell: |
+    kubectl get nodes -o json 2>/dev/null \
+      | jq '[.items[] | {
+          name: .metadata.name,
+          conditions: [.status.conditions[] | select(.type=="Ready") | {
+            type: .type,
+            status: .status,
+            lastTransition: .lastTransitionTime,
+            reason: .reason,
+            message: .message
+          }],
+          unschedulable: .spec.unschedulable
+        }]'
+  register: node_conditions
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+- name: Collect pod states for test workloads
+  shell: |
+    kubectl get pods -n {{ stateful_app_namespace }} -o json 2>/dev/null \
+      | jq '[.items[] | {
+          name: .metadata.name,
+          node: .spec.nodeName,
+          phase: .status.phase,
+          conditions: .status.conditions,
+          containerStatuses: [.status.containerStatuses[]? | {
+            name: .name,
+            ready: .ready,
+            restartCount: .restartCount,
+            state: .state
+          }]
+        }]'
+  register: pod_states
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+- name: Collect endpoint membership for test services
+  shell: |
+    kubectl get endpoints -n {{ stateful_app_namespace }} \
+      nginx-stateless postgres-stateful -o json 2>/dev/null \
+      | jq '[.items[] | {
+          service: .metadata.name,
+          subsets: .subsets,
+          notReadyAddresses: [.subsets[]?.notReadyAddresses[]?.ip // empty]
+        }]'
+  register: endpoint_states
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+- name: Collect controller-manager leader lease
+  shell: |
+    kubectl get lease kube-controller-manager -n kube-system -o json 2>/dev/null \
+      | jq '{
+          holder: .spec.holderIdentity,
+          acquireTime: .spec.acquireTime,
+          renewTime: .spec.renewTime,
+          leaseDuration: .spec.leaseDurationSeconds
+        }'
+  register: cm_lease
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+- name: Collect scheduler leader lease
+  shell: |
+    kubectl get lease kube-scheduler -n kube-system -o json 2>/dev/null \
+      | jq '{
+          holder: .spec.holderIdentity,
+          acquireTime: .spec.acquireTime,
+          renewTime: .spec.renewTime,
+          leaseDuration: .spec.leaseDurationSeconds
+        }'
+  register: scheduler_lease
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+- name: Collect recent events (warnings only)
+  shell: |
+    kubectl get events --all-namespaces --field-selector type=Warning \
+      --sort-by=.lastTimestamp -o json 2>/dev/null \
+      | jq '[.items[-50:] | .[] | {
+          namespace: .metadata.namespace,
+          name: .metadata.name,
+          reason: .reason,
+          message: .message,
+          involvedObject: .involvedObject,
+          count: .count,
+          lastTimestamp: .lastTimestamp
+        }]'
+  register: k8s_events
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+
+# ── Per-node kubelet observer ─────────────────────────────────────────────────
+
+- name: Collect kubelet node status from each node
+  shell: |
+    curl -sk https://127.0.0.1:10250/stats/summary \
+      --cert /var/lib/kubelet/pki/kubelet-client-current.pem \
+      --key /var/lib/kubelet/pki/kubelet-client-current.pem \
+      2>/dev/null | jq '{node: .node.nodeName, cpu: .node.cpu, memory: .node.memory}' \
+    || echo '{"error": "kubelet_unreachable"}'
+  register: kubelet_local_status
+  when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
+  ignore_errors: yes
+
+- name: Collect running containers from crictl on each node
+  shell: |
+    crictl ps -o json 2>/dev/null \
+      | jq '[.containers[] | {id: .id, name: .metadata.name, state: .state, podName: .labels."io.kubernetes.pod.name"}]' \
+    || echo '[]'
+  register: crictl_containers
+  when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
+  ignore_errors: yes
+
+# ── External client observer ──────────────────────────────────────────────────
+
+- name: Probe service reachability from observer
+  shell: |
+    SVC_IP=$(kubectl get svc nginx-stateless -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+    if [ -n "$SVC_IP" ]; then
+      result=$(curl -sk --max-time 3 http://$SVC_IP/ -o /dev/null -w '%{http_code}' 2>/dev/null)
+      echo "{\"service\": \"nginx-stateless\", \"clusterIP\": \"$SVC_IP\", \"httpCode\": $result}"
+    else
+      echo '{"service": "nginx-stateless", "error": "no_clusterIP"}'
+    fi
+  register: service_probe
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+  environment:
+    KUBECONFIG: /tmp/admin.conf
+  ignore_errors: yes
+
+# ── Assemble and write snapshot ───────────────────────────────────────────────
+
+- name: Assemble per-node data (gathered on observer)
+  set_fact:
+    node_snapshots: "{{ node_snapshots | default([]) + [
+      {
+        'host': item,
+        'kubelet_status': hostvars[item]['kubelet_local_status']['stdout'] | default('unavailable'),
+        'containers': hostvars[item]['crictl_containers']['stdout'] | default('[]')
+      }
+    ] }}"
+  loop: "{{ groups['workers'] + groups['control_plane'] }}"
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: Write snapshot JSON to results directory
+  copy:
+    dest: "{{ results_dir }}/snapshot_{{ snapshot_label }}.json"
+    content: |
+      {
+        "scenario_id": "{{ scenario_id }}",
+        "run_id": "{{ run_id }}",
+        "snapshot_label": "{{ snapshot_label }}",
+        "timestamp": "{{ snapshot_ts }}",
+        "etcd": {
+          "member_status": {{ etcd_status.stdout | default('null') }},
+          "current_revision": {{ etcd_revision.stdout | default('null') }}
+        },
+        "control_plane": {
+          "node_conditions": {{ node_conditions.stdout | default('null') }},
+          "pod_states": {{ pod_states.stdout | default('null') }},
+          "endpoint_states": {{ endpoint_states.stdout | default('null') }},
+          "controller_manager_lease": {{ cm_lease.stdout | default('null') }},
+          "scheduler_lease": {{ scheduler_lease.stdout | default('null') }},
+          "warning_events": {{ k8s_events.stdout | default('null') }}
+        },
+        "nodes": {{ node_snapshots | to_json }},
+        "external_probe": {{ service_probe.stdout | default('null') }}
+      }
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: Append snapshot label to run index
+  lineinfile:
+    path: "{{ results_dir }}/run_index.txt"
+    line: "{{ snapshot_ts }} {{ snapshot_label }}"
+    create: yes
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true

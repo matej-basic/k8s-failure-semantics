@@ -1,0 +1,154 @@
+---
+# scenarios/s1/playbook.yml
+# S1: Symmetric control-plane partition
+#
+# What it does:
+#   Isolates cp1 from cp2 and cp3 (and from the etcd cluster).
+#   The isolated node cannot communicate with the rest of the control plane.
+#
+# What we measure:
+#   - Whether a second leader lease holder appears (I1 violation)
+#   - How long before the isolated node's API server becomes unreachable
+#   - Whether etcd loses quorum or re-elects cleanly
+#   - Whether the remaining two nodes form a working majority
+#   - Recovery trajectory after partition is lifted
+
+- name: S1 — Pre-flight and baseline snapshot
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    scenario_name: "Symmetric control-plane partition"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Verify cluster is healthy before starting
+      shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+      register: not_ready_count
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready_count.stdout | int > 0
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S1 — Inject symmetric partition on cp1
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    fault_type: network_partition
+    target_host: cp1
+    peer_hosts:
+      - cp2
+      - cp3
+      - etcd1
+      - etcd2
+      - etcd3
+  roles:
+    - role: fault-inject
+
+- name: S1 — Observe during fault window (t+30s)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    snapshot_label: t_plus_30
+  tasks:
+    - pause:
+        seconds: 30
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S1 — Observe during fault window (t+60s)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    snapshot_label: t_plus_60
+  tasks:
+    - pause:
+        seconds: 30
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S1 — Observe during fault window (t+120s)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    snapshot_label: t_plus_120
+  tasks:
+    - pause:
+        seconds: 60
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S1 — Tear down partition
+  hosts: cp1
+  gather_facts: no
+  vars:
+    scenario_id: s1
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S1 — Post-fault snapshots (recovery trajectory)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s1
+  tasks:
+    - pause:
+        seconds: 30
+      run_once: true
+
+    - include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: post_fault_t30
+
+    - pause:
+        seconds: 60
+      run_once: true
+
+    - include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: post_fault_t90
+
+    - pause:
+        seconds: 120
+      run_once: true
+
+    - include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: post_fault_t210
+
+- name: S1 — Write invariant evaluation report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s1
+  tasks:
+    - name: Run invariant checker script
+      script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+
+    - name: Write invariant report
+      copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"

@@ -1,0 +1,254 @@
+---
+# scenarios/s14/playbook.yml
+# S14: Stale informer cache with high-churn objects
+#
+# What it does:
+#   Deploys a custom controller that uses a reflector/informer pattern
+#   (simulated by a kubectl watch loop). Then injects Toxiproxy latency
+#   specifically on the watch stream port (6443) for that controller only,
+#   while a separate process rapidly churns the watched objects.
+#   The controller continues acting on the stale list.
+#
+# What we measure:
+#   - Resource version of objects the controller acts on vs current etcd revision
+#   - Whether actions taken on stale objects produce contradictory writes (I5)
+#   - Duration of the stale window (watch lag in seconds)
+#   - Whether the controller self-corrects after watch stream recovers
+
+- name: S14 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s14
+    scenario_name: "Stale informer cache with high-churn objects"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+  roles:
+    - role: metrics-collect
+
+- name: S14 — Deploy stale-cache test controller
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - name: Deploy simulated informer controller
+      shell: |
+        kubectl apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: churn-target
+          namespace: default
+          annotations:
+            revision: "0"
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: stale-controller
+          namespace: default
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: stale-controller
+          template:
+            metadata:
+              labels:
+                app: stale-controller
+            spec:
+              serviceAccountName: default
+              containers:
+              - name: controller
+                image: bitnami/kubectl:1.29
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    # Simulates a controller watching a ConfigMap and acting on each version
+                    kubectl watch configmap churn-target -n default -o json \
+                      --watch-only 2>/dev/null | while read -r event; do
+                      RV=$(echo "$event" | jq -r '.object.metadata.resourceVersion // "?"')
+                      ANNOT=$(echo "$event" | jq -r '.object.metadata.annotations.revision // "?"')
+                      echo "[$(date -u +%H:%M:%S)] Acting on RV=$RV annotation=$ANNOT"
+                      # Simulate reconcile write based on stale view
+                      kubectl annotate configmap churn-target \
+                        "controller-acted-on=$RV" --overwrite 2>/dev/null || true
+                    done
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for stale-controller to start
+      shell: kubectl rollout status deployment/stale-controller --timeout=60s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: S14 — Start object churn pump
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - name: Install churn pump script
+      copy:
+        dest: /tmp/churn-pump.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          for i in $(seq 1 300); do
+            kubectl annotate configmap churn-target -n default \
+              revision="$i" --overwrite 2>/dev/null
+            sleep 0.2
+          done
+          echo "churn complete at $(date -u +%H:%M:%S)"
+
+    - name: Run churn pump in background
+      shell: nohup /tmp/churn-pump.sh > /tmp/churn-pump.log 2>&1 &
+      async: 0
+      poll: 0
+
+- name: S14 — Inject watch stream lag on stale-controller pod
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - name: Get stale-controller pod node
+      shell: |
+        kubectl get pods -l app=stale-controller -o json \
+          | jq -r '.items[0].spec.nodeName'
+      register: controller_node
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Inject API watch lag via Toxiproxy on the controller's node
+      shell: |
+        # Add slow-close toxic to simulate watch stream lag
+        {{ toxiproxy_cli }} --host {{ hostvars[controller_node.stdout]['ansible_host'] }} \
+          toxic add k8s-api-proxy \
+          --type slow_close \
+          --toxicName watch-lag-{{ scenario_id }} \
+          --attribute delay=8000 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Alternatively delay with iptables on the controller's node
+      iptables:
+        chain: OUTPUT
+        protocol: tcp
+        destination_port: 6443
+        destination: "{{ item }}"
+        jump: DROP
+        comment: "fault-inject-watch-lag-{{ scenario_id }}"
+      loop: "{{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list }}"
+      delegate_to: "{{ controller_node.stdout }}"
+
+- name: S14 — Allow churn to advance while controller is blind
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - pause:
+        seconds: 40
+
+- name: S14 — Snapshots during stale window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: stale_window_t40 }
+
+    - pause: { seconds: 20 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: stale_window_t60 }
+
+- name: S14 — Measure resource version drift
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - name: Get current ConfigMap resource version
+      shell: |
+        kubectl get configmap churn-target -n default \
+          -o jsonpath='{.metadata.resourceVersion}'
+      register: current_rv
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Get resource version the controller last acted on
+      shell: |
+        kubectl get configmap churn-target -n default \
+          -o jsonpath='{.metadata.annotations.controller-acted-on}'
+      register: acted_rv
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save resource version drift
+      copy:
+        dest: "{{ results_dir }}/rv_drift.json"
+        content: |
+          {
+            "current_rv": "{{ current_rv.stdout }}",
+            "controller_last_acted_rv": "{{ acted_rv.stdout }}",
+            "drift": {{ (current_rv.stdout | int) - (acted_rv.stdout | int) }}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      ignore_errors: yes
+
+- name: S14 — Restore watch stream
+  hosts: k8s_cluster
+  gather_facts: no
+  vars:
+    scenario_id: s14
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S14 — Post-reconnect snapshots (relist window)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_reconnect_t15 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_reconnect_t45 }
+
+- name: S14 — Clean up test controller
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tasks:
+    - shell: |
+        kubectl delete deployment stale-controller --ignore-not-found
+        kubectl delete configmap churn-target --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: S14 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s14
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"

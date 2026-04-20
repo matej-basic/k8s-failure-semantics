@@ -1,0 +1,62 @@
+---
+# roles/fault-inject/tasks/etcd-latency.yml
+# Inject write or read latency into etcd via Toxiproxy
+# Used for S3 (etcd write-latency degradation) and S8 (partition + storage lag)
+#
+# etcd_targets: list of etcd inventory hostnames to inject latency on (default: all)
+# latency_ms: milliseconds of additional latency (default: 500)
+# latency_jitter_ms: jitter (default: 100)
+# latency_type: 'latency' | 'slow_close' (default: latency)
+# toxicity: fraction of connections affected 0.0–1.0 (default: 1.0)
+
+- name: Set latency defaults
+  set_fact:
+    latency_ms: "{{ latency_ms | default(500) }}"
+    latency_jitter_ms: "{{ latency_jitter_ms | default(100) }}"
+    toxicity: "{{ toxicity | default(1.0) }}"
+    etcd_targets: "{{ etcd_targets | default(groups['etcd']) }}"
+
+- name: Ensure Toxiproxy is running
+  systemd:
+    name: toxiproxy
+    state: started
+  when: inventory_hostname in etcd_targets
+
+- name: Create Toxiproxy proxy for etcd (if not already created)
+  shell: |
+    {{ toxiproxy_cli }} create etcd-proxy \
+      --listen {{ toxiproxy_etcd_listen }} \
+      --upstream {{ toxiproxy_etcd_upstream }} 2>/dev/null || true
+  when: inventory_hostname in etcd_targets
+
+- name: Inject latency toxic on etcd proxy
+  shell: |
+    {{ toxiproxy_cli }} toxic add etcd-proxy \
+      --type latency \
+      --toxicName etcd-latency-{{ scenario_id }} \
+      --attribute latency={{ latency_ms }} \
+      --attribute jitter={{ latency_jitter_ms }} \
+      --toxicity {{ toxicity }}
+  when: inventory_hostname in etcd_targets
+
+- name: Reconfigure API servers to use Toxiproxy port for etcd
+  shell: |
+    # Update the static pod manifest to point at Toxiproxy port
+    for member_ip in {{ groups['etcd'] | map('extract', hostvars, 'ansible_host') | join(' ') }}; do
+      sed -i "s|https://${member_ip}:2379|https://${member_ip}:{{ toxiproxy_etcd_port }}|g" \
+        /etc/kubernetes/manifests/kube-apiserver.yaml
+    done
+  when: inventory_hostname in groups['control_plane']
+
+- name: Wait for API server to restart with new etcd endpoints
+  wait_for:
+    port: 6443
+    host: "{{ ansible_host }}"
+    delay: 5
+    timeout: 60
+  when: inventory_hostname in groups['control_plane']
+
+- name: Log etcd latency fault injected
+  debug:
+    msg: "FAULT INJECTED: {{ latency_ms }}ms ± {{ latency_jitter_ms }}ms latency on etcd members {{ etcd_targets | join(', ') }}"
+  when: inventory_hostname == groups['etcd'][0]

@@ -1,0 +1,46 @@
+---
+# scenarios/s6/playbook.yml
+# S6: Repeat-run recovery study
+#
+# What it does:
+#   Runs the S2 asymmetric worker isolation scenario N times in sequence,
+#   resetting to a clean state between runs. Compares recovery trajectories
+#   across runs to measure nondeterminism.
+#
+# Variables:
+#   repeat_count: number of runs (default: 5)
+#   base_scenario: which scenario to repeat (default: s2_asymmetric_worker)
+#
+# What we measure:
+#   - Whether the post-fault stable state is the same across all runs
+#   - Variance in convergence time
+#   - Whether any run produces a different final pod placement
+#   - Whether any run produces a different lease holder after recovery
+
+- name: S6 — Set up repeat-run study
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s6
+    scenario_name: "Repeat-run recovery study"
+    repeat_count: 5
+  tasks:
+    - name: Create results directory with run subdirectories
+      file:
+        path: "{{ results_dir }}/run_{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ range(1, repeat_count | int + 1) | list }}"
+
+    - name: Initialize comparison manifest
+      copy:
+        dest: "{{ results_dir }}/run_comparison.json"
+        content: "[]"
+
+- name: S6 — Execute repeat runs
+  include_tasks: run-one.yml
+  vars:
+    scenario_id: s6
+    run_number: "{{ item }}"
+    run_results_dir: "{{ results_dir }}/run_{{ item }}"
+  loop: "{{ range(1, (repeat_count | default(5)) | int + 1) | list }}"

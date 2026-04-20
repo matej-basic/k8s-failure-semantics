@@ -1,0 +1,202 @@
+---
+# scenarios/s3/playbook.yml
+# S3: etcd write-latency degradation
+#
+# What it does:
+#   Injects 800ms ± 200ms latency on all writes through Toxiproxy fronting etcd.
+#   Reads remain available. Controllers continue reconciling against stale state.
+#
+# What we measure:
+#   - etcd revision advancement rate (does it slow to a crawl?)
+#   - Controller reconciliation lag (object version acted on vs current revision)
+#   - Whether stale-state actuation produces semantic inconsistencies (I5)
+#   - API server request latency and error rate
+#   - Whether the system degrades gracefully or produces contradictory actions
+#   - Time before etcd leader election is disrupted by write timeouts
+
+- name: S3 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s3
+    scenario_name: "etcd write-latency degradation"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Verify cluster healthy
+      shell: kubectl get nodes --no-headers | grep -c Ready
+      register: ready_count
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: ready_count.stdout | int < 6
+
+    - name: Record baseline etcd write latency (uninjected)
+      shell: |
+        time (ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          put /k8s-test/baseline "$(date -u +%s%N)") 2>&1 | grep real
+      register: baseline_write_latency
+      delegate_to: "{{ groups['etcd'][0] }}"
+      run_once: true
+
+    - name: Save baseline latency
+      copy:
+        dest: "{{ results_dir }}/baseline_write_latency.txt"
+        content: "{{ baseline_write_latency.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+- name: S3 — Inject etcd write latency via Toxiproxy
+  hosts: etcd
+  gather_facts: no
+  vars:
+    scenario_id: s3
+    fault_type: etcd_latency
+    latency_ms: 800
+    latency_jitter_ms: 200
+    toxicity: 1.0
+  roles:
+    - role: fault-inject
+
+- name: S3 — Start continuous write-latency probe in background
+  hosts: "{{ groups['etcd'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s3
+  tasks:
+    - name: Install write-latency probe script
+      copy:
+        dest: /tmp/write-probe.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          OUT="{{ results_dir }}/write_latency_probe.jsonl"
+          while true; do
+            START=$(date +%s%N)
+            ETCDCTL_API=3 etcdctl \
+              --endpoints={{ etcd_endpoints }} \
+              --cacert={{ etcd_cert_dir }}/ca.crt \
+              --cert={{ etcd_cert_dir }}/server.crt \
+              --key={{ etcd_cert_dir }}/server.key \
+              put /k8s-test/probe "$(date -u +%s%N)" > /dev/null 2>&1
+            RC=$?
+            END=$(date +%s%N)
+            MS=$(( (END - START) / 1000000 ))
+            echo "{\"ts\": \"$(date -u +%H:%M:%S)\", \"latency_ms\": $MS, \"rc\": $RC}" >> $OUT
+            sleep 2
+          done
+
+    - name: Run write-latency probe in background
+      shell: nohup /tmp/write-probe.sh > /dev/null 2>&1 &
+      async: 0
+      poll: 0
+
+- name: S3 — Observer snapshots during fault window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s3
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_60 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_120 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_180 }
+
+- name: S3 — Measure reconciliation lag (resource version drift)
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s3
+  tasks:
+    - name: Compare etcd revision vs controller cache resource version
+      shell: |
+        ETCD_REV=$(ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint status --write-out=json | jq '.[0].Status.header.revision')
+        CM_RV=$(kubectl get pods --all-namespaces -o jsonpath='{.metadata.resourceVersion}')
+        echo "{\"etcd_revision\": $ETCD_REV, \"api_resourceVersion\": \"$CM_RV\", \"ts\": \"$(date -u +%H:%M:%S)\"}"
+      register: revision_drift
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save revision drift measurement
+      copy:
+        dest: "{{ results_dir }}/revision_drift.json"
+        content: "{{ revision_drift.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S3 — Tear down etcd latency
+  hosts: etcd:control_plane
+  gather_facts: no
+  vars:
+    scenario_id: s3
+    fault_type: teardown
+  roles:
+    - role: fault-inject
+
+- name: S3 — Stop write-latency probe
+  hosts: "{{ groups['etcd'][0] }}"
+  gather_facts: no
+  tasks:
+    - shell: pkill -f write-probe.sh 2>/dev/null || true
+
+- name: S3 — Post-fault recovery snapshots
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s3
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t30 }
+
+    - pause: { seconds: 90 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t120 }
+
+- name: S3 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s3
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"
