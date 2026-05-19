@@ -1,0 +1,39 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — it contains the vCenter password.
+
+# ── vCenter connection ─────────────────────────────────────────────────────
+vcenter_server   = "vcsa.oberin.cloud"
+vcenter_user     = "matej@oberin.cloud"
+vcenter_password = "CHANGEME"
+
+datacenter = "Datacenter"
+datastore  = "Datastore"
+esxi_host  = "esxi.oberin.cloud"
+vm_folder  = "k8s-failure-semantics"   # all 9 VMs land in this vSphere folder
+
+ubuntu_template = "ubuntu-24.04-template"
+
+# ── Management network (primary NIC: API, SSH, node-to-node) ───────────────
+mgmt_network     = "Internet_10.0.0.0"
+mgmt_ipv4_prefix = "10.0.0"      # VMs land on 10.0.0.50 .. 10.0.0.58
+mgmt_netmask     = 24
+mgmt_gateway     = "10.0.0.1"
+
+# ── Pod network (secondary NIC: Calico pod/service traffic) ────────────────
+# Point this at a dedicated portgroup/VLAN if you have one; otherwise the
+# management portgroup works fine — the NICs just use different subnets.
+pod_network     = "BasoNET"
+pod_ipv4_prefix = "192.168.200"  # VMs land on 192.168.200.50 .. .58
+pod_netmask     = 24
+
+dns_server = "10.0.0.1"
+domain     = "k8s.local"
+
+# ── Ansible / Kubernetes inventory settings ────────────────────────────────
+ansible_user                 = "ansible"
+ansible_ssh_private_key_file = "~/.ssh/id_rsa"
+k8s_version                  = "1.36.1"
+etcd_version                 = "3.5.30"
+pod_network_cidr             = "10.244.0.0/16"
+service_cidr                 = "10.96.0.0/12"
+api_vip                      = "10.0.0.59"
