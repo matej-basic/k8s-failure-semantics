@@ -1,0 +1,25 @@
+! Keepalived configuration — floats the apiserver VIP {{ api_vip }} across
+! the control-plane nodes. The first control plane in the inventory gets
+! MASTER + the highest priority; the rest are BACKUP and take over on failure.
+
+global_defs {
+  router_id k8s-{{ inventory_hostname }}
+}
+
+vrrp_instance VI_API {
+  state {% if inventory_hostname == groups['control_plane'][0] %}MASTER{% else %}BACKUP{% endif %}
+
+  interface {{ ansible_default_ipv4.interface }}
+  virtual_router_id 51
+  priority {{ 100 + (groups['control_plane'] | length) - groups['control_plane'].index(inventory_hostname) }}
+  advert_int 1
+
+  authentication {
+    auth_type PASS
+    auth_pass k8s-lab
+  }
+
+  virtual_ipaddress {
+    {{ api_vip }}
+  }
+}

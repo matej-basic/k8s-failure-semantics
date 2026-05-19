@@ -7,6 +7,12 @@
     join_cmd: "{{ lookup('file', '/tmp/worker-join.sh') }}"
     cert_key: "{{ lookup('file', '/tmp/cert-key.txt') | trim }}"
 
+- name: Ensure etcd PKI directory exists on this control plane node
+  file:
+    path: /etc/kubernetes/pki/etcd
+    state: directory
+    mode: '0755'
+
 - name: Distribute etcd CA cert to this control plane node
   copy:
     src: "/tmp/etcd-pki/ca.crt"

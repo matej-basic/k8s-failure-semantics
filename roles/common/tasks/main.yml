@@ -56,7 +56,6 @@
       - tcpdump
       - stress-ng
       - chrony
-      - ntp
     state: present
     update_cache: yes
 
@@ -79,9 +78,15 @@
     enabled: yes
     state: started
 
+# Minor version (e.g. 1.36) derived from k8s_version (e.g. 1.36.1) — the
+# pkgs.k8s.io repo is published per minor release.
+- name: Derive Kubernetes minor version for the apt repository
+  set_fact:
+    k8s_minor: "{{ k8s_version.split('.')[0:2] | join('.') }}"
+
 - name: Add Kubernetes apt repository key
   shell: |
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key \
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/Release.key \
       | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
   args:
     creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -90,7 +95,7 @@
   copy:
     dest: /etc/apt/sources.list.d/kubernetes.list
     content: |
-      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/ /
 
 - name: Install kubeadm, kubelet, kubectl
   apt:

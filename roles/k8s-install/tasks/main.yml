@@ -6,6 +6,10 @@
   include_tasks: etcd.yml
   when: inventory_hostname in groups['etcd']
 
+- name: Bring up the apiserver VIP via keepalived
+  include_tasks: keepalived.yml
+  when: inventory_hostname in groups['control_plane']
+
 - name: Include control plane init tasks (first node only)
   include_tasks: control-plane-init.yml
   when: inventory_hostname == groups['control_plane'][0]

@@ -1,0 +1,28 @@
+---
+# Bring up the floating apiserver VIP (api_vip) via keepalived/VRRP on the
+# three control-plane nodes. cp1 has the highest VRRP priority and owns the
+# VIP under normal operation; cp2/cp3 take over if cp1 fails.
+
+- name: Install keepalived
+  apt:
+    name: keepalived
+    state: present
+    update_cache: yes
+
+- name: Render keepalived configuration
+  template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: '0644'
+  register: keepalived_config
+
+- name: Enable keepalived
+  systemd:
+    name: keepalived
+    enabled: yes
+
+- name: Start or restart keepalived
+  systemd:
+    name: keepalived
+    state: "{{ 'restarted' if keepalived_config.changed else 'started' }}"
+    daemon_reload: yes

@@ -27,13 +27,20 @@
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
       -CAcreateserial -out server.crt -days 365 -sha256 \
       -extfile <(printf "subjectAltName=IP:127.0.0.1,{% for host in groups['etcd'] %}IP:{{ hostvars[host]['ansible_host'] }},{% endfor %}IP:{{ api_vip }}")
-    # Peer cert
+    # Peer cert — must carry the etcd member IPs as SANs; the Go TLS stack
+    # used by etcd verifies subjectAltName and ignores CN entirely.
     openssl genrsa -out peer.key 4096
     openssl req -new -key peer.key -subj "/CN=etcd-peer" -out peer.csr
     openssl x509 -req -in peer.csr -CA ca.crt -CAkey ca.key \
-      -CAcreateserial -out peer.crt -days 365 -sha256
+      -CAcreateserial -out peer.crt -days 365 -sha256 \
+      -extfile <(printf "subjectAltName=IP:127.0.0.1,{% for host in groups['etcd'] %}IP:{{ hostvars[host]['ansible_host'] }},{% endfor %}IP:{{ api_vip }}")
   args:
-    creates: /etc/etcd/pki/ca.crt
+    # peer.crt is the last artifact the script produces — a reliable
+    # "did the whole script finish" idempotency guard.
+    creates: /etc/etcd/pki/peer.crt
+    # The cert script uses process substitution <(...), a bash feature;
+    # the shell module defaults to /bin/sh (dash on Ubuntu), which lacks it.
+    executable: /bin/bash
 
 - name: Fetch etcd CA and certs from first etcd node
   when: inventory_hostname == groups['etcd'][0]

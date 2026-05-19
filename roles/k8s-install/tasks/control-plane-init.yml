@@ -2,11 +2,25 @@
 # roles/k8s-install/tasks/control-plane-init.yml
 # Initialises the first control plane node
 
-- name: Copy etcd CA to control plane
+- name: Ensure etcd PKI directory exists on the control plane
+  file:
+    path: /etc/kubernetes/pki/etcd
+    state: directory
+    mode: '0755'
+  tags: k8s-init
+
+- name: Copy etcd CA and apiserver etcd-client cert to control plane
   copy:
-    src: "/tmp/etcd-pki/ca.crt"
-    dest: /etc/kubernetes/pki/etcd/ca.crt
-    mode: '0644'
+    src: "/tmp/etcd-pki/{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    # External etcd: kubeadm needs the CA plus a client cert/key. The etcd
+    # server cert doubles as the apiserver etcd-client cert — it carries no
+    # EKU restriction, so it is also valid for clientAuth.
+    - { src: ca.crt, dest: /etc/kubernetes/pki/etcd/ca.crt, mode: '0644' }
+    - { src: server.crt, dest: /etc/kubernetes/pki/apiserver-etcd-client.crt, mode: '0644' }
+    - { src: server.key, dest: /etc/kubernetes/pki/apiserver-etcd-client.key, mode: '0600' }
   tags: k8s-init
 
 - name: Write kubeadm init config
@@ -39,7 +53,11 @@
 - name: Save join command and certificate key for other nodes
   shell: |
     kubeadm token create --print-join-command > /tmp/worker-join.sh
-    kubeadm init phase upload-certs --upload-certs 2>/dev/null \
+    # --config is required so kubeadm knows this is external-etcd mode and
+    # uploads the secret with external-etcd-* keys instead of stacked-etcd
+    # ones. Without it, the cp-join download-certs phase fails.
+    kubeadm init phase upload-certs --upload-certs \
+        --config /tmp/kubeadm-init.yml 2>/dev/null \
       | tail -1 > /tmp/cert-key.txt
   changed_when: true
 
