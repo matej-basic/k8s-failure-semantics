@@ -23,20 +23,28 @@
   when: inventory_hostname in etcd_targets
 
 - name: Create Toxiproxy proxy for etcd (if not already created)
+  # Modern toxiproxy-cli takes the proxy name as a POSITIONAL after all
+  # flags ('usage: create --listen <addr> --upstream <addr> <proxyName>').
+  # The old form (proxy name first) silently ate the next arg as the proxy
+  # name and reported "Required argument 'listen' was empty".
   shell: |
-    {{ toxiproxy_cli }} create etcd-proxy \
+    {{ toxiproxy_cli }} create \
       --listen {{ toxiproxy_etcd_listen }} \
-      --upstream {{ toxiproxy_etcd_upstream }} 2>/dev/null || true
+      --upstream {{ toxiproxy_etcd_upstream }} \
+      etcd-proxy 2>/dev/null || true
   when: inventory_hostname in etcd_targets
 
 - name: Inject latency toxic on etcd proxy
+  # Same positional-name issue as above; usage is
+  # 'toxic add [command options] <proxyName>'.
   shell: |
-    {{ toxiproxy_cli }} toxic add etcd-proxy \
+    {{ toxiproxy_cli }} toxic add \
       --type latency \
       --toxicName etcd-latency-{{ scenario_id }} \
       --attribute latency={{ latency_ms }} \
       --attribute jitter={{ latency_jitter_ms }} \
-      --toxicity {{ toxicity }}
+      --toxicity {{ toxicity }} \
+      etcd-proxy
   when: inventory_hostname in etcd_targets
 
 - name: Reconfigure API servers to use Toxiproxy port for etcd

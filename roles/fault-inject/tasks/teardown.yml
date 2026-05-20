@@ -15,10 +15,13 @@
   ignore_errors: yes
 
 - name: Remove all Toxiproxy toxics on etcd proxy
+  # Modern toxiproxy-cli takes the proxy name as the trailing positional
+  # for both `inspect` and `toxic remove` (was leading positional in older
+  # builds). Argument order matters even for these read-side commands.
   shell: |
     for toxic in $({{ toxiproxy_cli }} inspect etcd-proxy 2>/dev/null \
         | jq -r '.toxics[].name' 2>/dev/null); do
-      {{ toxiproxy_cli }} toxic remove etcd-proxy --toxicName "$toxic"
+      {{ toxiproxy_cli }} toxic remove --toxicName "$toxic" etcd-proxy
     done
   ignore_errors: yes
   when: inventory_hostname in groups['etcd']
