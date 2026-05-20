@@ -164,12 +164,40 @@ check_i3() {
 # (indicates nondeterministic recovery)
 
 check_i4() {
+  # I4 (recovery coherence) is *cross-run* by construction: the question is
+  # whether independent repetitions of the same fault converge to the same
+  # post-fault state. Comparing post-fault snapshots *within a single run*
+  # only tells you whether the lease holder happened to rotate during
+  # observation (it often does, that's normal renewal), not whether the
+  # cluster recovered to a unique state. Only S6 materially evaluates I4
+  # because only S6 runs multiple iterations under a stable scenario_id.
+  #
+  # For every other scenario we return INSUFFICIENT_DATA explicitly; the
+  # cross-run comparison lives in aggregate-results.sh
+  # (collect_recovery_variance).
+  local scenario
+  scenario=$(snap_field "$(snapshots | head -1)" '.scenario_id // "unknown"')
+
+  if [[ "$scenario" != s6* ]]; then
+    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
+           "note": "I4 is a cross-run invariant — only S6 (repeat-run study) can evaluate it. See aggregate_report.json recovery_variance_s6 block."}'
+    return
+  fi
+
+  # Inside an S6 sub-run (scenario_id "s6_run<N>") we still only have one
+  # final state; the cross-run comparison is done by aggregate-results.sh,
+  # so individual S6 runs also defer.
+  if [[ "$scenario" == s6_run* ]]; then
+    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
+           "note": "Single S6 iteration — see aggregate_report.json recovery_variance_s6 for the verdict across all repetitions."}'
+    return
+  fi
+
+  # Top-level S6 (scenario_id == "s6") with multiple per-run summaries —
+  # mirror the cross-run unique-holder count as the verdict.
   local post_snaps=()
   for snap in $(snapshots); do
     label=$(snap_field "$snap" '.snapshot_label')
-    # Match every post-fault label variant scenarios use: post_fault_*,
-    # post_recovery_*, post_convergence_*, post_reconnect_* (S11). The
-    # previous narrow match missed S11 entirely.
     if [[ "$label" == post_* ]]; then
       post_snaps+=("$snap")
     fi
@@ -177,18 +205,16 @@ check_i4() {
 
   if [ ${#post_snaps[@]} -lt 2 ]; then
     echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
-           "note": "fewer than 2 post-fault snapshots — run S6 for full assessment"}'
+           "note": "fewer than 2 post-fault snapshots — S6 did not complete enough iterations"}'
     return
   fi
 
-  # Compare lease holders across post-fault snapshots
   holders=()
   for snap in "${post_snaps[@]}"; do
     h=$(snap_field "$snap" '.control_plane.controller_manager_lease.holder // "unknown"')
     holders+=("$h")
   done
 
-  # Unique holders — if > 1 distinct non-null value, recovery is non-unique
   unique_holders=$(printf '%s\n' "${holders[@]}" | sort -u | grep -v null | wc -l)
 
   if [ "$unique_holders" -le 1 ]; then

@@ -2,6 +2,15 @@
 # group_vars/all.yml
 # Variables inherited by every host and play
 
+# ── Shell ─────────────────────────────────────────────────────────────────────
+# Use bash (not /bin/sh, which is dash on Ubuntu) for every shell:/script: task.
+# Several scenarios use bash-isms — `time (subshell)`, `local`, `${var:0:N}`
+# substring, process substitution — that silently break under dash with errors
+# like `Syntax error: word unexpected` or `Bad substitution`. Setting this
+# globally kills the whole class of bugs without touching the system's
+# /bin/sh symlink (system scripts and apt post-installs rely on dash semantics).
+ansible_shell_executable: /bin/bash
+
 # ── Scenario metadata ─────────────────────────────────────────────────────────
 scenario_id: "unset"
 scenario_name: "unset"

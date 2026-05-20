@@ -21,6 +21,12 @@
 - name: Inter-scenario health check
   hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no
+  # Combined with the per-task `retries:` / `until:` below, this lets a
+  # transient mux drop on cp1 be re-attempted as part of the retry loop
+  # instead of immediately flipping the host into the sticky global
+  # unreachable_hosts map (which would silently exclude every subsequent
+  # play in the entire ansible-playbook run).
+  ignore_unreachable: yes
   tasks:
     - name: Wait up to 5 minutes for all nodes to be Ready
       shell: |
@@ -82,6 +88,7 @@
 - name: Health check — etcd
   hosts: "{{ groups['etcd'][0] }}"
   gather_facts: no
+  ignore_unreachable: yes
   tasks:
     - name: Verify all etcd members are healthy
       shell: |

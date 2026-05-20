@@ -29,6 +29,12 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       failed_when: not_ready_count.stdout | int > 0
+      # Tolerate one transient ssh mux drop on cp1 (instead of silently
+      # propagating unreachable=1 to every subsequent play).
+      ignore_unreachable: yes
+      retries: 3
+      delay: 5
+      until: not_ready_count is succeeded
 
     - name: Create results directory
       file:

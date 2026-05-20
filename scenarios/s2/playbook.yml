@@ -31,6 +31,10 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       failed_when: not_ready_count.stdout | int > 0
+      ignore_unreachable: yes
+      retries: 3
+      delay: 5
+      until: not_ready_count is succeeded
 
     - name: Create results directory
       file:

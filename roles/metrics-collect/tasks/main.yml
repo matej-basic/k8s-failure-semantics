@@ -234,12 +234,12 @@
         "snapshot_label": "{{ snapshot_label }}",
         "timestamp": "{{ snapshot_ts }}",
         "etcd": {
-          "member_status": {{ etcd_status.stdout | default('null') }},
-          "current_revision": {{ etcd_revision.stdout | default('null') }}
+          "member_status": {{ etcd_status.stdout | default('null', true) }},
+          "current_revision": {{ etcd_revision.stdout | default('null', true) }}
         },
-        "control_plane": {{ cp_state.stdout | default('null') }},
+        "control_plane": {{ cp_state.stdout | default('null', true) }},
         "nodes": {{ node_snapshots | to_json }},
-        "external_probe": {{ service_probe.stdout | default('null') }}
+        "external_probe": {{ service_probe.stdout | default('null', true) }}
       }
   delegate_to: "{{ groups['observer'][0] }}"
   run_once: true

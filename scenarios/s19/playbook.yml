@@ -46,6 +46,10 @@
       register: etcd_prefault_health
       delegate_to: "{{ groups['etcd'][0] }}"
       run_once: true
+      ignore_unreachable: yes
+      retries: 3
+      delay: 5
+      until: etcd_prefault_health is succeeded
 
     - name: Save prefault etcd health
       copy:

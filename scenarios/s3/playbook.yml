@@ -30,6 +30,10 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       failed_when: ready_count.stdout | int < 6
+      ignore_unreachable: yes
+      retries: 3
+      delay: 5
+      until: ready_count is succeeded
 
     - name: Record baseline etcd write latency (uninjected)
       shell: |
