@@ -48,3 +48,8 @@ kubeconfig
 *.log
 tmp/
 .cache/
+
+# --- Scenario results & generated viewer ---
+/results/
+/report.html
+/results.zip

@@ -1,0 +1,7 @@
+---
+# inventory/group_vars/observer.yml
+# The observer is localhost (no VM). It only needs to write files under the
+# results_base path — never anything privileged — so disable become here so
+# the playbooks don't try to sudo on the macOS controller (which has no
+# passwordless sudo).
+ansible_become: false
