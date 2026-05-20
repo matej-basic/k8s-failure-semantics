@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Kubernetes Failure Semantics — Results</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {
+    --bg: #0f1115;
+    --bg-elev: #161922;
+    --bg-elev2: #1e2230;
+    --fg: #e6e9ef;
+    --fg-dim: #9aa3b2;
+    --fg-faint: #5a6273;
+    --accent: #7aa2f7;
+    --accent-dim: #3b4a6b;
+    --ok: #9ece6a;
+    --warn: #e0af68;
+    --err: #f7768e;
+    --na: #565f72;
+    --border: #262b38;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    padding: 18px 28px; border-bottom: 1px solid var(--border);
+    background: var(--bg-elev); display: flex; gap: 20px; align-items: baseline;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.2px; }
+  header .meta { color: var(--fg-dim); font-size: 12px; }
+
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 60px); }
+  nav { border-right: 1px solid var(--border); background: var(--bg-elev); padding: 14px 0; overflow-y: auto; }
+  nav .group { padding: 4px 18px 4px; color: var(--fg-faint); text-transform: uppercase;
+    font-size: 11px; letter-spacing: 0.8px; margin-top: 10px; }
+  nav button {
+    display: block; width: 100%; text-align: left; padding: 7px 18px;
+    background: transparent; border: none; color: var(--fg); cursor: pointer;
+    font: inherit; border-left: 3px solid transparent;
+  }
+  nav button:hover { background: var(--bg-elev2); }
+  nav button.active { background: var(--bg-elev2); border-left-color: var(--accent); color: var(--fg); }
+  nav .sub { padding-left: 36px; font-size: 13px; color: var(--fg-dim); }
+  nav .sub.active { color: var(--fg); }
+
+  main { padding: 24px 28px; overflow-x: auto; }
+  h2 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
+  h3 { margin: 24px 0 10px 0; font-size: 15px; font-weight: 600; color: var(--fg-dim);
+    text-transform: uppercase; letter-spacing: 0.6px; }
+  .crumb { color: var(--fg-dim); font-size: 12px; margin-bottom: 18px; }
+  .crumb span { color: var(--fg-faint); }
+
+  table.heatmap { border-collapse: separate; border-spacing: 4px; margin-top: 6px; }
+  table.heatmap th, table.heatmap td {
+    padding: 8px 12px; min-width: 86px; text-align: center; border-radius: 4px;
+    font-size: 12px; font-weight: 500;
+  }
+  table.heatmap th { background: var(--bg-elev); color: var(--fg-dim); font-weight: 500; }
+  table.heatmap td.scenario { background: var(--bg-elev); color: var(--fg);
+    text-align: left; font-family: ui-monospace, monospace; min-width: 60px; }
+  td.v-PRESERVED { background: rgba(158, 206, 106, 0.18); color: var(--ok); }
+  td.v-VIOLATED { background: rgba(247, 118, 142, 0.22); color: var(--err); }
+  td.v-INSUFFICIENT_DATA { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
+  td.v-NO_DATA, td.v-PARSE_ERROR { background: var(--bg-elev); color: var(--na); }
+
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; }
+  .badge { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 500;
+    background: var(--bg-elev2); color: var(--fg-dim); }
+  .badge.ok { background: rgba(158, 206, 106, 0.18); color: var(--ok); }
+  .badge.err { background: rgba(247, 118, 142, 0.22); color: var(--err); }
+  .badge.warn { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
+  .badge.na { color: var(--na); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px; margin: 12px 0; max-width: 720px; }
+  .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; }
+  .card .n { font-size: 22px; font-weight: 600; }
+  .card .lbl { color: var(--fg-dim); font-size: 12px; margin-top: 4px; }
+
+  .invariant-row { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; margin: 8px 0; }
+  .invariant-row .head { display: flex; gap: 12px; align-items: center; }
+  .invariant-row .id { font-family: ui-monospace, monospace; color: var(--accent); font-weight: 600; }
+  .invariant-row .name { color: var(--fg-dim); }
+  .invariant-row .grow { flex: 1; }
+  .invariant-row pre { margin: 8px 0 0 0; max-height: 240px; overflow: auto;
+    background: var(--bg); border: 1px solid var(--border); padding: 8px;
+    border-radius: 4px; font-size: 11px; color: var(--fg-dim); white-space: pre-wrap; }
+
+  .timeline { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 20px; }
+  .timeline button { background: var(--bg-elev); border: 1px solid var(--border);
+    color: var(--fg); padding: 6px 12px; border-radius: 4px; cursor: pointer;
+    font: inherit; font-size: 12px; }
+  .timeline button:hover { background: var(--bg-elev2); }
+  .timeline button.active { border-color: var(--accent); color: var(--accent); }
+  .timeline .phase { font-size: 10px; color: var(--fg-faint);
+    text-transform: uppercase; margin-right: 4px; align-self: center; }
+
+  .snap-meta { color: var(--fg-dim); font-size: 12px; margin: 8px 0 14px; }
+  .snap-meta b { color: var(--fg); font-weight: 500; }
+  .snap-meta .sep { color: var(--fg-faint); margin: 0 8px; }
+
+  details.snap-section { margin: 8px 0; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg-elev); }
+  details.snap-section > summary { padding: 8px 12px; cursor: pointer; user-select: none;
+    color: var(--fg); font-weight: 500; font-size: 13px; }
+  details.snap-section > summary:hover { background: var(--bg-elev2); }
+  details.snap-section[open] > summary { border-bottom: 1px solid var(--border); }
+  details.snap-section .body { padding: 10px 12px; }
+  details.snap-section pre { margin: 0; max-height: 480px; overflow: auto; font-size: 11px;
+    background: var(--bg); border-radius: 4px; padding: 8px; color: var(--fg-dim); }
+
+  .kv { display: grid; grid-template-columns: 220px 1fr; gap: 4px 14px; margin: 8px 0; }
+  .kv .k { color: var(--fg-dim); }
+  .kv .v { font-family: ui-monospace, monospace; font-size: 12px; }
+
+  .empty { color: var(--fg-dim); font-style: italic; margin: 14px 0; }
+
+  .ref-intro { color: var(--fg-dim); max-width: 760px; margin: 6px 0 18px; }
+  .ref-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 16px; margin: 10px 0; max-width: 880px; }
+  .ref-card .ref-head { display: flex; gap: 14px; align-items: baseline; }
+  .ref-card .ref-head .id { color: var(--accent); font-weight: 600;
+    font-family: ui-monospace, monospace; min-width: 36px; }
+  .ref-card .ref-head .name { font-weight: 600; color: var(--fg); }
+  .ref-card .ref-body { margin-top: 8px; color: var(--fg-dim); }
+  .ref-card .ref-body p { margin: 4px 0; }
+  .ref-card .ref-body p b { color: var(--fg); font-weight: 500; }
+  .ref-card .kv { grid-template-columns: 180px 1fr; margin-top: 10px; }
+  .ref-card .kv .v.plain { font-family: inherit; color: var(--fg-dim); }
+
+  .scenario-blurb { color: var(--fg-dim); max-width: 820px; margin: 8px 0 12px; }
+  .scenario-blurb a { font-size: 11px; }
+  .invariant-row .desc { color: var(--fg-dim); font-size: 12px; margin-top: 4px; }
+  .invariant-row .id a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--accent-dim); }
+  .invariant-row .id a:hover { border-bottom-color: var(--accent); }
+
+  .run-row { padding: 6px 18px; color: var(--fg-dim); font-size: 12px; }
+  .run-row.active { color: var(--fg); }
+  .run-row button { color: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kubernetes Failure Semantics — Results</h1>
+  <div class="meta" id="hdr-meta"></div>
+</header>
+<div class="layout">
+  <nav id="nav"></nav>
+  <main id="main"></main>
+</div>
+
+<script>
+const DATA = /*__REPORT_DATA__*/null;
+
+// ── Scenario catalogue (paper Table + scenario playbook headers) ─────────────
+const CATALOG = {
+  s1: {
+    name: "Symmetric control-plane partition",
+    fault: "network_partition",
+    invariants: ["I1","I3"],
+    summary: "Isolates one control-plane node (cp1) from its peers and from etcd.",
+    description: "iptables rules drop traffic between cp1 and { cp2, cp3, etcd1-3 } in both directions. The isolated node cannot reach a majority of etcd or the other API servers; the remaining two control-plane nodes should still form a working majority. We measure whether a second leader lease holder appears (I1 violation), how long the isolated API server takes to report unhealthy, whether etcd loses quorum, and the recovery trajectory after the partition is lifted.",
+  },
+  s2: {
+    name: "Asymmetric worker isolation",
+    fault: "network_asymmetric",
+    invariants: ["I1","I2","I3"],
+    summary: "One worker can be reached but cannot send replies (or vice versa).",
+    description: "One direction of traffic for a worker is dropped, so the kubelet's heartbeat and a control-plane-initiated probe see opposite states. Tests whether endpoints are correctly republished when the backend is one-way unreachable, and whether the control plane declares the node failed before pods are reconciled away from it.",
+  },
+  s3: {
+    name: "etcd write-latency degradation",
+    fault: "etcd_latency",
+    invariants: ["I5"],
+    summary: "Toxiproxy injects latency on the etcd write path.",
+    description: "All API-server → etcd writes route through a Toxiproxy in front of each etcd member, with added latency injected as a toxic. Controllers see writes succeed eventually but their observed revisions lag wall-clock time. Tests whether controllers throttle reconciliation under storage lag or amplify it.",
+  },
+  s4: {
+    name: "Clock skew on control-plane node",
+    fault: "clock_skew",
+    invariants: ["I1","I3"],
+    summary: "Shifts cp1's clock forward/back relative to its peers.",
+    description: "date is stepped on cp1 while chrony is paused. Leases, certificate validity, and event ordering all depend on local time; the test asks whether the cluster forms a coherent picture of failure when timestamps disagree.",
+  },
+  s5: {
+    name: "API disruption under multiple controllers",
+    fault: "network_partition",
+    invariants: ["I1","I5"],
+    summary: "Multiple controllers race during a flapping API-server outage.",
+    description: "API-server reachability is repeatedly blackholed while several controllers (custom operator + built-in) are mid-reconciliation. Measures lease-holder churn and reconciliation amplification.",
+  },
+  s6: {
+    name: "Repeat-run recovery study",
+    fault: "network_asymmetric",
+    invariants: ["I4"],
+    summary: "Same fault N times, comparing the post-fault state across runs.",
+    description: "The asymmetric partition from S2 is applied and removed in a loop, recording the final lease holder, pod placement, and endpoint set per run. I4 only has meaning here — a single run cannot show recovery is non-deterministic.",
+  },
+  s8: {
+    name: "Partition + storage lag (composed)",
+    fault: "composed",
+    invariants: ["I1","I2","I5"],
+    summary: "S1's partition overlaps with S3's etcd latency.",
+    description: "Composed fault: network partition on the control plane plus injected etcd write latency. Tests whether invariants that are preserved individually still hold under simultaneous faults.",
+  },
+  s11: {
+    name: "Kubelet partition / pod lifecycle divergence",
+    fault: "network_partition",
+    invariants: ["I1","I2","I3"],
+    summary: "Worker kubelet is partitioned mid-pod-lifecycle.",
+    description: "A worker is partitioned from the API server while pods are being created and deleted on it. Tests whether the control plane's pod state diverges from what crictl reports node-locally — a classic source of I3 violations.",
+  },
+  s12: {
+    name: "Leader election storm",
+    fault: "network_flap",
+    invariants: ["I1"],
+    summary: "Brief, repeated network drops to force lease re-elections.",
+    description: "iptables rules toggle on and off in a tight loop (flap-fault.sh), so the lease holder repeatedly loses and re-acquires the lease. Tests whether two distinct holders are ever simultaneously valid.",
+  },
+  s14: {
+    name: "Stale informer cache",
+    fault: "etcd_latency",
+    invariants: ["I5"],
+    summary: "Controllers act on a watch cache that has fallen behind.",
+    description: "Latency is injected on the watch stream so informer caches lag actual etcd state. The test records when reconciliation events are emitted against state that has since been overwritten.",
+  },
+  s15: {
+    name: "Graceful termination race",
+    fault: "pod lifecycle",
+    invariants: ["I2"],
+    summary: "Pod deletion races endpoint removal.",
+    description: "A pod is deleted while traffic is in flight; we capture the wall-clock gap between the SIGTERM and the endpoint subset update that stops sending it new traffic. Quantifies the I2 window that the paper claims is non-trivially open by default.",
+  },
+  s17: {
+    name: "etcd compaction + watch history gap",
+    fault: "etcd_compact",
+    invariants: ["I5"],
+    summary: "Compaction during a partition severs the watch history.",
+    description: "etcd compaction is triggered while a controller is partitioned away. When the controller reconnects, the requested revision is below compactRevision and the watch returns ErrCompacted — forcing a full re-list. Tests whether the controller re-derives state safely.",
+  },
+  s18: {
+    name: "Node pressure eviction race",
+    fault: "memory_pressure",
+    invariants: ["I1"],
+    summary: "stress-ng exhausts memory while the scheduler is placing pods.",
+    description: "Memory pressure is induced on a worker, triggering kubelet's node-pressure eviction. The scheduler is simultaneously placing replacement pods. Tests whether eviction and scheduling agree on which replica is the authoritative one.",
+  },
+  s19: {
+    name: "Split etcd quorum",
+    fault: "network_partition",
+    invariants: ["I1","I5"],
+    summary: "Network split divides etcd into majority/minority partitions.",
+    description: "iptables splits the etcd cluster so a minority side keeps its leader briefly but cannot commit. Measures whether the API server on the minority side serves stale reads, and how long until clients see the new leader on the majority side.",
+  },
+};
+
+// ── Invariant glossary (paper §4) ────────────────────────────────────────────
+const INVARIANTS = {
+  I1: {
+    name: "Exclusive authority",
+    description: "At most one process holds the authoritative role (controller-manager lease, scheduler lease, primary StatefulSet replica) at any wall-clock instant.",
+    violation: "Two simultaneous distinct lease holders observed across snapshots, or duplicate StatefulSet pod identities running on different nodes.",
+  },
+  I2: {
+    name: "Reachability publication",
+    description: "Endpoints published for a service correspond to backends that can actually serve traffic. Clients reading published endpoints should not be told to talk to a backend that has stopped.",
+    violation: "Endpoints list contains addresses of pods that are not Running, or the external probe (cluster-IP HTTP request) returns non-200 while endpoints are listed as Ready.",
+  },
+  I3: {
+    name: "Failure declaration consistency",
+    description: "A node declared NotReady by the control plane has actually stopped running its workloads from the node's own perspective. Declaration and reality agree.",
+    violation: "Node status shows Ready=False in the API while node-local crictl reports containers in CONTAINER_RUNNING state.",
+  },
+  I4: {
+    name: "Recovery coherence",
+    description: "After a fault is removed, the cluster converges to a state that is uniquely determined by the inputs — not dependent on which controller noticed recovery first.",
+    violation: "Across repeated runs of the same fault, the post-fault snapshots disagree on lease holder, pod placement, or endpoint membership. Only S6 can evaluate this; single-shot scenarios report INSUFFICIENT_DATA.",
+  },
+  I5: {
+    name: "Observation-action consistency",
+    description: "Controllers do not act on observations they can prove are stale. Reconciliation traffic should correlate with state change, not race ahead of it.",
+    violation: "etcd revision advances by more than 500 between snapshots without any change in pod state or lease holder (high reconciliation churn on unchanged state), or Warning events claim NodeNotReady while the same snapshot shows Ready=True nodes.",
+  },
+};
+const INVARIANT_NAMES = Object.fromEntries(Object.entries(INVARIANTS).map(([k,v]) => [k, v.name.toLowerCase()]));
+const PHASE_OF = (label) => {
+  if (!label) return "?";
+  if (label === "pre_fault") return "pre";
+  if (label.startsWith("post_fault") || label.startsWith("post_recovery") || label.startsWith("post_convergence")) return "post";
+  return "during";
+};
+
+// ── App state ────────────────────────────────────────────────────────────────
+const state = { view: "overview", scenario: null, run: null, snapshot: null };
+
+// ── Routing via hash ─────────────────────────────────────────────────────────
+function parseHash() {
+  const h = location.hash.replace(/^#\/?/, "");
+  if (!h) return { view: "overview" };
+  const parts = h.split("/");
+  if (parts[0] === "scenario" && parts[1]) {
+    return { view: "scenario", scenario: parts[1], run: parts[2] || null, snapshot: parts[3] || null };
+  }
+  if (parts[0] === "reference") {
+    return { view: "reference", anchor: parts[1] || null };
+  }
+  return { view: "overview" };
+}
+function setHash(s) {
+  let h = "";
+  if (s.view === "scenario") {
+    h = "#/scenario/" + s.scenario;
+    if (s.run) h += "/" + s.run;
+    if (s.snapshot) h += "/" + s.snapshot;
+  } else if (s.view === "reference") {
+    h = "#/reference" + (s.anchor ? "/" + s.anchor : "");
+  } else {
+    h = "#/";
+  }
+  if (location.hash !== h) location.hash = h;
+}
+
+// ── Header meta ──────────────────────────────────────────────────────────────
+function renderHeader() {
+  const el = document.getElementById("hdr-meta");
+  const scenarioCount = Object.keys(DATA.scenarios).length;
+  el.textContent = `${scenarioCount} scenario${scenarioCount === 1 ? "" : "s"} · generated ${DATA.generated_at}`;
+}
+
+// ── Nav ──────────────────────────────────────────────────────────────────────
+function renderNav() {
+  const nav = document.getElementById("nav");
+  nav.innerHTML = "";
+
+  const overviewBtn = document.createElement("button");
+  overviewBtn.textContent = "Overview";
+  overviewBtn.className = state.view === "overview" ? "active" : "";
+  overviewBtn.onclick = () => navigate({ view: "overview" });
+  nav.appendChild(overviewBtn);
+
+  const refBtn = document.createElement("button");
+  refBtn.textContent = "Reference";
+  refBtn.className = state.view === "reference" ? "active" : "";
+  refBtn.onclick = () => navigate({ view: "reference" });
+  nav.appendChild(refBtn);
+
+  const group = document.createElement("div");
+  group.className = "group";
+  group.textContent = "Scenarios";
+  nav.appendChild(group);
+
+  const scenarioIds = Object.keys(CATALOG);
+  for (const sc of scenarioIds) {
+    const hasData = DATA.scenarios[sc];
+    const btn = document.createElement("button");
+    btn.disabled = !hasData;
+    btn.style.opacity = hasData ? "1" : "0.4";
+    btn.style.cursor = hasData ? "pointer" : "not-allowed";
+    btn.className = state.view === "scenario" && state.scenario === sc ? "active" : "";
+    btn.innerHTML = `<span class="mono">${sc.toUpperCase()}</span> &nbsp; <span style="color:var(--fg-dim)">${CATALOG[sc].name}</span>`;
+    btn.title = CATALOG[sc].name;
+    btn.onclick = () => navigate({ view: "scenario", scenario: sc, run: latestRun(sc), snapshot: null });
+    nav.appendChild(btn);
+
+    if (state.view === "scenario" && state.scenario === sc && hasData) {
+      const runs = Object.keys(DATA.scenarios[sc].runs).sort();
+      for (const r of runs) {
+        const sub = document.createElement("button");
+        sub.className = "sub" + (state.run === r ? " active" : "");
+        sub.textContent = r;
+        sub.onclick = () => navigate({ view: "scenario", scenario: sc, run: r, snapshot: null });
+        nav.appendChild(sub);
+      }
+    }
+  }
+}
+
+function latestRun(sc) {
+  if (!DATA.scenarios[sc]) return null;
+  const runs = Object.keys(DATA.scenarios[sc].runs).sort();
+  return runs[runs.length - 1] || null;
+}
+
+// ── Navigation ───────────────────────────────────────────────────────────────
+function navigate(next) {
+  Object.assign(state, { scenario: null, run: null, snapshot: null }, next);
+  setHash(state);
+  render();
+}
+window.addEventListener("hashchange", () => {
+  const next = parseHash();
+  if (next.view === "scenario" && next.scenario && !next.run) next.run = latestRun(next.scenario);
+  Object.assign(state, { scenario: null, run: null, snapshot: null }, next);
+  render();
+});
+
+// ── Verdict helpers ──────────────────────────────────────────────────────────
+function verdictCell(v) {
+  v = v || "NO_DATA";
+  return `<td class="v-${v}">${v.replace("INSUFFICIENT_DATA","INSUF").replace("PARSE_ERROR","ERROR")}</td>`;
+}
+function verdictBadge(v) {
+  v = v || "NO_DATA";
+  const cls = v === "PRESERVED" ? "ok" : v === "VIOLATED" ? "err"
+            : v === "INSUFFICIENT_DATA" ? "warn" : "na";
+  return `<span class="badge ${cls}">${v}</span>`;
+}
+
+// ── Pull verdicts from a scenario's latest run ───────────────────────────────
+function latestVerdicts(sc) {
+  const data = DATA.scenarios[sc];
+  if (!data) return null;
+  const run = latestRun(sc);
+  const ir = data.runs[run] && data.runs[run].invariant_report;
+  if (!ir || !ir.invariants) return null;
+  const out = {};
+  for (const inv of ir.invariants) out[inv.invariant] = inv.verdict;
+  return out;
+}
+
+// ── Overview view ────────────────────────────────────────────────────────────
+function renderOverview() {
+  const main = document.getElementById("main");
+  const present = Object.keys(DATA.scenarios);
+  const all = Object.keys(CATALOG);
+
+  let totalP = 0, totalV = 0, totalI = 0;
+  for (const sc of present) {
+    const v = latestVerdicts(sc);
+    if (!v) continue;
+    for (const k of Object.keys(v)) {
+      if (v[k] === "PRESERVED") totalP++;
+      else if (v[k] === "VIOLATED") totalV++;
+      else if (v[k] === "INSUFFICIENT_DATA") totalI++;
+    }
+  }
+  const total = totalP + totalV + totalI;
+
+  let html = `
+    <h2>Overview</h2>
+    <div class="crumb"><span>Results path:</span> <code>${escapeHtml(DATA.results_path)}</code></div>
+    <div class="cards">
+      <div class="card"><div class="n">${present.length}<span style="color:var(--fg-dim);font-size:14px;font-weight:400">&nbsp;/ ${all.length}</span></div><div class="lbl">scenarios with data</div></div>
+      <div class="card"><div class="n" style="color:var(--ok)">${totalP}</div><div class="lbl">invariants preserved</div></div>
+      <div class="card"><div class="n" style="color:var(--err)">${totalV}</div><div class="lbl">invariants violated</div></div>
+      <div class="card"><div class="n" style="color:var(--warn)">${totalI}</div><div class="lbl">insufficient data</div></div>
+    </div>
+
+    <h3>Invariant heatmap (latest run per scenario)</h3>
+  `;
+
+  html += `<table class="heatmap"><thead><tr><th></th>`;
+  for (const inv of ["I1","I2","I3","I4","I5"]) {
+    const tip = INVARIANTS[inv] ? `${INVARIANTS[inv].name} — ${INVARIANTS[inv].description}` : "";
+    html += `<th title="${escapeHtml(tip)}"><a href="#/reference/${inv}" style="color:inherit">${inv}</a></th>`;
+  }
+  html += `</tr></thead><tbody>`;
+
+  for (const sc of all) {
+    const v = latestVerdicts(sc) || {};
+    const has = !!DATA.scenarios[sc];
+    const labelCell = has
+      ? `<td class="scenario"><a href="#/scenario/${sc}">${sc.toUpperCase()}</a> <span style="color:var(--fg-faint);font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`
+      : `<td class="scenario" style="color:var(--fg-faint)">${sc.toUpperCase()} <span style="font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`;
+    html += `<tr>${labelCell}`;
+    for (const inv of ["I1","I2","I3","I4","I5"]) {
+      html += verdictCell(v[inv]);
+    }
+    html += `</tr>`;
+  }
+  html += `</tbody></table>`;
+
+  if (DATA.aggregate) {
+    html += `<h3>Aggregate report</h3>`;
+    html += `<details class="snap-section" open><summary>aggregate_report.json</summary>
+              <div class="body"><pre>${escapeHtml(JSON.stringify(DATA.aggregate, null, 2))}</pre></div>
+             </details>`;
+  } else {
+    html += `<p class="empty">No aggregate_report.json yet — run all scenarios or run <code>scripts/aggregate-results.sh ${escapeHtml(DATA.results_path)}</code>.</p>`;
+  }
+
+  main.innerHTML = html;
+}
+
+// ── Scenario view ────────────────────────────────────────────────────────────
+function renderScenario() {
+  const main = document.getElementById("main");
+  const sc = state.scenario;
+  const meta = CATALOG[sc] || { name: "(unknown scenario)", fault: "?", invariants: [] };
+  const data = DATA.scenarios[sc];
+
+  if (!data) {
+    main.innerHTML = `<h2>${sc.toUpperCase()} — ${escapeHtml(meta.name)}</h2>
+      <p class="empty">No results yet for ${sc.toUpperCase()}.</p>`;
+    return;
+  }
+
+  const runs = Object.keys(data.runs).sort();
+  if (!state.run || !data.runs[state.run]) state.run = runs[runs.length - 1];
+  const run = data.runs[state.run];
+  const snapLabels = Object.keys(run.snapshots);
+
+  // Pick a default snapshot
+  if (!state.snapshot || !run.snapshots[state.snapshot]) {
+    state.snapshot = snapLabels[0] || null;
+  }
+
+  let html = `
+    <div class="crumb"><a href="#/">Overview</a> <span>›</span> ${sc.toUpperCase()}</div>
+    <h2>${sc.toUpperCase()} — ${escapeHtml(meta.name)}</h2>
+    ${meta.summary ? `<div class="scenario-blurb">${escapeHtml(meta.summary)} <a href="#/reference/${sc}">full description →</a></div>` : ""}
+    <div class="snap-meta">
+      <b>Fault:</b> <span class="mono">${escapeHtml(meta.fault)}</span>
+      <span class="sep">·</span>
+      <b>Run:</b> <span class="mono">${escapeHtml(state.run)}</span>
+      <span class="sep">·</span>
+      <b>Snapshots:</b> ${snapLabels.length}
+    </div>
+  `;
+
+  // ── Run selector
+  if (runs.length > 1) {
+    html += `<h3>Runs</h3><div class="timeline">`;
+    for (const r of runs) {
+      const active = r === state.run ? "active" : "";
+      html += `<button class="${active}" onclick="navigate({view:'scenario',scenario:'${sc}',run:'${r}',snapshot:null})">${escapeHtml(r)}</button>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── Invariant report
+  html += `<h3>Invariant verdicts</h3>`;
+  const ir = run.invariant_report;
+  if (!ir) {
+    html += `<p class="empty">No invariant_report.json for this run.</p>`;
+  } else if (ir._parse_error) {
+    html += `<p class="empty">Invariant report failed to parse: ${escapeHtml(ir._parse_error)}</p>`;
+  } else {
+    if (ir.summary) {
+      html += `<div class="badges">
+        <span class="badge ok">${ir.summary.preserved || 0} preserved</span>
+        <span class="badge err">${ir.summary.violated || 0} violated</span>
+        <span class="badge warn">${ir.summary.insufficient_data || 0} insufficient</span>
+        <span class="badge">snapshots: ${ir.snapshots_evaluated || 0}</span>
+      </div>`;
+    }
+    if (ir.divergence_timing) {
+      const t = ir.divergence_timing;
+      html += `<div class="kv">
+        <div class="k">First fault snapshot</div><div class="v">${escapeHtml(String(t.first_fault_snapshot || "—"))}</div>
+        <div class="k">First service failure</div><div class="v">${escapeHtml(String(t.first_service_failure_snapshot || "—"))}</div>
+      </div>`;
+    }
+    for (const inv of (ir.invariants || [])) {
+      const def = INVARIANTS[inv.invariant];
+      html += `<div class="invariant-row">
+        <div class="head">
+          <div class="id"><a href="#/reference/${inv.invariant}" title="See full definition">${escapeHtml(inv.invariant)}</a></div>
+          <div class="name">${escapeHtml(def ? def.name.toLowerCase() : (inv.name || ""))}</div>
+          <div class="grow"></div>
+          ${verdictBadge(inv.verdict)}
+        </div>
+        ${def ? `<div class="desc">${escapeHtml(def.description)}</div>` : ""}`;
+      if ((inv.violations && inv.violations.length) || inv.note) {
+        html += `<pre>${escapeHtml(JSON.stringify({
+          violation_count: inv.violation_count,
+          violations: inv.violations,
+          note: inv.note,
+          distinct_holders: inv.distinct_holders,
+          holder_sequence: inv.holder_sequence,
+          post_fault_snapshots: inv.post_fault_snapshots,
+        }, (k,v) => v === undefined ? undefined : v, 2))}</pre>`;
+      }
+      html += `</div>`;
+    }
+  }
+
+  // ── Snapshot timeline
+  html += `<h3>Snapshots</h3>`;
+  if (!snapLabels.length) {
+    html += `<p class="empty">No snapshots recorded.</p>`;
+  } else {
+    const ordered = orderSnapLabels(snapLabels);
+    html += `<div class="timeline">`;
+    let lastPhase = null;
+    for (const l of ordered) {
+      const phase = PHASE_OF(l);
+      if (phase !== lastPhase) {
+        html += `<span class="phase">${phase}</span>`;
+        lastPhase = phase;
+      }
+      const active = l === state.snapshot ? "active" : "";
+      html += `<button class="${active}" onclick="navigate({view:'scenario',scenario:'${sc}',run:'${state.run}',snapshot:'${l}'})">${escapeHtml(l)}</button>`;
+    }
+    html += `</div>`;
+
+    if (state.snapshot && run.snapshots[state.snapshot]) {
+      html += renderSnapshot(run.snapshots[state.snapshot]);
+    }
+  }
+
+  main.innerHTML = html;
+}
+
+function orderSnapLabels(labels) {
+  const phaseOrder = { pre: 0, during: 1, post: 2, "?": 3 };
+  return [...labels].sort((a, b) => {
+    const pa = phaseOrder[PHASE_OF(a)], pb = phaseOrder[PHASE_OF(b)];
+    if (pa !== pb) return pa - pb;
+    // Try to sort by trailing number when present (t_plus_30 < t_plus_60).
+    const na = (a.match(/(\d+)$/) || [])[1];
+    const nb = (b.match(/(\d+)$/) || [])[1];
+    if (na && nb) return Number(na) - Number(nb);
+    return a.localeCompare(b);
+  });
+}
+
+// ── Snapshot detail ──────────────────────────────────────────────────────────
+function renderSnapshot(snap) {
+  let html = `<div class="snap-meta">
+    <b>Label:</b> <span class="mono">${escapeHtml(snap.snapshot_label || "?")}</span>
+    <span class="sep">·</span>
+    <b>Timestamp:</b> <span class="mono">${escapeHtml(snap.timestamp || "?")}</span>
+    <span class="sep">·</span>
+    <b>etcd revision:</b> <span class="mono">${escapeHtml(String(snap.etcd && snap.etcd.current_revision))}</span>
+  </div>`;
+
+  const sections = [
+    ["External probe", snap.external_probe],
+    ["Controller-manager lease", snap.control_plane && snap.control_plane.controller_manager_lease],
+    ["Scheduler lease", snap.control_plane && snap.control_plane.scheduler_lease],
+    ["Node conditions", snap.control_plane && snap.control_plane.node_conditions],
+    ["Pod states", snap.control_plane && snap.control_plane.pod_states],
+    ["Endpoint states", snap.control_plane && snap.control_plane.endpoint_states],
+    ["Warning events", snap.control_plane && snap.control_plane.warning_events],
+    ["etcd member status", snap.etcd && snap.etcd.member_status],
+    ["Per-node observations", snap.nodes],
+  ];
+
+  for (const [title, value] of sections) {
+    if (value == null) continue;
+    const isEmpty = Array.isArray(value) ? value.length === 0
+                   : typeof value === "object" ? Object.keys(value).length === 0 : false;
+    const summary = isEmpty
+      ? `${escapeHtml(title)} <span style="color:var(--fg-faint);font-weight:400">(empty)</span>`
+      : escapeHtml(title);
+    html += `<details class="snap-section"><summary>${summary}</summary>
+      <div class="body"><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></div>
+    </details>`;
+  }
+
+  html += `<details class="snap-section"><summary>Raw snapshot JSON</summary>
+    <div class="body"><pre>${escapeHtml(JSON.stringify(snap, null, 2))}</pre></div>
+  </details>`;
+
+  return html;
+}
+
+// ── Util ─────────────────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderReference() {
+  const main = document.getElementById("main");
+  let html = `
+    <h2>Reference</h2>
+    <div class="crumb">What each scenario does and what each invariant means. Cross-links are clickable.</div>
+
+    <h3 id="invariants">Invariants (paper §4)</h3>
+    <p class="ref-intro">The five invariants below are evaluated against each snapshot of a scenario run. A scenario's verdict is the conjunction across all its snapshots: <span class="badge ok">PRESERVED</span> if the invariant held in every snapshot, <span class="badge err">VIOLATED</span> if it failed in at least one, and <span class="badge warn">INSUFFICIENT_DATA</span> if there were too few snapshots to evaluate (only relevant for I4 outside S6).</p>
+  `;
+  for (const [iid, inv] of Object.entries(INVARIANTS)) {
+    const usedBy = Object.entries(CATALOG)
+      .filter(([_, sc]) => sc.invariants.includes(iid))
+      .map(([sid, _]) => `<a href="#/reference/${sid}">${sid.toUpperCase()}</a>`)
+      .join(", ");
+    html += `<div class="ref-card" id="ref-${iid}">
+      <div class="ref-head">
+        <span class="id">${iid}</span>
+        <span class="name">${escapeHtml(inv.name)}</span>
+      </div>
+      <div class="ref-body">
+        <p>${escapeHtml(inv.description)}</p>
+        <div class="kv">
+          <div class="k">Violation criterion</div><div class="v plain">${escapeHtml(inv.violation)}</div>
+          <div class="k">Evaluated by scenarios</div><div class="v plain">${usedBy || "—"}</div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  html += `<h3 id="scenarios">Scenarios</h3>`;
+  for (const [sid, sc] of Object.entries(CATALOG)) {
+    const hasData = !!DATA.scenarios[sid];
+    const dataLink = hasData
+      ? ` &nbsp; <a href="#/scenario/${sid}" style="font-size:11px">view results →</a>`
+      : ` &nbsp; <span class="badge na" style="font-size:10px">no data</span>`;
+    const invLinks = sc.invariants.map(i => `<a href="#/reference/${i}">${i}</a>`).join(", ");
+    html += `<div class="ref-card" id="ref-${sid}">
+      <div class="ref-head">
+        <span class="id mono">${sid.toUpperCase()}</span>
+        <span class="name">${escapeHtml(sc.name)}</span>
+        ${dataLink}
+      </div>
+      <div class="ref-body">
+        <p><b>${escapeHtml(sc.summary)}</b></p>
+        <p>${escapeHtml(sc.description)}</p>
+        <div class="kv">
+          <div class="k">Fault type</div><div class="v">${escapeHtml(sc.fault)}</div>
+          <div class="k">Invariants evaluated</div><div class="v plain">${invLinks}</div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  main.innerHTML = html;
+
+  // Scroll to anchor if requested.
+  if (state.anchor) {
+    const target = document.getElementById("ref-" + state.anchor);
+    if (target) target.scrollIntoView({ behavior: "auto", block: "start" });
+  }
+}
+
+function render() {
+  renderHeader();
+  renderNav();
+  if (state.view === "scenario" && state.scenario) renderScenario();
+  else if (state.view === "reference") renderReference();
+  else renderOverview();
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+if (!DATA) {
+  document.getElementById("main").innerHTML = "<p class='empty'>No data embedded. Re-run scripts/build-report.sh.</p>";
+} else {
+  const initial = parseHash();
+  if (initial.view === "scenario" && initial.scenario && !initial.run) {
+    initial.run = latestRun(initial.scenario);
+  }
+  Object.assign(state, initial);
+  render();
+}
+window.navigate = navigate;
+</script>
+</body>
+</html>
