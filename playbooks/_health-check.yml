@@ -3,6 +3,21 @@
 # Run between scenarios to verify the cluster has recovered cleanly.
 # Fails hard if any node is NotReady or etcd has lost a member.
 
+- name: Reset failed/unreachable host state before next scenario
+  # Ansible flags a host as `unreachable` the first time a task fails on it
+  # (most commonly here: a `delegate_to: cp1` task hitting cp1's sshd burst
+  # limit during a fault window). That marker is **sticky across plays** —
+  # the host is silently excluded from every subsequent play in the same
+  # `ansible-playbook` invocation. During run-all-scenarios.yml that
+  # produced an empty S3 onward: zero tasks run, the per-scenario invariant
+  # script then crashes because the results dir was never created. Reset
+  # the per-host error state here before the next scenario starts. localhost
+  # is always reachable so this play is guaranteed to run.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: Inter-scenario health check
   hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no

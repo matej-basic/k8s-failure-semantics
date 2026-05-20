@@ -59,6 +59,34 @@
     state: present
     update_cache: yes
 
+# ── sshd hardening for scenario bursts ────────────────────────────────────
+# During fault windows the framework can fire 5-6 ssh connections at a
+# control-plane node in a few seconds (each delegate_to: cp1 task is its
+# own session, multiplied by parallel fan-out from delegated hosts).
+# The default `MaxStartups 10:30:100` random-drops above 10 unauthenticated
+# connections; the symptom is "Permission denied (publickey)" mid-scenario
+# which Ansible turns into a sticky `unreachable=1` marker on the calling
+# host. Raise the threshold so legitimate scenario bursts fit comfortably
+# under it.
+
+- name: Raise sshd MaxStartups for scenario bursts
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*#?\s*MaxStartups\b'
+    line: 'MaxStartups 60:30:200'
+    state: present
+    validate: '/usr/sbin/sshd -t -f %s'
+  notify: restart sshd
+
+- name: Raise sshd MaxAuthTries (one connection may legitimately offer the inventory key + agent)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*#?\s*MaxAuthTries\b'
+    line: 'MaxAuthTries 10'
+    state: present
+    validate: '/usr/sbin/sshd -t -f %s'
+  notify: restart sshd
+
 - name: Install containerd
   apt:
     name: containerd

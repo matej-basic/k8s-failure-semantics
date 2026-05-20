@@ -49,119 +49,125 @@
   ignore_errors: yes
 
 # ── Kubernetes API observer ──────────────────────────────────────────────────
+# All six control-plane queries (nodes, pods, endpoints, both leases, events)
+# are bundled into ONE shell call. This used to be six separate `delegate_to`
+# tasks firing 5-6 fresh SSH sessions in a few seconds, which tripped sshd's
+# MaxStartups during fault windows and surfaced as "Permission denied
+# (publickey)" mid-scenario. One bundled call = one SSH session per snapshot
+# regardless of ControlMaster state. Each sub-query falls back to `null`
+# independently so a kubectl failure in one block does not nullify the others.
+#
+# Why cp2 by default (not cp1)? Scenarios that partition cp1 (S1, S4, S12,
+# S17 — most of them) leave cp1's kubectl unable to reach any apiserver:
+#   - cp1's local apiserver has lost etcd (etcd nodes are on the far side
+#     of the partition), so it returns errors;
+#   - the VIP has failed over to cp2 or cp3 but cp1 cannot route there.
+# A scenario that needs to query from a different host (e.g. one that
+# partitions cp2 specifically) can override `metrics_cp_host` in its vars.
 
-- name: Collect node conditions from API server
+- name: Collect all control-plane state in one bundled kubectl call
   shell: |
-    kubectl get nodes -o json 2>/dev/null \
-      | jq '[.items[] | {
-          name: .metadata.name,
-          conditions: [.status.conditions[] | select(.type=="Ready") | {
-            type: .type,
-            status: .status,
-            lastTransition: .lastTransitionTime,
-            reason: .reason,
-            message: .message
-          }],
-          unschedulable: .spec.unschedulable
-        }]'
-  register: node_conditions
-  delegate_to: "{{ groups['control_plane'][0] }}"
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    run_or_null() {
+      local out
+      if out=$("$@" 2>/dev/null); then
+        printf '%s' "${out:-null}"
+      else
+        printf 'null'
+      fi
+    }
+    NC=$(run_or_null kubectl get nodes -o json \
+         | jq '[.items[] | {
+             name: .metadata.name,
+             conditions: [.status.conditions[] | select(.type=="Ready") | {
+               type: .type,
+               status: .status,
+               lastTransition: .lastTransitionTime,
+               reason: .reason,
+               message: .message
+             }],
+             unschedulable: .spec.unschedulable
+           }]' 2>/dev/null || echo null)
+    PS=$(run_or_null kubectl get pods -n {{ stateful_app_namespace }} -o json \
+         | jq '[.items[] | {
+             name: .metadata.name,
+             node: .spec.nodeName,
+             phase: .status.phase,
+             conditions: .status.conditions,
+             containerStatuses: [.status.containerStatuses[]? | {
+               name: .name,
+               ready: .ready,
+               restartCount: .restartCount,
+               state: .state
+             }]
+           }]' 2>/dev/null || echo null)
+    ES=$(run_or_null kubectl get endpoints -n {{ stateful_app_namespace }} \
+                     nginx-stateless postgres-stateful -o json \
+         | jq '[.items[] | {
+             service: .metadata.name,
+             subsets: .subsets,
+             notReadyAddresses: [.subsets[]?.notReadyAddresses[]?.ip // empty]
+           }]' 2>/dev/null || echo null)
+    CM=$(run_or_null kubectl get lease kube-controller-manager -n kube-system -o json \
+         | jq '{
+             holder: .spec.holderIdentity,
+             acquireTime: .spec.acquireTime,
+             renewTime: .spec.renewTime,
+             leaseDuration: .spec.leaseDurationSeconds
+           }' 2>/dev/null || echo null)
+    SL=$(run_or_null kubectl get lease kube-scheduler -n kube-system -o json \
+         | jq '{
+             holder: .spec.holderIdentity,
+             acquireTime: .spec.acquireTime,
+             renewTime: .spec.renewTime,
+             leaseDuration: .spec.leaseDurationSeconds
+           }' 2>/dev/null || echo null)
+    EV=$(run_or_null kubectl get events --all-namespaces --field-selector type=Warning \
+                     --sort-by=.lastTimestamp -o json \
+         | jq '[.items[-50:] | .[] | {
+             namespace: .metadata.namespace,
+             name: .metadata.name,
+             reason: .reason,
+             message: .message,
+             involvedObject: .involvedObject,
+             count: .count,
+             lastTimestamp: .lastTimestamp
+           }]' 2>/dev/null || echo null)
+    jq -cn \
+      --argjson nc "${NC:-null}" \
+      --argjson ps "${PS:-null}" \
+      --argjson es "${ES:-null}" \
+      --argjson cm "${CM:-null}" \
+      --argjson sl "${SL:-null}" \
+      --argjson ev "${EV:-null}" \
+      '{
+        node_conditions: $nc,
+        pod_states: $ps,
+        endpoint_states: $es,
+        controller_manager_lease: $cm,
+        scheduler_lease: $sl,
+        warning_events: $ev
+      }'
+  register: cp_state
+  delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
   run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_unreachable: yes
   ignore_errors: yes
 
-- name: Collect pod states for test workloads
-  shell: |
-    kubectl get pods -n {{ stateful_app_namespace }} -o json 2>/dev/null \
-      | jq '[.items[] | {
-          name: .metadata.name,
-          node: .spec.nodeName,
-          phase: .status.phase,
-          conditions: .status.conditions,
-          containerStatuses: [.status.containerStatuses[]? | {
-            name: .name,
-            ready: .ready,
-            restartCount: .restartCount,
-            state: .state
-          }]
-        }]'
-  register: pod_states
-  delegate_to: "{{ groups['control_plane'][0] }}"
-  run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ignore_errors: yes
-
-- name: Collect endpoint membership for test services
-  shell: |
-    kubectl get endpoints -n {{ stateful_app_namespace }} \
-      nginx-stateless postgres-stateful -o json 2>/dev/null \
-      | jq '[.items[] | {
-          service: .metadata.name,
-          subsets: .subsets,
-          notReadyAddresses: [.subsets[]?.notReadyAddresses[]?.ip // empty]
-        }]'
-  register: endpoint_states
-  delegate_to: "{{ groups['control_plane'][0] }}"
-  run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ignore_errors: yes
-
-- name: Collect controller-manager leader lease
-  shell: |
-    kubectl get lease kube-controller-manager -n kube-system -o json 2>/dev/null \
-      | jq '{
-          holder: .spec.holderIdentity,
-          acquireTime: .spec.acquireTime,
-          renewTime: .spec.renewTime,
-          leaseDuration: .spec.leaseDurationSeconds
-        }'
-  register: cm_lease
-  delegate_to: "{{ groups['control_plane'][0] }}"
-  run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ignore_errors: yes
-
-- name: Collect scheduler leader lease
-  shell: |
-    kubectl get lease kube-scheduler -n kube-system -o json 2>/dev/null \
-      | jq '{
-          holder: .spec.holderIdentity,
-          acquireTime: .spec.acquireTime,
-          renewTime: .spec.renewTime,
-          leaseDuration: .spec.leaseDurationSeconds
-        }'
-  register: scheduler_lease
-  delegate_to: "{{ groups['control_plane'][0] }}"
-  run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ignore_errors: yes
-
-- name: Collect recent events (warnings only)
-  shell: |
-    kubectl get events --all-namespaces --field-selector type=Warning \
-      --sort-by=.lastTimestamp -o json 2>/dev/null \
-      | jq '[.items[-50:] | .[] | {
-          namespace: .metadata.namespace,
-          name: .metadata.name,
-          reason: .reason,
-          message: .message,
-          involvedObject: .involvedObject,
-          count: .count,
-          lastTimestamp: .lastTimestamp
-        }]'
-  register: k8s_events
-  delegate_to: "{{ groups['control_plane'][0] }}"
-  run_once: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ignore_errors: yes
+# cp_state.stdout is already a JSON object with the exact field names the
+# snapshot expects (node_conditions, pod_states, endpoint_states,
+# controller_manager_lease, scheduler_lease, warning_events), so the
+# snapshot-assembly task below splices it in directly as the control_plane
+# object — no per-field shims needed.
 
 # ── Per-node kubelet observer ─────────────────────────────────────────────────
+# These two tasks talk to each cluster host directly. During a partition the
+# fault target may briefly drop its ssh mux ("Broken pipe") which Ansible
+# normally turns into a global `unreachable=1` marker that excludes the host
+# from every subsequent play in the run — silently breaking the scenario's
+# own teardown play. `ignore_unreachable: yes` keeps the per-snapshot failure
+# local, leaving the host eligible for the teardown.
 
 - name: Collect kubelet node status from each node
   shell: |
@@ -173,6 +179,7 @@
   register: kubelet_local_status
   when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
   ignore_errors: yes
+  ignore_unreachable: yes
 
 - name: Collect running containers from crictl on each node
   shell: |
@@ -182,6 +189,7 @@
   register: crictl_containers
   when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
   ignore_errors: yes
+  ignore_unreachable: yes
 
 # ── External client observer ──────────────────────────────────────────────────
 
@@ -229,14 +237,7 @@
           "member_status": {{ etcd_status.stdout | default('null') }},
           "current_revision": {{ etcd_revision.stdout | default('null') }}
         },
-        "control_plane": {
-          "node_conditions": {{ node_conditions.stdout | default('null') }},
-          "pod_states": {{ pod_states.stdout | default('null') }},
-          "endpoint_states": {{ endpoint_states.stdout | default('null') }},
-          "controller_manager_lease": {{ cm_lease.stdout | default('null') }},
-          "scheduler_lease": {{ scheduler_lease.stdout | default('null') }},
-          "warning_events": {{ k8s_events.stdout | default('null') }}
-        },
+        "control_plane": {{ cp_state.stdout | default('null') }},
         "nodes": {{ node_snapshots | to_json }},
         "external_probe": {{ service_probe.stdout | default('null') }}
       }
