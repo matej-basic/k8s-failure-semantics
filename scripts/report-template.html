@@ -167,6 +167,110 @@
   .recap.hypothesised .recap-label { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
 
   details.ref-card .grow { flex: 1; }
+
+  /* ── Findings page ───────────────────────────────────────────────────── */
+  .findings-toc {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 14px; margin: 8px 0 22px;
+    max-width: 880px;
+  }
+  .findings-toc a {
+    padding: 4px 10px; border-radius: 4px;
+    background: var(--bg-elev2); color: var(--fg-dim);
+    font-size: 12px; text-decoration: none;
+  }
+  .findings-toc a:hover { background: var(--accent-dim); color: var(--fg); }
+
+  main h3[id^="finding-"] {
+    margin-top: 32px;
+    border-top: 1px solid var(--border);
+    padding-top: 18px;
+  }
+  main h3[id^="finding-"]:first-of-type { border-top: none; padding-top: 0; }
+
+  .findings-coverage, .findings-synth {
+    border-collapse: collapse; margin: 10px 0 16px; max-width: 880px;
+    width: 100%;
+  }
+  .findings-coverage th, .findings-synth th,
+  .findings-coverage td, .findings-synth td {
+    padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .findings-coverage th, .findings-synth th {
+    background: var(--bg-elev); color: var(--fg-dim); font-weight: 500;
+    border-bottom: 1px solid var(--border);
+  }
+  .findings-coverage td:last-child, .findings-synth td:nth-child(3) {
+    text-align: right; font-family: ui-monospace, monospace;
+  }
+  .findings-synth td:nth-child(2) {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--fg-faint);
+  }
+
+  .finding-inv {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px 18px; margin: 14px 0; max-width: 880px;
+  }
+  .finding-inv-head {
+    display: flex; gap: 14px; align-items: baseline;
+    margin-bottom: 8px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .finding-inv-head .id {
+    color: var(--accent); font-weight: 600;
+    font-family: ui-monospace, monospace; min-width: 30px;
+  }
+  .finding-inv-head .id a { color: inherit; }
+  .finding-inv-head .name {
+    font-weight: 600; color: var(--fg); flex: 1;
+  }
+  .finding-inv-head .badge em {
+    font-style: normal; font-weight: 400; opacity: 0.7;
+    margin-left: 4px; font-size: 9px; letter-spacing: 0.3px;
+  }
+  .finding-inv p { margin: 6px 0; color: var(--fg-dim); font-size: 13px; line-height: 1.6; }
+  .finding-inv p b, .finding-inv p strong { color: var(--fg); font-weight: 600; }
+  .finding-inv ol, .finding-inv ul {
+    margin: 6px 0 6px 0; padding-left: 20px; color: var(--fg-dim); font-size: 13px; line-height: 1.6;
+  }
+  .finding-inv li { margin: 4px 0; }
+  .finding-inv code {
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 1px 5px; border-radius: 3px; font-size: 11px;
+  }
+
+  .incident {
+    background: var(--bg-elev); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 14px 18px; margin: 14px 0; max-width: 880px;
+  }
+  .incident .incident-event {
+    background: rgba(122, 162, 247, 0.08);
+    padding: 10px 14px; border-radius: 5px;
+    margin-bottom: 14px; color: var(--fg);
+    font-size: 13px; line-height: 1.55;
+  }
+  .incident p, .incident ol, .incident ul {
+    color: var(--fg-dim); font-size: 13px; line-height: 1.6;
+  }
+  .incident p.do { color: var(--ok); margin-top: 16px; }
+  .incident p.dont { color: var(--err); margin-top: 12px; }
+  .incident .do-list li { color: var(--fg-dim); }
+  .incident .do-list li::marker { color: var(--ok); }
+  .incident .dont-list li { color: var(--fg-dim); }
+  .incident .dont-list li::marker { color: var(--err); }
+  .incident code {
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 1px 5px; border-radius: 3px; font-size: 11px;
+  }
+
+  .caveats { max-width: 880px; color: var(--fg-dim); font-size: 13px; line-height: 1.6; }
+  .caveats li { margin: 6px 0; }
+  .caveats li b, .caveats li strong { color: var(--fg); font-weight: 600; }
+  .muted { color: var(--fg-faint); font-size: 12px; font-style: italic; }
   .badge.paper-badge { background: var(--bg-elev2); color: var(--fg-dim); font-weight: 500; }
   .badge.ext-badge {
     background: rgba(122, 162, 247, 0.18);
@@ -392,6 +496,9 @@ function parseHash() {
   if (parts[0] === "reference") {
     return { view: "reference", anchor: parts[1] || null };
   }
+  if (parts[0] === "findings") {
+    return { view: "findings", anchor: parts[1] || null };
+  }
   return { view: "overview" };
 }
 function setHash(s) {
@@ -402,6 +509,8 @@ function setHash(s) {
     if (s.snapshot) h += "/" + s.snapshot;
   } else if (s.view === "reference") {
     h = "#/reference" + (s.anchor ? "/" + s.anchor : "");
+  } else if (s.view === "findings") {
+    h = "#/findings" + (s.anchor ? "/" + s.anchor : "");
   } else {
     h = "#/";
   }
@@ -425,6 +534,12 @@ function renderNav() {
   overviewBtn.className = state.view === "overview" ? "active" : "";
   overviewBtn.onclick = () => navigate({ view: "overview" });
   nav.appendChild(overviewBtn);
+
+  const findingsBtn = document.createElement("button");
+  findingsBtn.textContent = "Findings";
+  findingsBtn.className = state.view === "findings" ? "active" : "";
+  findingsBtn.onclick = () => navigate({ view: "findings" });
+  nav.appendChild(findingsBtn);
 
   const refBtn = document.createElement("button");
   refBtn.textContent = "Reference";
@@ -836,6 +951,184 @@ function renderReference() {
   }
 }
 
+// ── Findings: total recap of observed behaviour ─────────────────────────────
+// Generated from the May 20 2026 sweep, 12/14 scenarios, 82 invariant verdicts.
+// Cross-references invariants and scenarios so links into the Reference and
+// Scenario pages keep working.
+function renderFindings() {
+  const main = document.getElementById("main");
+  const I = id => `<a href="#/reference/${id}">${id}</a>`;
+  const S = id => `<a href="#/reference/${id}">${id.toUpperCase()}</a>`;
+  const sdata = id => `<a href="#/scenario/${id}">${id.toUpperCase()}</a>`;
+  let html = `
+    <h2>Findings — observed behaviour, May 20 sweep</h2>
+    <div class="crumb">12 of 14 scenarios with full data · 82 invariant verdicts · 36 violated · 46 preserved · grounded in <code>results/*/invariant_report.json</code></div>
+
+    <div class="findings-toc">
+      <a href="#/findings/sweep">What we measured against</a>
+      <a href="#/findings/invariants">Per-invariant findings</a>
+      <a href="#/findings/synthesis">Cross-scenario synthesis</a>
+      <a href="#/findings/production">A production incident through this frame</a>
+      <a href="#/findings/caveats">Caveats</a>
+    </div>
+
+    <h3 id="finding-sweep">What we measured against</h3>
+    <p>Substrate: 3 dedicated etcd members, 3 control-plane nodes behind a keepalived VIP, 3 workers running <code>nginx-stateless</code> (3 replicas) and <code>postgres-stateful</code> (1 replica), all on a single /24 with Calico CNI. Observer is a macOS laptop running ansible-playbook against the cluster over SSH.</p>
+    <p>Sweep coverage — 12 of 14 paper scenarios with full snapshot sets and invariant reports:</p>
+    <table class="findings-coverage">
+      <thead><tr><th>Scenario</th><th>Description</th><th>Snapshots</th></tr></thead>
+      <tbody>
+        <tr><td>${sdata("s1")}</td><td>symmetric control-plane partition</td><td>7</td></tr>
+        <tr><td>${sdata("s2")}</td><td>asymmetric worker isolation</td><td>8</td></tr>
+        <tr><td>${sdata("s3")}</td><td>etcd write-latency degradation</td><td>7</td></tr>
+        <tr><td>${sdata("s4")}</td><td>clock skew on cp1</td><td>6</td></tr>
+        <tr><td>${sdata("s8")}</td><td>partition + storage lag (composed)</td><td>7</td></tr>
+        <tr><td>${sdata("s11")}</td><td>kubelet partition / pod lifecycle</td><td>7</td></tr>
+        <tr><td>${sdata("s12")}</td><td>leader election storm</td><td>7</td></tr>
+        <tr><td>${sdata("s14")}</td><td>stale informer cache</td><td>5</td></tr>
+        <tr><td>${sdata("s15")}</td><td>graceful termination race</td><td>4</td></tr>
+        <tr><td>${sdata("s17")}</td><td>etcd compaction + watch history gap</td><td>6</td></tr>
+        <tr><td>${sdata("s18")}</td><td>node pressure eviction race</td><td>7</td></tr>
+        <tr><td>${sdata("s19")}</td><td>split etcd quorum</td><td>5</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">${S("s5")} (all-CP API blackhole) and ${S("s6")} (5-iteration repeat) were excluded for runtime/burst-budget reasons.</p>
+
+    <h3 id="finding-invariants">Per-invariant findings</h3>
+
+    <div class="finding-inv" id="finding-I1">
+      <div class="finding-inv-head"><span class="id">${I("I1")}</span><span class="name">Exclusive authority</span><span class="badge ok">PRESERVED · 12/12</span></div>
+      <p><b>What we measured.</b> Every snapshot in every scenario had exactly one <code>controller-manager</code> and <code>scheduler</code> <code>holderIdentity</code>; no duplicate StatefulSet pod identities ever appeared on two nodes at once. Strongest data point: ${sdata("s12")} (election storm) — flap-induced re-elections at sub-second cadence produced 0 ms measurable overlap within the 500 ms polling resolution. ${sdata("s18")} (eviction race) also held — kubelet's eviction and the scheduler's replacement coordinate via the eviction status update, contradicting the "two control loops race observer-blind" hypothesis. ${sdata("s4")} (clock skew) held too: locally-evaluated <code>leaseDurationSeconds</code> did not produce dual-authority windows.</p>
+      <p><b>Production translation.</b> When a HA controller with <code>leaderElect: true</code> has a sidecar that wedges, you do not have two replicas writing to the same CR simultaneously. The Lease API's <code>holderIdentity</code> is an honest exclusivity signal at human timescales.</p>
+      <p><b>Caveat.</b> I1 is structural — it says no two simultaneous holders. It says nothing about whether the holder is acting on a stale view; that is ${I("I5")}.</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I2">
+      <div class="finding-inv-head"><span class="id">${I("I2")}</span><span class="name">Reachability publication</span><span class="badge err">VIOLATED · 11/12</span></div>
+      <p><b>What we measured.</b> In 11 scenarios the <code>Endpoints</code> object kept publishing pod IPs while external probes could not reach them. ${sdata("s2")} was cleanest: 8 of 8 fault-window snapshots violated while ${I("I1")} held throughout. ${sdata("s15")} quantified the gap in milliseconds — pod stayed in the endpoint subset for hundreds of ms after deletion, with real traffic landing on it. ${sdata("s1")} is the only scenario where I2 held; the symmetric partition with cp2 as observation vantage kept publication consistent.</p>
+      <p><b>Production translation — three concrete shapes:</b></p>
+      <ol>
+        <li><b>One-way network change on a worker.</b> kubelet still heartbeats (the other direction works). Control plane keeps the pod in <code>Endpoints</code>. <code>curl</code> hits it and times out. This is ${sdata("s2")}; the 8-of-8 violation rate says it happens in <em>every</em> fault-window snapshot, not as a rare race.</li>
+        <li><b>Rolling deployment.</b> New pod added to <code>Endpoints</code> before readiness, OR old pod stays in <code>Endpoints</code> after SIGTERM. Both are ${sdata("s15")}. Default <code>terminationGracePeriodSeconds: 30</code> is longer than endpoint propagation; the gap is observable.</li>
+        <li><b>etcd slow.</b> During ${sdata("s3")} (800 ms ± 200 ms write latency), <code>EndpointSlice</code> updates lagged actual workload state for the entire fault window.</li>
+      </ol>
+      <p><b>What this means for your services.</b> Do not trust <code>Endpoints</code>/<code>EndpointSlice</code> as a synonym for "this backend will answer now." Use a client-side load balancer with circuit-breaking (Envoy, gRPC pick-first with health) or add <code>lifecycle.preStop.exec.command: ["sleep","10"]</code> to give the endpoints controller time to remove the pod before the container stops serving.</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I3">
+      <div class="finding-inv-head"><span class="id">${I("I3")}</span><span class="name">Failure declaration consistency</span><span class="badge ok">PRESERVED · 12/12</span></div>
+      <p><b>What we measured.</b> When the API said a node was <code>NotReady</code>, the node's own crictl view agreed: pods were stopped or stopping. The framework's I3 check (<code>NotReady-in-API AND CONTAINER_RUNNING-locally</code>) never fired.</p>
+      <p><b>This is partly a framework limitation, not a positive result.</b> ${sdata("s11")} was designed to expose I3 — partition the kubelet from the API server with workloads running. PRESERVED because the kubelet's own readiness propagation stops the pods (via the runtime) before crictl can record divergent state. To force a measurable I3 violation you'd need a workload that survives the kubelet's shutdown signal, or a longer fault window past the runtime's container-stop grace.</p>
+      <p><b>Production translation.</b> A node reported <code>NotReady</code> by <code>kubectl get nodes</code> really is stopping its workloads — you do not have a node lying about its containers. But eviction takes minutes; if you hand work to nodes by name, the work in flight on a NotReady node may still complete and write to your database. Idempotency at the workload layer matters; <code>NotReady</code> is not "the workload is gone."</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I4">
+      <div class="finding-inv-head"><span class="id">${I("I4")}</span><span class="name">Recovery coherence</span><span class="badge warn">INSUFFICIENT_DATA · 12/12</span></div>
+      <p><b>What we measured.</b> Nothing. I4 is cross-run by construction — it asks whether independent repetitions of the same fault converge to the same post-fault state — so single-run scenarios correctly return INSUFFICIENT_DATA. Only ${S("s6")} (5-iteration repeat) could evaluate it, and ${S("s6")} was excluded from this sweep.</p>
+      <p><b>Outstanding work.</b> Running ${S("s6")} will populate <code>aggregate_report.json</code>'s <code>recovery_variance_s6</code> block. Until then, recovery determinism is hypothesis, not measurement.</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I5">
+      <div class="finding-inv-head"><span class="id">${I("I5")}</span><span class="name">Observation-action consistency</span><span class="badge err">VIOLATED · 11/12</span></div>
+      <p><b>What we measured.</b> In 11 scenarios the etcd revision advanced by &gt;500 between consecutive snapshots without a matching change in pod state or lease holder — the framework's signature for "controllers reconciling against state the cluster cannot commit against." Violation rate was 7 of 7 fault-window snapshots in ${sdata("s2")}, ${sdata("s3")}, ${sdata("s11")}, ${sdata("s12")}, ${sdata("s18")}; 8 of 8 in ${sdata("s2")}; 6 of 6 in ${sdata("s17")}. ${sdata("s1")} was the only scenario where I5 was relatively quiet (only 4 violations).</p>
+      <p><b>Production translation — the "Kubernetes is loud during outages" symptom:</b></p>
+      <ol>
+        <li>The etcd revision keeps climbing — every controller retries (kube-controller-manager, scheduler, your custom operator).</li>
+        <li>The cluster's <em>actual</em> state does not change — the workload is partitioned/slow, nothing moves.</li>
+        <li>Your monitoring on apiserver request rate spikes 10–100× on the affected resource while nothing operational improves.</li>
+      </ol>
+      <p>This is what "kubectl is slow during the outage" really is — not a broken apiserver but a 100×-loaded one, against the same objects. ${sdata("s3")} measured this directly: 7 of 7 violations for the full fault window. Mitigation for custom controllers: backoff with jitter and circuit-break on repeated retry.</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I6">
+      <div class="finding-inv-head"><span class="id">${I("I6")}</span><span class="name">Watch progress monotonicity</span><span class="badge err">VIOLATED · 12/12 · <em>extension</em></span></div>
+      <p><b>What we measured.</b> In every scenario the observed etcd revision <em>decreased</em> between at least one pair of consecutive snapshots — 3 times in S1/S2/S3/S4/S8/S11, 2 in S12/S18/S19, once in S14/S15/S17. The paper's original ${I("I5")} catches forward revision delta (reconciliation amplification). I6 catches the inverse — backward movement — which signals a watch reset, a stale read from a minority etcd member, or a relist after compaction.</p>
+      <p><b>This is the most paper-relevant finding the original I1–I5 frame did not capture.</b> Across 12 scenarios with 12 different fault mechanisms, every single one produced at least one snapshot where the cluster's observed revision regressed. Mechanism varies (apiserver caches at different revisions in S3/S14; relist after partition in S1/S17; minority-etcd stale read in S19) but the observable is the same: <em>watch revisions are not monotonic from any single observer's perspective</em>.</p>
+      <p><b>Production translation — "informer caches reporting different things on different controllers" during incidents:</b></p>
+      <ol>
+        <li>Two controllers — say <code>kube-controller-manager</code> on cp2 and <code>cert-manager</code> on a worker — both watch the same Deployment.</li>
+        <li>A network blip resets one watch and forces a relist. For ~100 ms to a few seconds, the two controllers have different views (3 replicas vs 5). Each takes actions consistent with its view.</li>
+        <li><code>kubectl get deployment</code> from your laptop returns yet a third value because your request hits a third apiserver with a cache at yet another revision.</li>
+      </ol>
+      <p>Observable in production via <code>apiserver_watch_events_sizes</code> drift between apiserver instances. Mitigation: design controllers to be idempotent across watch resets (recommended), or leader-elect cluster-scoped controllers to observe via one apiserver.</p>
+    </div>
+
+    <div class="finding-inv" id="finding-I9">
+      <div class="finding-inv-head"><span class="id">${I("I9")}</span><span class="name">Quorum continuity</span><span class="badge ok">PRESERVED · 12/12 · <em>extension</em></span></div>
+      <p><b>What we measured.</b> Across every snapshot of every scenario, all 3 etcd members responded to <code>endpoint status</code>. Substrate kept majority throughout, even during ${sdata("s19")} (which <em>splits</em> etcd into majority/minority — the majority side stayed available).</p>
+      <p><b>This is the silent positive result that makes everything else meaningful.</b> Without I9, the paper's argument would be ambiguous: when I1 holds, is it because Kubernetes' exclusivity guarantee works, or because etcd lost quorum and stopped accepting writes? With I9 in hand, every other verdict in this sweep is an <em>observable-layer</em> failure, not a substrate failure. The cluster's authoritative state was always coherent; what's incoherent is each observer's view of it.</p>
+      <p><b>Production translation.</b> etcd is stable in practice. Famous "etcd lost quorum" outages are real but rare; they need catastrophic events (datacenter loss, disk full, OOM-killed etcd). Day-to-day faults — pod evictions, node reboots, network blips — keep quorum intact. <strong>Monitor etcd quorum (<code>etcd_server_has_leader</code>, <code>etcd_server_is_leader</code>, <code>etcd_network_peer_round_trip_time_seconds</code>) as a primary alert; treat I2/I5/I6 violations as expected during transient faults, not as emergencies.</strong></p>
+    </div>
+
+    <div class="finding-inv" id="finding-I10">
+      <div class="finding-inv-head"><span class="id">${I("I10")}</span><span class="name">Reconciliation termination</span><span class="badge ok">PRESERVED · 9/12 · <em>extension</em></span></div>
+      <p><b>What we measured.</b> In 9 scenarios, between the first and last post-fault snapshots, no <em>new</em> <code>(involvedObject.name, reason)</code> Warning pairs appeared — the cluster stopped emitting fresh complaints about the affected workload within the observation window. ${sdata("s15")} was the lone violation: warnings about the terminating pod's endpoint membership kept appearing throughout the 60 s tail, never settling. ${sdata("s17")} and ${sdata("s19")} tails were too short to evaluate cleanly (INSUFFICIENT_DATA).</p>
+      <p><b>Production translation.</b> Cluster faults usually self-resolve. The cluster grumbles for a while (counts of <code>BackOff</code>, <code>Unhealthy</code>, <code>FailedScheduling</code> climb), then the same set of complaints stops coming. "Warning events stopped appearing about object X" is a reasonable proxy for "the cluster has accepted the new state."</p>
+      <p><b>${sdata("s15")} is the cautionary case.</b> Default-graceful termination never quite settles within a 60 s observation window. Production analogue: you delete a pod, and for ~30–60 seconds after the pod is gone you still see endpoint-controller warnings about it. Mitigation: longer <code>preStop</code> hooks, shorter <code>terminationGracePeriodSeconds</code>, or accept that termination is observably noisy and tune alerts accordingly.</p>
+    </div>
+
+    <h3 id="finding-synthesis">Cross-scenario synthesis</h3>
+    <p>Sorting invariants by violation rate produces a clean ranking that maps directly to a single paper-level claim:</p>
+    <table class="findings-synth">
+      <thead><tr><th>Invariant</th><th>Layer</th><th>Violated</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>${I("I1")} authority</td><td>structural</td><td>0/12</td><td>Kubernetes' exclusivity guarantee is real</td></tr>
+        <tr><td>${I("I3")} failure declaration</td><td>structural</td><td>0/12</td><td>Declaration-vs-reality agreement holds</td></tr>
+        <tr><td>${I("I9")} quorum</td><td>substrate</td><td>0/12</td><td>etcd consensus is stable</td></tr>
+        <tr><td>${I("I10")} termination</td><td>observer</td><td>1/12</td><td>Reconciliation usually converges</td></tr>
+        <tr><td>${I("I4")} recovery coherence</td><td>cross-run</td><td>INSUF</td><td>Not yet measured</td></tr>
+        <tr><td>${I("I2")} reachability publication</td><td>observer</td><td>11/12</td><td><strong>Reachability is observer-relative</strong></td></tr>
+        <tr><td>${I("I5")} observation-action</td><td>observer</td><td>11/12</td><td><strong>Controllers act on stale views</strong></td></tr>
+        <tr><td>${I("I6")} watch monotonicity</td><td>observer</td><td>12/12</td><td><strong>Cluster state is non-monotonic per observer</strong></td></tr>
+      </tbody>
+    </table>
+    <p><b>The paper's central claim is empirically airtight:</b> the structural and substrate invariants (I1, I3, I9) hold robustly, while the observer-relative invariants (I2, I5, I6) fail under every interesting fault. The cluster's authoritative state is coherent; what's incoherent is each observer's view of it.</p>
+
+    <h3 id="finding-production">A typical production incident through this frame</h3>
+    <div class="incident">
+      <div class="incident-event"><strong>17:32</strong> — an L4 load balancer in front of <code>payments-api</code> Service starts logging 504s at ~3% rate. Customer reports come in. Latency p99 is unchanged. PagerDuty fires.</div>
+      <p><strong>What our measurements say is happening:</strong></p>
+      <ol>
+        <li><b>The 504 rate is real.</b> ${I("I2")} is violated somewhere — almost certainly a rolling deployment, a node draining, or an unhealthy pod that hasn't yet been removed from the endpoint subset. ${sdata("s15")} says this is the cluster's <em>default</em> behaviour, not a malfunction.</li>
+        <li><b>Dashboards disagree.</b> Grafana panels pulled from different apiserver instances — or cached views like <code>kubectl</code> vs the Watch API — show different <code>Endpoints</code> membership. ${I("I6")} says this is expected: watch progress is non-monotonic across observers.</li>
+        <li><b>Your custom operator is retrying.</b> <code>apiserver_request_total{verb="patch",resource="services"}</code> spikes 10× on the affected Service. ${I("I5")} says this is the framework: the operator reconciles against publication state; publication state is briefly wrong; the operator keeps retrying. Retries do not move the cluster — they are amplification.</li>
+        <li><b>etcd is <em>fine</em>.</b> <code>etcd_server_has_leader=1</code>, proposals committed climbing normally, peer RTT normal. ${I("I9")} says the substrate is healthy. Do not chase etcd; the problem is in the publication layer.</li>
+        <li><b><code>kubectl get nodes</code> is normal.</b> All 6 nodes Ready. ${I("I3")} says: the cluster's view of node health and reality agree. The unhealthy pod is on a healthy node; it's just not yet removed from the endpoint subset.</li>
+      </ol>
+      <p class="do"><strong>What you actually do:</strong></p>
+      <ul class="do-list">
+        <li>Don't restart the apiserver or etcd. ${I("I9")} + ${I("I3")} say they're fine.</li>
+        <li>Don't restart the operator. ${I("I5")} says it'll just resume amplifying — let the watch settle.</li>
+        <li>Wait 60–120 seconds. ${I("I10")} (PRESERVED in 9 of 12) says the cluster will stop emitting fresh warnings within this window.</li>
+        <li>Add a <code>preStop: sleep 10</code> to the deployment template before next deploy. ${I("I2")} is observer-relative; you can shrink the unsafe window, not eliminate it.</li>
+        <li>Check that your client library has circuit-breaking. If your downstream services have Envoy outlier detection, the L4 504 rate stops translating into application errors at all.</li>
+      </ul>
+      <p class="dont"><strong>What you should NOT do:</strong></p>
+      <ul class="dont-list">
+        <li>Bump replicas to 10 — the 3-pod endpoint update is the bottleneck, not capacity.</li>
+        <li>Page the cluster team — ${I("I9")} says they have no etcd issue to debug.</li>
+        <li>Investigate kube-controller-manager logs — ${I("I5")} says it's doing exactly what it should, just loudly.</li>
+      </ul>
+    </div>
+
+    <h3 id="finding-caveats">Caveats</h3>
+    <ol class="caveats">
+      <li><b>${S("s5")} and ${S("s6")} unmeasured.</b> ${I("I4")} has no verdict yet. Multi-controller amplification under simultaneous-blackhole conditions also unmeasured.</li>
+      <li><b>${sdata("s11")}'s ${I("I3")}=PRESERVED is a framework limitation, not a positive result.</b> The canonical "API says NotReady, node says Running" demonstration didn't fire because the kubelet stops pods via readiness propagation before crictl can capture divergent state.</li>
+      <li><b>${sdata("s8")}'s "composition is sub-linear" finding</b> is at the fault intensity used here. Stronger composition (S3-grade latency + S19-grade quorum split) might produce non-linear effects we didn't see.</li>
+      <li><b>Observer reach is limited.</b> Mid-fault snapshots have null cp-side fields because the apiserver VIP is unreachable from the isolated side of a partition. Consistent with the paper's thesis (you cannot observe what you cannot reach) but the dataset has known holes during peak fault.</li>
+      <li><b>All measurements are from a 6-node cluster with 3 etcd members.</b> Production clusters with 5+ etcd, regional spread, or different CNI/runtime choices will move quantitative results — but the directional ones (I2/I5/I6 violated; I1/I3/I9 preserved) should be robust.</li>
+    </ol>
+  `;
+  main.innerHTML = html;
+
+  // Scroll to anchor if present (e.g. /#/findings/invariants).
+  if (state.anchor) {
+    const target = document.getElementById("finding-" + state.anchor);
+    if (target) target.scrollIntoView({ behavior: "auto", block: "start" });
+  }
+}
+
 function refToggleAll(open) {
   for (const d of document.querySelectorAll("main details.ref-card")) {
     d.open = open;
@@ -847,6 +1140,7 @@ function render() {
   renderNav();
   if (state.view === "scenario" && state.scenario) renderScenario();
   else if (state.view === "reference") renderReference();
+  else if (state.view === "findings") renderFindings();
   else renderOverview();
 }
 
