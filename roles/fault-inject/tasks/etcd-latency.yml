@@ -34,6 +34,18 @@
       etcd-proxy 2>/dev/null || true
   when: inventory_hostname in etcd_targets
 
+- name: Remove any stale latency toxic from a prior aborted run
+  # Toxiproxy persists its proxy table to disk and reloads on systemd
+  # restart, so a sweep that died before reaching the teardown play can
+  # leave a same-named toxic in place. Without this idempotency step the
+  # next `toxic add` returns HTTP 409 "toxic already exists" and the
+  # scenario bails before injecting the fault.
+  shell: |
+    {{ toxiproxy_cli }} toxic remove \
+      --toxicName etcd-latency-{{ scenario_id }} \
+      etcd-proxy 2>/dev/null || true
+  when: inventory_hostname in etcd_targets
+
 - name: Inject latency toxic on etcd proxy
   # Same positional-name issue as above; usage is
   # 'toxic add [command options] <proxyName>'.
