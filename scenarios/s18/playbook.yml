@@ -43,9 +43,14 @@
         KUBECONFIG: /etc/kubernetes/admin.conf
 
     - name: Record memory available on worker3
+      # The previous form used `jq -Rn 'input | split("\n") | .[1] | ...'`,
+      # which reads only the first line of `free -m` (the column header) and
+      # then `.[1]` returns null because the split has only one element.
+      # Use awk on the Mem: row instead — much simpler, no jq needed.
       shell: |
-        free -m | jq -Rn 'input | split("\n") | .[1] | split(" ") | map(select(. != "")) |
-          {total: .[1]|tonumber, used: .[2]|tonumber, available: .[6]|tonumber}'
+        free -m | awk '/^Mem:/ {
+          printf("{\"total\":%s,\"used\":%s,\"available\":%s}\n", $2, $3, $NF)
+        }'
       register: worker3_mem
       ignore_errors: yes
 
@@ -55,7 +60,7 @@
         content: |
           {
             "pod_spread": {{ pod_spread.stdout }},
-            "worker3_memory_mb": {{ worker3_mem.stdout | default('null') }}
+            "worker3_memory_mb": {{ worker3_mem.stdout | default('null', true) }}
           }
       delegate_to: "{{ groups['observer'][0] }}"
       run_once: true
