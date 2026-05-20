@@ -138,7 +138,9 @@
     scenario_id: s12
   tasks:
     - name: Stop lease watcher
+      # See S3/S18 — `pkill -f` self-terminates and returns rc=-15.
       shell: pkill -f lease-watch.sh 2>/dev/null || true
+      ignore_errors: yes
 
     - name: Analyze lease holder changes from watch log
       shell: |

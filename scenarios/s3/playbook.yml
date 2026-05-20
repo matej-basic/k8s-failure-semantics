@@ -180,7 +180,15 @@
   hosts: "{{ groups['etcd'][0] }}"
   gather_facts: no
   tasks:
+    # `pkill -f` matches the calling shell's own argv (which contains the
+    # literal string "write-probe.sh" as part of the bash -c command line),
+    # so the kill terminates the parent shell and Ansible sees rc=-15. The
+    # actual probe script is killed regardless. Ignore errors here — this
+    # task is best-effort cleanup of a known footgun, matching the same
+    # treatment for pkill -f stress-ng / flap-fault.sh in the fault-inject
+    # role teardown.
     - shell: pkill -f write-probe.sh 2>/dev/null || true
+      ignore_errors: yes
 
 - name: S3 — Post-fault recovery snapshots
   hosts: k8s_cluster:etcd

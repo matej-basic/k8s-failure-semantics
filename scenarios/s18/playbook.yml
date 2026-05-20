@@ -180,7 +180,10 @@
   vars:
     scenario_id: s18
   tasks:
+    # `pkill -f` self-terminates the calling shell (its argv contains the
+    # match string). Best-effort cleanup; ignore the resulting rc=-15.
     - shell: pkill -f pod-watch.sh 2>/dev/null || true
+      ignore_errors: yes
 
     - name: Analyze pod placement timeline for duplicates
       shell: |
