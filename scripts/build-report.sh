@@ -126,11 +126,18 @@ if [ ! -f "$TEMPLATE" ]; then
   exit 1
 fi
 
-# Inject the data blob at the marker.
-python3 - "$TEMPLATE" "$OUTPUT_HTML" "$DATA_JSON" <<'PY'
+# Inject the data blob at the marker. With many scenarios the JSON can
+# exceed argv size limits (~256 KB on macOS), so stage it in a temp file
+# and pass only the path to python.
+DATA_FILE="$(mktemp -t report-data.json.XXXXXX)"
+trap 'rm -f "$DATA_FILE"' EXIT
+printf '%s' "$DATA_JSON" > "$DATA_FILE"
+
+python3 - "$TEMPLATE" "$OUTPUT_HTML" "$DATA_FILE" <<'PY'
 import sys, pathlib
-tmpl_path, out_path, data = sys.argv[1], sys.argv[2], sys.argv[3]
+tmpl_path, out_path, data_path = sys.argv[1], sys.argv[2], sys.argv[3]
 tmpl = pathlib.Path(tmpl_path).read_text()
+data = pathlib.Path(data_path).read_text()
 marker = "/*__REPORT_DATA__*/null"
 if marker not in tmpl:
     sys.exit(f"marker {marker!r} not found in template")
