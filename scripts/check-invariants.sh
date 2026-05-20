@@ -167,7 +167,10 @@ check_i4() {
   local post_snaps=()
   for snap in $(snapshots); do
     label=$(snap_field "$snap" '.snapshot_label')
-    if [[ "$label" == post_fault* ]] || [[ "$label" == post_recovery* ]]; then
+    # Match every post-fault label variant scenarios use: post_fault_*,
+    # post_recovery_*, post_convergence_*, post_reconnect_* (S11). The
+    # previous narrow match missed S11 entirely.
+    if [[ "$label" == post_* ]]; then
       post_snaps+=("$snap")
     fi
   done
@@ -264,6 +267,146 @@ check_i5() {
   fi
 }
 
+# ── I6: Watch progress monotonicity ────────────────────────────────────────────
+# Violation: between two consecutive snapshots, the observed etcd revision
+# decreases. A backwards revision means a watch reset / re-list / split-quorum
+# stale read — the observer is seeing an older state than it had seen before.
+
+check_i6() {
+  local violations=()
+  local detail=()
+  local prev_revision=""
+  local prev_label=""
+
+  for snap in $(snapshots); do
+    label=$(snap_field "$snap" '.snapshot_label')
+    ts=$(snap_field "$snap" '.timestamp')
+    revision=$(snap_field "$snap" '.etcd.current_revision // 0')
+
+    if [[ "$prev_revision" =~ ^[0-9]+$ ]] && [[ "$revision" =~ ^[0-9]+$ ]] \
+       && [ "$revision" -lt "$prev_revision" ]; then
+      violations+=("$label")
+      detail+=("{\"snapshot\": \"$label\", \"ts\": \"$ts\",
+                 \"revision\": $revision, \"previous_revision\": $prev_revision,
+                 \"from\": \"$prev_label\"}")
+    fi
+
+    prev_revision="$revision"
+    prev_label="$label"
+  done
+
+  if [ ${#violations[@]} -eq 0 ]; then
+    echo '{"invariant": "I6", "name": "watch_progress_monotonicity", "verdict": "PRESERVED", "violations": []}'
+  else
+    DETAILS=$(IFS=','; echo "[${detail[*]}]")
+    echo "{\"invariant\": \"I6\", \"name\": \"watch_progress_monotonicity\", \"verdict\": \"VIOLATED\", \"violation_count\": ${#violations[@]}, \"violations\": $DETAILS}"
+  fi
+}
+
+# ── I9: Quorum continuity ──────────────────────────────────────────────────────
+# Violation: at any snapshot, fewer than ⌈n/2⌉+1 etcd members respond to
+# endpoint status. The substrate-side counterpart to I1: tells you whether
+# the consensus layer itself ever lost majority, distinguishing
+# "the cluster lost quorum" from "the cluster kept quorum but exposed
+# inconsistencies to its observers."
+#
+# Cluster size n is inferred as the maximum members observed across all
+# snapshots. For a 3-member cluster, quorum is 2; for 5, it is 3.
+
+check_i9() {
+  local violations=()
+  local detail=()
+  local total_members=0
+
+  # First pass: find the largest member count observed.
+  for snap in $(snapshots); do
+    count=$(snap_field "$snap" '.etcd.member_status | length // 0')
+    if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt "$total_members" ]; then
+      total_members=$count
+    fi
+  done
+
+  if [ "$total_members" -lt 3 ]; then
+    echo '{"invariant": "I9", "name": "quorum_continuity", "verdict": "INSUFFICIENT_DATA", "note": "no snapshot showed an etcd cluster of >= 3 members; cannot infer quorum threshold"}'
+    return
+  fi
+
+  local quorum=$(( total_members / 2 + 1 ))
+
+  for snap in $(snapshots); do
+    label=$(snap_field "$snap" '.snapshot_label')
+    ts=$(snap_field "$snap" '.timestamp')
+    healthy=$(snap_field "$snap" '.etcd.member_status | length // 0')
+
+    if [[ "$healthy" =~ ^[0-9]+$ ]] && [ "$healthy" -lt "$quorum" ]; then
+      violations+=("$label")
+      detail+=("{\"snapshot\": \"$label\", \"ts\": \"$ts\",
+                 \"healthy_members\": $healthy, \"quorum_required\": $quorum,
+                 \"cluster_size\": $total_members}")
+    fi
+  done
+
+  if [ ${#violations[@]} -eq 0 ]; then
+    echo "{\"invariant\": \"I9\", \"name\": \"quorum_continuity\", \"verdict\": \"PRESERVED\", \"cluster_size\": $total_members, \"quorum_threshold\": $quorum, \"violations\": []}"
+  else
+    DETAILS=$(IFS=','; echo "[${detail[*]}]")
+    echo "{\"invariant\": \"I9\", \"name\": \"quorum_continuity\", \"verdict\": \"VIOLATED\", \"cluster_size\": $total_members, \"quorum_threshold\": $quorum, \"violation_count\": ${#violations[@]}, \"violations\": $DETAILS}"
+  fi
+}
+
+# ── I10: Reconciliation termination ────────────────────────────────────────────
+# Violation: after fault removal, the cluster keeps emitting new Warning events
+# (NodeNotReady, FailedScheduling, BackOff, Unhealthy, …) — i.e. controllers
+# never converge on a stable view. We compare (involvedObject.name, reason)
+# pairs in the *last* post-fault snapshot against those in the *first*
+# post-fault snapshot; any new pair = a fresh problem the cluster has not yet
+# resolved. The standard 1h event TTL means old events stay in the list, so
+# count alone is misleading — set difference is the right primitive.
+
+check_i10() {
+  local post_snaps=()
+  for snap in $(snapshots); do
+    label=$(snap_field "$snap" '.snapshot_label')
+    if [[ "$label" == post_* ]]; then
+      post_snaps+=("$snap")
+    fi
+  done
+
+  if [ ${#post_snaps[@]} -lt 2 ]; then
+    echo '{"invariant": "I10", "name": "reconciliation_termination", "verdict": "INSUFFICIENT_DATA", "note": "fewer than 2 post-fault snapshots; cannot evaluate whether new warnings stopped appearing"}'
+    return
+  fi
+
+  local first="${post_snaps[0]}"
+  local last="${post_snaps[${#post_snaps[@]}-1]}"
+  local first_label last_label last_ts
+  first_label=$(snap_field "$first" '.snapshot_label')
+  last_label=$(snap_field "$last" '.snapshot_label')
+  last_ts=$(snap_field "$last" '.timestamp')
+
+  # Set-difference of (involvedObject.name, reason) tuples — last minus first.
+  # Two reads of jq because the snapshots may be in separate files.
+  local new_pairs
+  new_pairs=$(jq -s '
+    (.[0].control_plane.warning_events // []) as $first |
+    (.[1].control_plane.warning_events // []) as $last |
+    ($first | map((.involvedObject.name // "?") + ":" + (.reason // "?"))) as $f |
+    ($last  | map((.involvedObject.name // "?") + ":" + (.reason // "?"))) as $l |
+    [$l[] | select(. as $x | ($f | index($x)) | not)]
+  ' "$first" "$last" 2>/dev/null || echo "null")
+
+  local new_count
+  new_count=$(echo "$new_pairs" | jq 'length' 2>/dev/null || echo "null")
+
+  if [ "$new_count" = "null" ]; then
+    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"INSUFFICIENT_DATA\", \"note\": \"could not parse warning_events in one of the post-fault snapshots\", \"first\": \"$first_label\", \"last\": \"$last_label\"}"
+  elif [ "$new_count" = "0" ]; then
+    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"PRESERVED\", \"post_fault_snapshots\": ${#post_snaps[@]}, \"first\": \"$first_label\", \"last\": \"$last_label\", \"new_warning_pairs\": 0}"
+  else
+    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"VIOLATED\", \"post_fault_snapshots\": ${#post_snaps[@]}, \"first\": \"$first_label\", \"last\": \"$last_label\", \"new_warning_pairs\": $new_count, \"examples\": $(echo "$new_pairs" | jq '.[0:5]')}"
+  fi
+}
+
 # ── Divergence timing analysis ─────────────────────────────────────────────────
 # Records the first snapshot at which any invariant was violated,
 # relative to the first snapshot after fault injection.
@@ -305,6 +448,9 @@ I2=$(check_i2)
 I3=$(check_i3)
 I4=$(check_i4)
 I5=$(check_i5)
+I6=$(check_i6)
+I9=$(check_i9)
+I10=$(check_i10)
 TIMING=$(divergence_timing)
 
 jq -n \
@@ -316,16 +462,19 @@ jq -n \
   --argjson i3 "$I3" \
   --argjson i4 "$I4" \
   --argjson i5 "$I5" \
+  --argjson i6 "$I6" \
+  --argjson i9 "$I9" \
+  --argjson i10 "$I10" \
   --argjson timing "$TIMING" \
   '{
     scenario_id: $scenario,
     run_id: $run,
     snapshots_evaluated: $snap_count,
-    invariants: [$i1, $i2, $i3, $i4, $i5],
+    invariants: [$i1, $i2, $i3, $i4, $i5, $i6, $i9, $i10],
     summary: {
-      preserved: ([$i1,$i2,$i3,$i4,$i5] | map(select(.verdict == "PRESERVED")) | length),
-      violated: ([$i1,$i2,$i3,$i4,$i5] | map(select(.verdict == "VIOLATED")) | length),
-      insufficient_data: ([$i1,$i2,$i3,$i4,$i5] | map(select(.verdict == "INSUFFICIENT_DATA")) | length)
+      preserved: ([$i1,$i2,$i3,$i4,$i5,$i6,$i9,$i10] | map(select(.verdict == "PRESERVED")) | length),
+      violated: ([$i1,$i2,$i3,$i4,$i5,$i6,$i9,$i10] | map(select(.verdict == "VIOLATED")) | length),
+      insufficient_data: ([$i1,$i2,$i3,$i4,$i5,$i6,$i9,$i10] | map(select(.verdict == "INSUFFICIENT_DATA")) | length)
     },
     divergence_timing: $timing
   }'

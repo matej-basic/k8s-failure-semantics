@@ -8,8 +8,8 @@ set -euo pipefail
 
 BASE="${1:-/opt/k8s-results}"
 
-SCENARIOS=(s1 s2 s3 s4 s5 s6 s8 s11 s12 s15 s17 s18 s19)
-INVARIANTS=(I1 I2 I3 I4 I5)
+SCENARIOS=(s1 s2 s3 s4 s5 s6 s8 s11 s12 s14 s15 s17 s18 s19)
+INVARIANTS=(I1 I2 I3 I4 I5 I6 I9 I10)
 
 # ── Collect per-scenario invariant verdicts ───────────────────────────────────
 
@@ -22,21 +22,28 @@ collect_verdicts() {
 
     if [ -z "$report" ]; then
       row=$(jq -n --arg sc "$sc" \
-        '{scenario: $sc, I1: "NO_DATA", I2: "NO_DATA", I3: "NO_DATA", I4: "NO_DATA", I5: "NO_DATA"}')
+        '{scenario: $sc, I1: "NO_DATA", I2: "NO_DATA", I3: "NO_DATA", I4: "NO_DATA", I5: "NO_DATA", I6: "NO_DATA", I9: "NO_DATA", I10: "NO_DATA"}')
     else
+      # Build the row by indexing each invariant we know about. Using //
+      # "NO_DATA" gracefully handles reports written before I6/I9/I10
+      # existed (older runs whose checker did not emit them).
       row=$(jq --arg sc "$sc" '
-        . as $r |
+        (.invariants // []) as $inv |
+        ($inv | map({(.invariant): .verdict}) | add) as $by_id |
         {
           scenario: $sc,
-          I1: ($r.invariants[] | select(.invariant == "I1") | .verdict),
-          I2: ($r.invariants[] | select(.invariant == "I2") | .verdict),
-          I3: ($r.invariants[] | select(.invariant == "I3") | .verdict),
-          I4: ($r.invariants[] | select(.invariant == "I4") | .verdict),
-          I5: ($r.invariants[] | select(.invariant == "I5") | .verdict)
+          I1:  ($by_id.I1  // "NO_DATA"),
+          I2:  ($by_id.I2  // "NO_DATA"),
+          I3:  ($by_id.I3  // "NO_DATA"),
+          I4:  ($by_id.I4  // "NO_DATA"),
+          I5:  ($by_id.I5  // "NO_DATA"),
+          I6:  ($by_id.I6  // "NO_DATA"),
+          I9:  ($by_id.I9  // "NO_DATA"),
+          I10: ($by_id.I10 // "NO_DATA")
         }
       ' "$report" 2>/dev/null || \
       jq -n --arg sc "$sc" \
-        '{scenario: $sc, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR"}')
+        '{scenario: $sc, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
     fi
 
     out=$(echo "$out" | jq --argjson row "$row" '. + [$row]')
@@ -157,8 +164,8 @@ AMPLIFICATION=$(collect_amplification)
 TERMINATION=$(collect_termination_timing)
 
 # Overall statistics
-TOTAL_PRESERVED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5 | select(. == "PRESERVED")] | length')
-TOTAL_VIOLATED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5 | select(. == "VIOLATED")] | length')
+TOTAL_PRESERVED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "PRESERVED")] | length')
+TOTAL_VIOLATED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "VIOLATED")] | length')
 
 jq -n \
   --argjson verdicts "$VERDICTS" \
