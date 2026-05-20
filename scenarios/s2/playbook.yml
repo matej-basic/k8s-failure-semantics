@@ -115,7 +115,10 @@
     scenario_id: s2
   tasks:
     - name: List actually-running containers on worker1 during partition
-      shell: crictl ps -o json | jq '[.containers[] | {name: .metadata.name, state: .state}]'
+      # Block scalar avoids YAML parsing the flow-mapping `{name: ...}` inside
+      # the jq expression as if it were Ansible task arguments.
+      shell: |
+        crictl ps -o json | jq '[.containers[] | {name: .metadata.name, state: .state}]'
       register: worker1_actual_containers
 
     - name: Save worker1 actual container state

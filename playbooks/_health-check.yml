@@ -47,14 +47,17 @@
       register: rollout_check
       until: rollout_check.rc == 0
 
-    - name: Tear down any residual fault injections cluster-wide
-      include_role:
-        name: fault-inject
-      vars:
-        fault_type: teardown
-        scenario_id: cleanup
-      delegate_to: "{{ item }}"
-      loop: "{{ groups['k8s_cluster'] + groups['etcd'] }}"
+- name: Inter-scenario teardown sweep — clear any residual faults on every host
+  # include_role does not accept delegate_to, so run the teardown role as its
+  # own play against k8s_cluster:etcd directly instead of trying to fan-out
+  # from the control-plane play above.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    fault_type: teardown
+    scenario_id: cleanup
+  roles:
+    - fault-inject
 
 - name: Health check — etcd
   hosts: "{{ groups['etcd'][0] }}"

@@ -96,7 +96,7 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_130 }
 
-- name: S11 — Capture divergence: API view vs node reality
+- name: "S11 — Capture divergence: API view vs node reality"
   hosts: worker1
   gather_facts: no
   vars:
