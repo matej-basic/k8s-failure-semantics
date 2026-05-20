@@ -36,13 +36,18 @@
       until: ready_count is succeeded
 
     - name: Record baseline etcd write latency (uninjected)
+      # `time` is a bash reserved word, not a command — its output goes to
+      # fd 2 of the shell itself, which `2>&1` on the pipeline cannot
+      # redirect. Wrapping `time …` in a brace group `{ … ; } 2>&1` makes
+      # 2>&1 apply to the group, so the timing output is finally captured
+      # and the `grep real` downstream sees it.
       shell: |
-        time (ETCDCTL_API=3 etcdctl \
-          --endpoints={{ etcd_endpoints }} \
-          --cacert={{ etcd_cert_dir }}/ca.crt \
-          --cert={{ etcd_cert_dir }}/server.crt \
-          --key={{ etcd_cert_dir }}/server.key \
-          put /k8s-test/baseline "$(date -u +%s%N)") 2>&1 | grep real
+        { time ETCDCTL_API=3 etcdctl \
+            --endpoints={{ etcd_endpoints }} \
+            --cacert={{ etcd_cert_dir }}/ca.crt \
+            --cert={{ etcd_cert_dir }}/server.crt \
+            --key={{ etcd_cert_dir }}/server.key \
+            put /k8s-test/baseline "$(date -u +%s%N)" ; } 2>&1 | grep real
       register: baseline_write_latency
       delegate_to: "{{ groups['etcd'][0] }}"
       run_once: true
