@@ -53,11 +53,16 @@
       until: cm_lease_check.rc == 0
 
     - name: Verify test deployments are healthy
+      # Some scenarios (partition / pressure) leave the workload mid-recovery.
+      # Bumped from 3×60s to 10×60s so we don't bail on a slow but normal
+      # post-fault settle window — observed nginx-stateless taking >3 min to
+      # come back after an S1-style cp1 partition that destabilised the
+      # scheduler view.
       shell: |
         kubectl rollout status deployment/nginx-stateless --timeout=60s
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      retries: 3
+      retries: 10
       delay: 10
       register: rollout_check
       until: rollout_check.rc == 0
