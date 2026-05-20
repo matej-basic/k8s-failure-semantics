@@ -217,8 +217,12 @@ check_i5() {
     revision=$(snap_field "$snap" '.etcd.current_revision // 0')
 
     # Large revision jump (> 500 in a short window) without pod state changes
-    # is a signal that reconciliation traffic is high but state is unchanged
-    if [ "$prev_revision" != "0" ] && [ "$revision" != "null" ]; then
+    # is a signal that reconciliation traffic is high but state is unchanged.
+    # Both values must be numeric — during a partition etcd is unreachable
+    # and `revision` comes through as the string "null", which would otherwise
+    # be dereferenced as a variable name inside $((…)) under `set -u`.
+    if [[ "$prev_revision" =~ ^[0-9]+$ ]] && [[ "$revision" =~ ^[0-9]+$ ]] \
+       && [ "$prev_revision" != "0" ]; then
       delta=$((revision - prev_revision))
       if [ "$delta" -gt 500 ]; then
         violations+=("$label")
