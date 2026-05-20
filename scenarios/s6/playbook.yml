@@ -2,20 +2,18 @@
 # scenarios/s6/playbook.yml
 # S6: Repeat-run recovery study
 #
-# What it does:
-#   Runs the S2 asymmetric worker isolation scenario N times in sequence,
-#   resetting to a clean state between runs. Compares recovery trajectories
-#   across runs to measure nondeterminism.
+# Runs the inner cycle (run-one.yml) five times in sequence, resetting
+# between iterations. Each iteration writes its snapshots and
+# run_summary.json into results/s6/<run_id>/run_<N>/. The cross-run
+# comparison is done by scripts/aggregate-results.sh.
 #
-# Variables:
-#   repeat_count: number of runs (default: 5)
-#   base_scenario: which scenario to repeat (default: s2_asymmetric_worker)
-#
-# What we measure:
-#   - Whether the post-fault stable state is the same across all runs
-#   - Variance in convergence time
-#   - Whether any run produces a different final pod placement
-#   - Whether any run produces a different lease holder after recovery
+# Why five hard-coded imports?
+#   Ansible does not support looping `import_playbook`, and the inner
+#   file is a multi-play playbook (each play targets a different host
+#   group), so it cannot be converted to `include_tasks`. Five explicit
+#   imports is the simplest form that keeps the inner file intact and
+#   still gets parsed at playbook-import time. To change the repeat
+#   count, edit the imports below.
 
 - name: S6 — Set up repeat-run study
   hosts: "{{ groups['observer'][0] }}"
@@ -25,7 +23,7 @@
     scenario_name: "Repeat-run recovery study"
     repeat_count: 5
   tasks:
-    - name: Create results directory with run subdirectories
+    - name: Create per-run results directories
       file:
         path: "{{ results_dir }}/run_{{ item }}"
         state: directory
@@ -37,10 +35,32 @@
         dest: "{{ results_dir }}/run_comparison.json"
         content: "[]"
 
-- name: S6 — Execute repeat runs
-  include_tasks: run-one.yml
+# ── Five iterations of run-one.yml ─────────────────────────────────────────
+# `import_playbook` accepts `vars:` (since Ansible 2.11). Each iteration
+# pins its own run_number and run_results_dir so the inner plays write to
+# results/s6/<run_id>/run_<N>/.
+
+- import_playbook: run-one.yml
   vars:
-    scenario_id: s6
-    run_number: "{{ item }}"
-    run_results_dir: "{{ results_dir }}/run_{{ item }}"
-  loop: "{{ range(1, (repeat_count | default(5)) | int + 1) | list }}"
+    run_number: 1
+    run_results_dir: "{{ results_base }}/s6/{{ run_id }}/run_1"
+
+- import_playbook: run-one.yml
+  vars:
+    run_number: 2
+    run_results_dir: "{{ results_base }}/s6/{{ run_id }}/run_2"
+
+- import_playbook: run-one.yml
+  vars:
+    run_number: 3
+    run_results_dir: "{{ results_base }}/s6/{{ run_id }}/run_3"
+
+- import_playbook: run-one.yml
+  vars:
+    run_number: 4
+    run_results_dir: "{{ results_base }}/s6/{{ run_id }}/run_4"
+
+- import_playbook: run-one.yml
+  vars:
+    run_number: 5
+    run_results_dir: "{{ results_base }}/s6/{{ run_id }}/run_5"

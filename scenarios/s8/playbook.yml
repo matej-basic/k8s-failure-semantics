@@ -33,7 +33,7 @@
   roles:
     - role: metrics-collect
 
-- name: S8 — Phase 1: Inject etcd write latency
+- name: "S8 — Phase 1: Inject etcd write latency"
   hosts: etcd
   gather_facts: no
   vars:
@@ -57,7 +57,7 @@
   roles:
     - role: metrics-collect
 
-- name: S8 — Phase 2: Add worker2 partition (now both faults active)
+- name: "S8 — Phase 2: Add worker2 partition (now both faults active)"
   hosts: worker2
   gather_facts: no
   vars:

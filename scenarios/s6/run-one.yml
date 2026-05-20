@@ -43,6 +43,10 @@
   vars:
     scenario_id: "s6_run{{ run_number }}"
     snapshot_label: pre_fault
+    # Override results_dir so the inner plays write into the
+    # per-run subdir set by the outer playbook, not into a parallel
+    # results/s6_runN tree.
+    results_dir: "{{ run_results_dir }}"
   roles:
     - role: metrics-collect
 
@@ -74,6 +78,7 @@
   vars:
     scenario_id: "s6_run{{ run_number }}"
     snapshot_label: mid_fault
+    results_dir: "{{ run_results_dir }}"
   roles:
     - role: metrics-collect
 
@@ -99,6 +104,7 @@
   vars:
     scenario_id: "s6_run{{ run_number }}"
     snapshot_label: post_recovery
+    results_dir: "{{ run_results_dir }}"
   roles:
     - role: metrics-collect
 

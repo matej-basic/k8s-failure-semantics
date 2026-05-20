@@ -99,6 +99,14 @@
   import_playbook: _health-check.yml
   tags: s12
 
+- name: S14 — Stale informer cache
+  import_playbook: ../scenarios/s14/playbook.yml
+  tags: s14
+
+- name: Post-S14 health check
+  import_playbook: _health-check.yml
+  tags: s14
+
 - name: S15 — Graceful termination race
   import_playbook: ../scenarios/s15/playbook.yml
   tags: s15

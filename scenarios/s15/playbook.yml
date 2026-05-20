@@ -10,11 +10,17 @@
 #
 # What we measure:
 #   - Duration (ms) between pod deletion and endpoint removal
-#   - Duration (ms) between endpoint removal and kube-proxy rule update
-#   - HTTP error rate during the grace period (5xx from terminated pod)
-#   - Whether the endpoint controller and kube-proxy converge simultaneously
-#     or sequentially — and how far apart (I2)
-#   - Whether any requests reach the pod after it has stopped responding
+#   - HTTP error rate during the grace period (5xx / 000 from terminated pod)
+#   - Whether requests reach the pod after it has stopped responding (I2)
+#
+# Topology note:
+#   The traffic generator and the endpoint-membership watcher are bash loops
+#   that need (a) reachability to the service ClusterIP and (b) kubectl access.
+#   On a macOS observer neither is true — ClusterIP CIDRs are not routable
+#   from localhost, /usr/local/bin is root-owned, and /tmp/admin.conf does
+#   not exist. So the in-flight generators run on cp1, write their JSONL
+#   logs to /tmp/s15-* on cp1, and the analysis step at the end pulls the
+#   results back to the observer's results_dir.
 
 - name: S15 — Pre-flight and baseline
   hosts: k8s_cluster:etcd
@@ -53,39 +59,33 @@
   roles:
     - role: metrics-collect
 
-- name: S15 — Start continuous traffic generator on observer
-  hosts: "{{ groups['observer'][0] }}"
+- name: S15 — Start continuous traffic generator (runs on cp1, can reach ClusterIPs)
+  hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no
   vars:
     scenario_id: s15
   tasks:
-    - name: Install hey HTTP load tester if not present
-      shell: |
-        which hey 2>/dev/null || \
-        curl -fsSL https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64 \
-          -o /usr/local/bin/hey && chmod +x /usr/local/bin/hey
-      args:
-        creates: /usr/local/bin/hey
-
     - name: Get service ClusterIP
       shell: |
         kubectl get svc nginx-stateless -o jsonpath='{.spec.clusterIP}'
       register: svc_ip
       environment:
-        KUBECONFIG: /tmp/admin.conf
+        KUBECONFIG: /etc/kubernetes/admin.conf
 
     - name: Start traffic generator (background, logs response codes)
+      # cp1 has GNU coreutils so date +%3N gives millisecond precision.
       shell: |
         nohup bash -c '
           SVC_IP="{{ svc_ip.stdout }}"
-          OUT="{{ results_dir }}/traffic_log.jsonl"
+          OUT="/tmp/s15-traffic.jsonl"
+          : > "$OUT"
           while true; do
-            CODE=$(curl -sk --max-time 2 http://$SVC_IP/ -o /dev/null -w "%{http_code}" 2>/dev/null)
-            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"http_code\": $CODE}" >> $OUT
+            CODE=$(curl -sk --max-time 2 "http://$SVC_IP/" -o /dev/null -w "%{http_code}" 2>/dev/null)
+            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"http_code\": ${CODE:-0}}" >> "$OUT"
             sleep 0.1
           done
         ' > /dev/null 2>&1 &
-        echo $! > /tmp/traffic-gen.pid
+        echo $! > /tmp/s15-traffic-gen.pid
 
 - name: S15 — Select target pod and record its IP
   hosts: "{{ groups['control_plane'][0] }}"
@@ -108,38 +108,45 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
 
-    - name: Save target pod info
+    - name: Save target pod info (observer copy for the invariant report)
       copy:
         dest: "{{ results_dir }}/target_pod.json"
         content: |
           {"name": "{{ target_pod_name.stdout }}", "ip": "{{ target_pod_ip.stdout }}"}
       delegate_to: "{{ groups['observer'][0] }}"
 
-- name: S15 — Start endpoint watcher (records when pod IP leaves endpoints)
-  hosts: "{{ groups['observer'][0] }}"
+    - name: Save target pod info (cp1 copy so the endpoint watcher can read it)
+      copy:
+        dest: /tmp/s15-target_pod.json
+        content: |
+          {"name": "{{ target_pod_name.stdout }}", "ip": "{{ target_pod_ip.stdout }}"}
+
+- name: S15 — Start endpoint watcher (also on cp1, uses local kubeconfig)
+  hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no
   vars:
     scenario_id: s15
   tasks:
-    - name: Get target pod IP from saved file
-      shell: cat {{ results_dir }}/target_pod.json | jq -r '.ip'
+    - name: Read target pod IP from cp1-local copy
+      shell: cat /tmp/s15-target_pod.json | jq -r '.ip'
       register: target_ip
 
     - name: Start endpoint membership watcher
       shell: |
         TARGET_IP="{{ target_ip.stdout }}"
-        OUT="{{ results_dir }}/endpoint_watch.jsonl"
-        export KUBECONFIG=/tmp/admin.conf
+        OUT="/tmp/s15-endpoint-watch.jsonl"
+        : > "$OUT"
+        export KUBECONFIG=/etc/kubernetes/admin.conf
         nohup bash -c '
           while true; do
             IN_EP=$(kubectl get endpoints nginx-stateless -o json 2>/dev/null \
               | jq --arg ip "'"$TARGET_IP"'" \
                 "[.subsets[]?.addresses[]? | select(.ip == \$ip)] | length")
-            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"target_in_endpoints\": $IN_EP}" >> '"$OUT"'
+            echo "{\"ts\": \"$(date -u +%H:%M:%S.%3N)\", \"target_in_endpoints\": ${IN_EP:-null}}" >> '"$OUT"'
             sleep 0.5
           done
         ' > /dev/null 2>&1 &
-        echo $! > /tmp/ep-watcher.pid
+        echo $! > /tmp/s15-ep-watcher.pid
 
 - name: S15 — DELETE the target pod (record precise timestamp)
   hosts: "{{ groups['control_plane'][0] }}"
@@ -147,7 +154,7 @@
   vars:
     scenario_id: s15
   tasks:
-    - name: Read target pod name
+    - name: Read target pod name from observer copy
       shell: cat {{ results_dir }}/target_pod.json | jq -r '.name'
       register: target_pod_name
       delegate_to: "{{ groups['observer'][0] }}"
@@ -188,24 +195,39 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: post_delete_t60 }
 
-- name: S15 — Stop traffic generator and endpoint watcher
-  hosts: "{{ groups['observer'][0] }}"
+- name: S15 — Stop generators, analyze traffic, ship results back to observer
+  hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no
   vars:
     scenario_id: s15
   tasks:
-    - shell: |
-        kill $(cat /tmp/traffic-gen.pid) 2>/dev/null || true
-        kill $(cat /tmp/ep-watcher.pid) 2>/dev/null || true
+    - name: Kill traffic generator and endpoint watcher
+      shell: |
+        kill $(cat /tmp/s15-traffic-gen.pid) 2>/dev/null || true
+        kill $(cat /tmp/s15-ep-watcher.pid)  2>/dev/null || true
+        sleep 1
+      ignore_errors: yes
+
+    - name: Fetch traffic log to observer
+      fetch:
+        src: /tmp/s15-traffic.jsonl
+        dest: "{{ results_dir }}/traffic_log.jsonl"
+        flat: yes
+
+    - name: Fetch endpoint watch log to observer
+      fetch:
+        src: /tmp/s15-endpoint-watch.jsonl
+        dest: "{{ results_dir }}/endpoint_watch.jsonl"
+        flat: yes
 
     - name: Analyze traffic log for errors during grace window
       shell: |
-        cat {{ results_dir }}/traffic_log.jsonl \
+        cat /tmp/s15-traffic.jsonl \
           | jq -s '{
               total_requests: length,
-              errors_5xx: [.[] | select(.http_code >= 500)] | length,
-              errors_000: [.[] | select(.http_code == 0)] | length,
-              success_200: [.[] | select(.http_code == 200)] | length
+              errors_5xx: ([.[] | select(.http_code >= 500)] | length),
+              errors_000: ([.[] | select(.http_code == 0)]   | length),
+              success_200: ([.[] | select(.http_code == 200)] | length)
             }'
       register: traffic_analysis
 
@@ -213,10 +235,11 @@
       copy:
         dest: "{{ results_dir }}/traffic_analysis.json"
         content: "{{ traffic_analysis.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
 
     - name: Find first timestamp where target left endpoints
       shell: |
-        cat {{ results_dir }}/endpoint_watch.jsonl \
+        cat /tmp/s15-endpoint-watch.jsonl \
           | jq -r 'select(.target_in_endpoints == 0) | .ts' \
           | head -1
       register: endpoint_removal_ts
@@ -225,6 +248,7 @@
       copy:
         dest: "{{ results_dir }}/endpoint_removal_ts.txt"
         content: "{{ endpoint_removal_ts.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
 
 - name: S15 — Invariant report
   hosts: "{{ groups['observer'][0] }}"
@@ -236,4 +260,7 @@
       register: r
     - copy:
         dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
         content: "{{ r.stdout }}"
