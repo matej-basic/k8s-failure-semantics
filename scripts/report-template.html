@@ -123,17 +123,48 @@
   .empty { color: var(--fg-dim); font-style: italic; margin: 14px 0; }
 
   .ref-intro { color: var(--fg-dim); max-width: 760px; margin: 6px 0 18px; }
-  .ref-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
-    padding: 12px 16px; margin: 10px 0; max-width: 880px; }
-  .ref-card .ref-head { display: flex; gap: 14px; align-items: baseline; }
-  .ref-card .ref-head .id { color: var(--accent); font-weight: 600;
+  .ref-toolbar { display: flex; gap: 8px; margin: 8px 0 14px; max-width: 880px; }
+  .ref-toolbar button { background: var(--bg-elev); border: 1px solid var(--border);
+    color: var(--fg); padding: 5px 12px; border-radius: 4px; cursor: pointer;
+    font: inherit; font-size: 12px; }
+  .ref-toolbar button:hover { background: var(--bg-elev2); border-color: var(--accent-dim); }
+
+  details.ref-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+    margin: 10px 0; max-width: 880px; overflow: hidden; }
+  details.ref-card > summary {
+    padding: 12px 16px; cursor: pointer; user-select: none;
+    display: flex; gap: 14px; align-items: baseline; list-style: none;
+  }
+  details.ref-card > summary::-webkit-details-marker { display: none; }
+  details.ref-card > summary::before {
+    content: "▶"; color: var(--fg-faint); font-size: 9px;
+    transition: transform 0.15s ease; display: inline-block;
+    transform: rotate(0deg); flex: 0 0 auto;
+  }
+  details.ref-card[open] > summary::before { transform: rotate(90deg); }
+  details.ref-card > summary:hover { background: var(--bg-elev2); }
+  details.ref-card[open] > summary { border-bottom: 1px solid var(--border); }
+  details.ref-card .ref-head .id { color: var(--accent); font-weight: 600;
     font-family: ui-monospace, monospace; min-width: 36px; }
-  .ref-card .ref-head .name { font-weight: 600; color: var(--fg); }
-  .ref-card .ref-body { margin-top: 8px; color: var(--fg-dim); }
-  .ref-card .ref-body p { margin: 4px 0; }
-  .ref-card .ref-body p b { color: var(--fg); font-weight: 500; }
-  .ref-card .kv { grid-template-columns: 180px 1fr; margin-top: 10px; }
-  .ref-card .kv .v.plain { font-family: inherit; color: var(--fg-dim); }
+  details.ref-card .ref-head .name { font-weight: 600; color: var(--fg); }
+  details.ref-card .ref-body { padding: 12px 16px; color: var(--fg-dim); }
+  details.ref-card .ref-body p { margin: 4px 0 8px; }
+  details.ref-card .ref-body p b { color: var(--fg); font-weight: 500; }
+  details.ref-card .kv { grid-template-columns: 180px 1fr; margin-top: 10px; }
+  details.ref-card .kv .v.plain { font-family: inherit; color: var(--fg-dim); }
+
+  .recap { margin: 12px 0; padding: 10px 12px; border-radius: 5px;
+    background: rgba(122, 162, 247, 0.07); border-left: 3px solid var(--accent-dim);
+    color: var(--fg-dim); font-size: 13px; line-height: 1.55; }
+  .recap.observed { border-left-color: var(--ok);
+    background: rgba(158, 206, 106, 0.06); }
+  .recap.hypothesised { border-left-color: var(--warn);
+    background: rgba(224, 175, 104, 0.05); }
+  .recap-label { display: inline-block; font-size: 10px; letter-spacing: 0.6px;
+    text-transform: uppercase; font-weight: 600; padding: 2px 7px; border-radius: 3px;
+    margin-right: 8px; background: var(--bg-elev2); color: var(--fg-dim); vertical-align: 2px; }
+  .recap.observed .recap-label { background: rgba(158, 206, 106, 0.16); color: var(--ok); }
+  .recap.hypothesised .recap-label { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
 
   .scenario-blurb { color: var(--fg-dim); max-width: 820px; margin: 8px 0 12px; }
   .scenario-blurb a { font-size: 11px; }
@@ -167,6 +198,7 @@ const CATALOG = {
     invariants: ["I1","I3"],
     summary: "Isolates one control-plane node (cp1) from its peers and from etcd.",
     description: "iptables rules drop traffic between cp1 and { cp2, cp3, etcd1-3 } in both directions. The isolated node cannot reach a majority of etcd or the other API servers; the remaining two control-plane nodes should still form a working majority. We measure whether a second leader lease holder appears (I1 violation), how long the isolated API server takes to report unhealthy, whether etcd loses quorum, and the recovery trajectory after the partition is lifted.",
+    recap: "Observed (single run): I1 and I3 were preserved across the whole window — the surviving etcd quorum re-elected without producing a competing lease holder, and the isolated cp1 stopped emitting authoritative writes before any duplicate ownership could appear. The interesting violations were I2 and I5: during the partition the cluster-IP probe failed while endpoints were still listed as Ready, and the etcd revision continued to advance by more than 500 between consecutive snapshots without any matching change in pod or lease state — controllers reconciling against a view that the partitioned node could no longer commit against. Both violations cleared within the 210-second post-fault window. The run is therefore consistent with the paper's thesis: even a 'clean' partition leaves brief but measurable windows where reachability publication and observation-action consistency diverge.",
   },
   s2: {
     name: "Asymmetric worker isolation",
@@ -174,6 +206,7 @@ const CATALOG = {
     invariants: ["I1","I2","I3"],
     summary: "One worker can be reached but cannot send replies (or vice versa).",
     description: "One direction of traffic for a worker is dropped, so the kubelet's heartbeat and a control-plane-initiated probe see opposite states. Tests whether endpoints are correctly republished when the backend is one-way unreachable, and whether the control plane declares the node failed before pods are reconciled away from it.",
+    recap: "Hypothesised: the data should show that reachability is observer-relative. The kubelet's PATCH /status/heartbeat continues to land (one direction works), so the API server records the node as Ready and keeps its pods in the service endpoint subset — but external clients hitting the cluster-IP see those backends time out. The expected outcome is a sustained I2 violation across the fault window with I1 preserved, quantifying the gap between 'the control plane thinks this node is alive' and 'clients can reach its pods'. This scenario is the primary empirical support for the paper's observer-relative failure claim.",
   },
   s3: {
     name: "etcd write-latency degradation",
@@ -181,6 +214,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Toxiproxy injects latency on the etcd write path.",
     description: "All API-server → etcd writes route through a Toxiproxy in front of each etcd member, with added latency injected as a toxic. Controllers see writes succeed eventually but their observed revisions lag wall-clock time. Tests whether controllers throttle reconciliation under storage lag or amplify it.",
+    recap: "Hypothesised: with writes artificially slowed, controllers should keep re-issuing reconciliation actions because their previous writes have not yet been confirmed at the revision they expected. We expect I5 violations in the form of revision-delta spikes between snapshots without any corresponding change in pod state or lease holder — the empirical signature of 'reconciliation amplification under storage lag'. The size of the delta-per-second curve relative to fault_duration gives the amplification factor the paper relies on for its bound on safe storage latency.",
   },
   s4: {
     name: "Clock skew on control-plane node",
@@ -188,6 +222,7 @@ const CATALOG = {
     invariants: ["I1","I3"],
     summary: "Shifts cp1's clock forward/back relative to its peers.",
     description: "date is stepped on cp1 while chrony is paused. Leases, certificate validity, and event ordering all depend on local time; the test asks whether the cluster forms a coherent picture of failure when timestamps disagree.",
+    recap: "Hypothesised: stepping cp1's clock should produce lease-renewal anomalies because leaseDurationSeconds is evaluated against each node's local time. We expect short windows where two distinct holderIdentity values are simultaneously considered valid by their respective hosts (an I1 violation), and possibly Ready/NotReady flapping on cp1 from the perspective of the other two control-plane nodes (an I3 violation, since the node may keep serving pods while peers consider it down). The data should let us bound the maximum survivable skew before authority is no longer well-defined.",
   },
   s5: {
     name: "API disruption under multiple controllers",
@@ -195,6 +230,7 @@ const CATALOG = {
     invariants: ["I1","I5"],
     summary: "Multiple controllers race during a flapping API-server outage.",
     description: "API-server reachability is repeatedly blackholed while several controllers (custom operator + built-in) are mid-reconciliation. Measures lease-holder churn and reconciliation amplification.",
+    recap: "Hypothesised: during repeated brief API outages, the controller-manager lease should churn between holders as each side loses and re-acquires the lock. We expect I1 violations at the boundary instants (old holder hasn't yet noticed lease loss, new holder has already claimed) and I5 violations from controllers issuing actions against pre-outage cached state. The amplification_metrics.json file (lease changes × reconciliation events per second) gives the paper its core figure for amplification under partial API availability.",
   },
   s6: {
     name: "Repeat-run recovery study",
@@ -202,6 +238,7 @@ const CATALOG = {
     invariants: ["I4"],
     summary: "Same fault N times, comparing the post-fault state across runs.",
     description: "The asymmetric partition from S2 is applied and removed in a loop, recording the final lease holder, pod placement, and endpoint set per run. I4 only has meaning here — a single run cannot show recovery is non-deterministic.",
+    recap: "Hypothesised: across N repetitions of the same fault we expect the recorded final lease holder to vary, the surviving pod replica's node to vary, and the order of endpoint subset updates to vary — none of which are determined by the fault itself, only by which controller's watch fires first on recovery. This is the central piece of evidence for the paper's claim that Kubernetes recovery is not coherent in the formal sense: I4 should be VIOLATED with multiple distinct holders observed across runs, and run_summary.json should quantify the distribution.",
   },
   s8: {
     name: "Partition + storage lag (composed)",
@@ -209,6 +246,7 @@ const CATALOG = {
     invariants: ["I1","I2","I5"],
     summary: "S1's partition overlaps with S3's etcd latency.",
     description: "Composed fault: network partition on the control plane plus injected etcd write latency. Tests whether invariants that are preserved individually still hold under simultaneous faults.",
+    recap: "Hypothesised: faults that are preserved individually need not compose. We expect at least one invariant to be VIOLATED here that was PRESERVED in both S1 (partition alone) and S3 (latency alone) — likely I1, because slowed writes mean lease loss takes longer to propagate, widening the window in which two holders coexist. The interesting finding will be the delta between (S1 ∪ S3 verdicts) and (S8 verdicts): every additional violation here is direct evidence against linear composition of failure semantics.",
   },
   s11: {
     name: "Kubelet partition / pod lifecycle divergence",
@@ -216,6 +254,7 @@ const CATALOG = {
     invariants: ["I1","I2","I3"],
     summary: "Worker kubelet is partitioned mid-pod-lifecycle.",
     description: "A worker is partitioned from the API server while pods are being created and deleted on it. Tests whether the control plane's pod state diverges from what crictl reports node-locally — a classic source of I3 violations.",
+    recap: "Hypothesised: this is the canonical I3 demonstration. The control plane will mark the node NotReady after the heartbeat grace period and start reconciling its pods elsewhere, while crictl on the partitioned worker still reports CONTAINER_RUNNING for the original copies. The data should show, side-by-side, an API-server view in which the workload has 'moved' and a node-local view in which it has not — a concrete instance of failure being declared without being realised. We expect I3 VIOLATED for the entire fault window plus a brief I1 violation when both old and new replicas exist simultaneously.",
   },
   s12: {
     name: "Leader election storm",
@@ -223,6 +262,7 @@ const CATALOG = {
     invariants: ["I1"],
     summary: "Brief, repeated network drops to force lease re-elections.",
     description: "iptables rules toggle on and off in a tight loop (flap-fault.sh), so the lease holder repeatedly loses and re-acquires the lease. Tests whether two distinct holders are ever simultaneously valid.",
+    recap: "Hypothesised: under flap-induced re-elections we expect I1 to be VIOLATED at every transition boundary. The interesting datum is not whether a violation exists but how long it persists — the gap between the old holder writing its last action and the new holder writing its first. lease_analysis.json should record the holderIdentity sequence and the timestamps; the maximum overlap window in milliseconds is the practical bound on Kubernetes' exclusivity guarantee.",
   },
   s14: {
     name: "Stale informer cache",
@@ -230,6 +270,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Controllers act on a watch cache that has fallen behind.",
     description: "Latency is injected on the watch stream so informer caches lag actual etcd state. The test records when reconciliation events are emitted against state that has since been overwritten.",
+    recap: "Hypothesised: when the watch stream is delayed, controllers' informer caches operate at an older revision than etcd's current revision. We expect actions (writes, status updates) tagged at the cache revision to be issued against objects that no longer exist in that form — classic I5 violations. The data lets us quantify how stale a cache can be before its actions cease to be safe, which underpins the paper's bound on safe watch-stream latency.",
   },
   s15: {
     name: "Graceful termination race",
@@ -237,6 +278,7 @@ const CATALOG = {
     invariants: ["I2"],
     summary: "Pod deletion races endpoint removal.",
     description: "A pod is deleted while traffic is in flight; we capture the wall-clock gap between the SIGTERM and the endpoint subset update that stops sending it new traffic. Quantifies the I2 window that the paper claims is non-trivially open by default.",
+    recap: "Hypothesised: the gap between pod_deletion_ts and endpoint_removal_ts is the size of the I2 violation window. We expect it to be on the order of hundreds of milliseconds even on a healthy cluster, because the endpoints controller has to observe the pod-Pending → pod-Terminating transition and rewrite the subset. traffic_analysis.json should show non-zero requests landing on the terminating pod within that gap — the empirical basis for the paper's claim that the default-graceful termination is default-unsafe.",
   },
   s17: {
     name: "etcd compaction + watch history gap",
@@ -244,6 +286,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Compaction during a partition severs the watch history.",
     description: "etcd compaction is triggered while a controller is partitioned away. When the controller reconnects, the requested revision is below compactRevision and the watch returns ErrCompacted — forcing a full re-list. Tests whether the controller re-derives state safely.",
+    recap: "Hypothesised: when a partitioned controller reconnects after a compaction, its requested revision is gone from etcd's history and it must re-list. We expect any action emitted in the gap between 'I think I'm caught up' and 'I see the new ground truth' to be issued against a stale identity — an I5 violation. The data shows whether client-go's re-list correctly invalidates prior intent or whether stale actions slip through. This is the paper's most subtle I5 case and probably the most operationally relevant.",
   },
   s18: {
     name: "Node pressure eviction race",
@@ -251,6 +294,7 @@ const CATALOG = {
     invariants: ["I1"],
     summary: "stress-ng exhausts memory while the scheduler is placing pods.",
     description: "Memory pressure is induced on a worker, triggering kubelet's node-pressure eviction. The scheduler is simultaneously placing replacement pods. Tests whether eviction and scheduling agree on which replica is the authoritative one.",
+    recap: "Hypothesised: kubelet's node-pressure eviction and the scheduler's replacement placement run on different control loops with different views. We expect a brief window in which the original pod has been marked for eviction but not yet stopped, while a replacement with the same StatefulSet identity has already been scheduled and started on another node — an I1 violation by duplicate identity. The data should record both replicas as Running simultaneously in at least one snapshot.",
   },
   s19: {
     name: "Split etcd quorum",
@@ -258,6 +302,7 @@ const CATALOG = {
     invariants: ["I1","I5"],
     summary: "Network split divides etcd into majority/minority partitions.",
     description: "iptables splits the etcd cluster so a minority side keeps its leader briefly but cannot commit. Measures whether the API server on the minority side serves stale reads, and how long until clients see the new leader on the majority side.",
+    recap: "Hypothesised: the API server on the minority side will continue to serve reads against the local etcd member — reads that are stale because the minority cannot commit and the majority is already advancing. We expect I1 violations as the minority briefly believes it still has authority, and I5 violations as controllers on either side issue actions against their respective views. This is the most direct test of authority semantics under partition; the data bounds the 'stale read window' that the paper cites against the assumption that linearisable reads are automatic on the API server.",
   },
 };
 
@@ -678,7 +723,12 @@ function renderReference() {
   const main = document.getElementById("main");
   let html = `
     <h2>Reference</h2>
-    <div class="crumb">What each scenario does and what each invariant means. Cross-links are clickable.</div>
+    <div class="crumb">What each scenario does and what each invariant means. Click a card header to collapse it; cross-links and the toggles in the toolbar work as expected.</div>
+
+    <div class="ref-toolbar">
+      <button onclick="refToggleAll(true)">Expand all</button>
+      <button onclick="refToggleAll(false)">Collapse all</button>
+    </div>
 
     <h3 id="invariants">Invariants (paper §4)</h3>
     <p class="ref-intro">The five invariants below are evaluated against each snapshot of a scenario run. A scenario's verdict is the conjunction across all its snapshots: <span class="badge ok">PRESERVED</span> if the invariant held in every snapshot, <span class="badge err">VIOLATED</span> if it failed in at least one, and <span class="badge warn">INSUFFICIENT_DATA</span> if there were too few snapshots to evaluate (only relevant for I4 outside S6).</p>
@@ -688,11 +738,11 @@ function renderReference() {
       .filter(([_, sc]) => sc.invariants.includes(iid))
       .map(([sid, _]) => `<a href="#/reference/${sid}">${sid.toUpperCase()}</a>`)
       .join(", ");
-    html += `<div class="ref-card" id="ref-${iid}">
-      <div class="ref-head">
+    html += `<details class="ref-card" id="ref-${iid}" open>
+      <summary class="ref-head">
         <span class="id">${iid}</span>
         <span class="name">${escapeHtml(inv.name)}</span>
-      </div>
+      </summary>
       <div class="ref-body">
         <p>${escapeHtml(inv.description)}</p>
         <div class="kv">
@@ -700,39 +750,51 @@ function renderReference() {
           <div class="k">Evaluated by scenarios</div><div class="v plain">${usedBy || "—"}</div>
         </div>
       </div>
-    </div>`;
+    </details>`;
   }
 
   html += `<h3 id="scenarios">Scenarios</h3>`;
   for (const [sid, sc] of Object.entries(CATALOG)) {
     const hasData = !!DATA.scenarios[sid];
     const dataLink = hasData
-      ? ` &nbsp; <a href="#/scenario/${sid}" style="font-size:11px">view results →</a>`
+      ? ` &nbsp; <a href="#/scenario/${sid}" style="font-size:11px" onclick="event.stopPropagation()">view results →</a>`
       : ` &nbsp; <span class="badge na" style="font-size:10px">no data</span>`;
-    const invLinks = sc.invariants.map(i => `<a href="#/reference/${i}">${i}</a>`).join(", ");
-    html += `<div class="ref-card" id="ref-${sid}">
-      <div class="ref-head">
+    const invLinks = sc.invariants.map(i => `<a href="#/reference/${i}" onclick="event.stopPropagation()">${i}</a>`).join(", ");
+    const recapLabel = hasData ? "Observed" : "Hypothesised";
+    const recapClass = hasData ? "recap observed" : "recap hypothesised";
+    html += `<details class="ref-card" id="ref-${sid}" open>
+      <summary class="ref-head">
         <span class="id mono">${sid.toUpperCase()}</span>
         <span class="name">${escapeHtml(sc.name)}</span>
         ${dataLink}
-      </div>
+      </summary>
       <div class="ref-body">
         <p><b>${escapeHtml(sc.summary)}</b></p>
         <p>${escapeHtml(sc.description)}</p>
+        ${sc.recap ? `<div class="${recapClass}"><span class="recap-label">${recapLabel}</span> ${escapeHtml(sc.recap)}</div>` : ""}
         <div class="kv">
           <div class="k">Fault type</div><div class="v">${escapeHtml(sc.fault)}</div>
           <div class="k">Invariants evaluated</div><div class="v plain">${invLinks}</div>
         </div>
       </div>
-    </div>`;
+    </details>`;
   }
 
   main.innerHTML = html;
 
-  // Scroll to anchor if requested.
+  // Scroll to anchor if requested; force it open so it's visible.
   if (state.anchor) {
     const target = document.getElementById("ref-" + state.anchor);
-    if (target) target.scrollIntoView({ behavior: "auto", block: "start" });
+    if (target) {
+      if (target.tagName === "DETAILS") target.open = true;
+      target.scrollIntoView({ behavior: "auto", block: "start" });
+    }
+  }
+}
+
+function refToggleAll(open) {
+  for (const d of document.querySelectorAll("main details.ref-card")) {
+    d.open = open;
   }
 }
 
