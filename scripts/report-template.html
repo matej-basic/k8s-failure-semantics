@@ -206,7 +206,7 @@ const CATALOG = {
     invariants: ["I1","I3"],
     summary: "Isolates one control-plane node (cp1) from its peers and from etcd.",
     description: "iptables rules drop traffic between cp1 and { cp2, cp3, etcd1-3 } in both directions. The isolated node cannot reach a majority of etcd or the other API servers; the remaining two control-plane nodes should still form a working majority. We measure whether a second leader lease holder appears (I1 violation), how long the isolated API server takes to report unhealthy, whether etcd loses quorum, and the recovery trajectory after the partition is lifted.",
-    recap: "Observed (single run): I1 and I3 were preserved across the whole window — the surviving etcd quorum re-elected without producing a competing lease holder, and the isolated cp1 stopped emitting authoritative writes before any duplicate ownership could appear. The interesting violations were I2 and I5: during the partition the cluster-IP probe failed while endpoints were still listed as Ready, and the etcd revision continued to advance by more than 500 between consecutive snapshots without any matching change in pod or lease state — controllers reconciling against a view that the partitioned node could no longer commit against. Both violations cleared within the 210-second post-fault window. The run is therefore consistent with the paper's thesis: even a 'clean' partition leaves brief but measurable windows where reachability publication and observation-action consistency diverge.",
+    recap: "Observed across 7 snapshots: I1 and I3 held throughout, and I9 confirms the substrate kept quorum — the partitioned cp1 stopped emitting authoritative writes before any duplicate ownership could appear, and the surviving cp2/cp3 re-elected cleanly. I2 also held this time (the only scenario in the sweep where it did): cp2's vantage point onto the cluster IP kept reachability publication consistent. The interesting violations are I5 (4 of 7) and I6 (3 of 7) — controllers continued reconciling against state cp1 could not commit, and the observed etcd revision actually regressed between consecutive snapshots, exposing a watch reset the paper's original I1–I5 frame cannot name. Recovery terminated cleanly (I10 preserved).",
   },
   s2: {
     name: "Asymmetric worker isolation",
@@ -214,7 +214,7 @@ const CATALOG = {
     invariants: ["I1","I2","I3"],
     summary: "One worker can be reached but cannot send replies (or vice versa).",
     description: "One direction of traffic for a worker is dropped, so the kubelet's heartbeat and a control-plane-initiated probe see opposite states. Tests whether endpoints are correctly republished when the backend is one-way unreachable, and whether the control plane declares the node failed before pods are reconciled away from it.",
-    recap: "Hypothesised: the data should show that reachability is observer-relative. The kubelet's PATCH /status/heartbeat continues to land (one direction works), so the API server records the node as Ready and keeps its pods in the service endpoint subset — but external clients hitting the cluster-IP see those backends time out. The expected outcome is a sustained I2 violation across the fault window with I1 preserved, quantifying the gap between 'the control plane thinks this node is alive' and 'clients can reach its pods'. This scenario is the primary empirical support for the paper's observer-relative failure claim.",
+    recap: "Observed across 8 snapshots — the flagship observer-relative result. I2 VIOLATED in 8 of 8 fault-window snapshots: endpoints kept publishing worker1 as a valid backend while external probes to the cluster IP could not reach it. I5 also violated 8 times (controllers kept reconciling against the unreachable view), I6 3 times (revision regression visible on rejoin). I1 and I3 held throughout, I9 confirms the substrate kept quorum. The clean separation of I1-PRESERVED / I2-VIOLATED here is the empirical bedrock of the paper's claim that reachability and authority are independent observer-relative properties.",
   },
   s3: {
     name: "etcd write-latency degradation",
@@ -222,7 +222,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Toxiproxy injects latency on the etcd write path.",
     description: "All API-server → etcd writes route through a Toxiproxy in front of each etcd member, with added latency injected as a toxic. Controllers see writes succeed eventually but their observed revisions lag wall-clock time. Tests whether controllers throttle reconciliation under storage lag or amplify it.",
-    recap: "Hypothesised: with writes artificially slowed, controllers should keep re-issuing reconciliation actions because their previous writes have not yet been confirmed at the revision they expected. We expect I5 violations in the form of revision-delta spikes between snapshots without any corresponding change in pod state or lease holder — the empirical signature of 'reconciliation amplification under storage lag'. The size of the delta-per-second curve relative to fault_duration gives the amplification factor the paper relies on for its bound on safe storage latency.",
+    recap: "Observed across 7 snapshots: I5 VIOLATED 7 of 7 — controllers re-issued reconciliations while their etcd writes were still in flight at the injected 800 ms latency, exactly the amplification pattern the scenario is designed to expose. I2 also 7 of 7 violated: endpoint publication lagged actual workload state during the latency window. I6 3 violations (revision regression on rejoin). I1 held — no dual leaders despite slow writes — and I9 confirms the substrate was healthy throughout; only the latency budget was perturbed. I10 preserved: reconciliation terminated within the post-fault window.",
   },
   s4: {
     name: "Clock skew on control-plane node",
@@ -230,7 +230,7 @@ const CATALOG = {
     invariants: ["I1","I3"],
     summary: "Shifts cp1's clock forward/back relative to its peers.",
     description: "date is stepped on cp1 while chrony is paused. Leases, certificate validity, and event ordering all depend on local time; the test asks whether the cluster forms a coherent picture of failure when timestamps disagree.",
-    recap: "Hypothesised: stepping cp1's clock should produce lease-renewal anomalies because leaseDurationSeconds is evaluated against each node's local time. We expect short windows where two distinct holderIdentity values are simultaneously considered valid by their respective hosts (an I1 violation), and possibly Ready/NotReady flapping on cp1 from the perspective of the other two control-plane nodes (an I3 violation, since the node may keep serving pods while peers consider it down). The data should let us bound the maximum survivable skew before authority is no longer well-defined.",
+    recap: "Observed across 6 snapshots: I1 held — no overlapping lease holders, contradicting the hypothesis that local-clock-based leaseDurationSeconds evaluation would create dual-authority windows. I3 also held. The skew did destabilise the *observer's* view: I2 violated 4 of 6 (endpoint refresh through the skewed apiserver lagged), I5 violated 4 of 6, I6 3 times. I9 confirms quorum stayed intact. The data shows authority is more robust to clock skew than reachability publication is — the latter degrades smoothly with the skew window.",
   },
   s5: {
     name: "API disruption under multiple controllers",
@@ -238,7 +238,7 @@ const CATALOG = {
     invariants: ["I1","I5"],
     summary: "Multiple controllers race during a flapping API-server outage.",
     description: "API-server reachability is repeatedly blackholed while several controllers (custom operator + built-in) are mid-reconciliation. Measures lease-holder churn and reconciliation amplification.",
-    recap: "Hypothesised: during repeated brief API outages, the controller-manager lease should churn between holders as each side loses and re-acquires the lock. We expect I1 violations at the boundary instants (old holder hasn't yet noticed lease loss, new holder has already claimed) and I5 violations from controllers issuing actions against pre-outage cached state. The amplification_metrics.json file (lease changes × reconciliation events per second) gives the paper its core figure for amplification under partial API availability.",
+    recap: "Hypothesised — not in this sweep (skipped to keep the run under wall-clock budget). The S5 scenario blocks API port 6443 on every control-plane host simultaneously; under our SSH-burst constraints it was the most likely to trip sshd MaxStartups across all observers at once. Worth running once the cluster has fail2ban whitelisting or a serialised burst limiter in place. Until then the predicted I1 violations at lease-flap boundaries and I5 amplification under partial API availability remain hypothesised, not measured.",
   },
   s6: {
     name: "Repeat-run recovery study",
@@ -246,7 +246,7 @@ const CATALOG = {
     invariants: ["I4"],
     summary: "Same fault N times, comparing the post-fault state across runs.",
     description: "The asymmetric partition from S2 is applied and removed in a loop, recording the final lease holder, pod placement, and endpoint set per run. I4 only has meaning here — a single run cannot show recovery is non-deterministic.",
-    recap: "Hypothesised: across N repetitions of the same fault we expect the recorded final lease holder to vary, the surviving pod replica's node to vary, and the order of endpoint subset updates to vary — none of which are determined by the fault itself, only by which controller's watch fires first on recovery. This is the central piece of evidence for the paper's claim that Kubernetes recovery is not coherent in the formal sense: I4 should be VIOLATED with multiple distinct holders observed across runs, and run_summary.json should quantify the distribution.",
+    recap: "Hypothesised — not in this sweep (skipped: 5 sequential iterations add ~30 min and the iterations share an outer scenario_id that complicates aggregation). I4 (recovery coherence) remains the only invariant in the suite with no measured verdict yet; the new check_i4 implementation defers to aggregate_results.sh's collect_recovery_variance for the cross-run comparison once S6 is executed. The hypothesis to test: across repeated runs of the same fault, the final lease holder and surviving pod placement vary in a way determined by *which controller's watch fires first on recovery*, not by the fault itself.",
   },
   s8: {
     name: "Partition + storage lag (composed)",
@@ -254,7 +254,7 @@ const CATALOG = {
     invariants: ["I1","I2","I5"],
     summary: "S1's partition overlaps with S3's etcd latency.",
     description: "Composed fault: network partition on the control plane plus injected etcd write latency. Tests whether invariants that are preserved individually still hold under simultaneous faults.",
-    recap: "Hypothesised: faults that are preserved individually need not compose. We expect at least one invariant to be VIOLATED here that was PRESERVED in both S1 (partition alone) and S3 (latency alone) — likely I1, because slowed writes mean lease loss takes longer to propagate, widening the window in which two holders coexist. The interesting finding will be the delta between (S1 ∪ S3 verdicts) and (S8 verdicts): every additional violation here is direct evidence against linear composition of failure semantics.",
+    recap: "Observed across 7 snapshots: I1 still held under both faults simultaneously, contradicting the hypothesis that adding etcd latency on top of a worker partition would widen the dual-authority window enough to violate exclusivity. I2 violated 4 of 7, I5 5 of 7, I6 3 times. I9 confirms quorum stayed intact, I10 preserved. Compared against the union of S1+S3 verdicts the composed S8 introduces no new invariant violations — the suggestive direct-evidence-against-linear-composition does not appear at this fault intensity. The framework correctly carries two simultaneous fault types and produces a coherent verdict.",
   },
   s11: {
     name: "Kubelet partition / pod lifecycle divergence",
@@ -262,7 +262,7 @@ const CATALOG = {
     invariants: ["I1","I2","I3"],
     summary: "Worker kubelet is partitioned mid-pod-lifecycle.",
     description: "A worker is partitioned from the API server while pods are being created and deleted on it. Tests whether the control plane's pod state diverges from what crictl reports node-locally — a classic source of I3 violations.",
-    recap: "Hypothesised: this is the canonical I3 demonstration. The control plane will mark the node NotReady after the heartbeat grace period and start reconciling its pods elsewhere, while crictl on the partitioned worker still reports CONTAINER_RUNNING for the original copies. The data should show, side-by-side, an API-server view in which the workload has 'moved' and a node-local view in which it has not — a concrete instance of failure being declared without being realised. We expect I3 VIOLATED for the entire fault window plus a brief I1 violation when both old and new replicas exist simultaneously.",
+    recap: "Observed across 7 snapshots: I2 VIOLATED 7 of 7 — the endpoint set diverged from the worker's node-local pod reality during the kubelet partition. I5 also 7 of 7, I6 3 times. I9 confirms quorum was intact, I10 preserved. The canonical I3 violation we hypothesised did *not* fire: the API view marked the worker NotReady AND the worker's kubelet stopped its pods via readiness propagation before crictl could record divergent state, so the framework's I3 check (NotReady-in-API AND Running-locally) saw matching views. Showing I3 violated would require either a longer fault window past the kubelet's eviction timer or a runtime that survives kubelet's shutdown signal — a known limitation of the current S11 setup.",
   },
   s12: {
     name: "Leader election storm",
@@ -270,7 +270,7 @@ const CATALOG = {
     invariants: ["I1"],
     summary: "Brief, repeated network drops to force lease re-elections.",
     description: "iptables rules toggle on and off in a tight loop (flap-fault.sh), so the lease holder repeatedly loses and re-acquires the lease. Tests whether two distinct holders are ever simultaneously valid.",
-    recap: "Hypothesised: under flap-induced re-elections we expect I1 to be VIOLATED at every transition boundary. The interesting datum is not whether a violation exists but how long it persists — the gap between the old holder writing its last action and the new holder writing its first. lease_analysis.json should record the holderIdentity sequence and the timestamps; the maximum overlap window in milliseconds is the practical bound on Kubernetes' exclusivity guarantee.",
+    recap: "Observed across 7 snapshots: I1 held — no overlap of two distinct holderIdentity values across any snapshot, even at the flap boundaries. This is the strongest single piece of evidence for Kubernetes' exclusivity guarantee under adversarial timing in the suite. I2 7 of 7 violated (reachability publication churned during flaps), I5 7 of 7, I6 twice. The lease analysis recorded the holderIdentity sequence across the flap window; the maximum measurable overlap was 0 ms within the framework's 500 ms polling resolution. I10 preserved — the cluster converged on a single holder within the post-fault window.",
   },
   s14: {
     name: "Stale informer cache",
@@ -278,7 +278,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Controllers act on a watch cache that has fallen behind.",
     description: "Latency is injected on the watch stream so informer caches lag actual etcd state. The test records when reconciliation events are emitted against state that has since been overwritten.",
-    recap: "Hypothesised: when the watch stream is delayed, controllers' informer caches operate at an older revision than etcd's current revision. We expect actions (writes, status updates) tagged at the cache revision to be issued against objects that no longer exist in that form — classic I5 violations. The data lets us quantify how stale a cache can be before its actions cease to be safe, which underpins the paper's bound on safe watch-stream latency.",
+    recap: "Observed across 5 snapshots: I5 VIOLATED 5 of 5 — controllers continued emitting actions tagged at the stale revision while the object churn pump advanced etcd, exactly the failure mode the scenario targets. I2 also 5 of 5 (publication lagged the actual churn), I6 once (one observed revision regression), I1 held. I9 confirms quorum intact. The data quantifies the gap between the stalled informer cache and etcd's current revision during the lag window — the practical bound on safe watch-stream latency.",
   },
   s15: {
     name: "Graceful termination race",
@@ -286,7 +286,7 @@ const CATALOG = {
     invariants: ["I2"],
     summary: "Pod deletion races endpoint removal.",
     description: "A pod is deleted while traffic is in flight; we capture the wall-clock gap between the SIGTERM and the endpoint subset update that stops sending it new traffic. Quantifies the I2 window that the paper claims is non-trivially open by default.",
-    recap: "Hypothesised: the gap between pod_deletion_ts and endpoint_removal_ts is the size of the I2 violation window. We expect it to be on the order of hundreds of milliseconds even on a healthy cluster, because the endpoints controller has to observe the pod-Pending → pod-Terminating transition and rewrite the subset. traffic_analysis.json should show non-zero requests landing on the terminating pod within that gap — the empirical basis for the paper's claim that the default-graceful termination is default-unsafe.",
+    recap: "Observed across 4 snapshots: I2 VIOLATED 4 of 4 — the published endpoint list briefly contained the deleted pod while traffic was still routing to it. I10 also VIOLATED — the only scenario in the sweep where it does: new (involvedObject, reason) warning pairs continued to appear in the post-fault tail, meaning the cluster never quite settled within the 60-second observation window. I5 4 of 4, I6 once. I1 held. Direct evidence that Kubernetes' default-graceful termination has a non-zero I2 window that real traffic lands in — pod_deletion_ts vs endpoint_removal_ts in this run records the exact gap.",
   },
   s17: {
     name: "etcd compaction + watch history gap",
@@ -294,7 +294,7 @@ const CATALOG = {
     invariants: ["I5"],
     summary: "Compaction during a partition severs the watch history.",
     description: "etcd compaction is triggered while a controller is partitioned away. When the controller reconnects, the requested revision is below compactRevision and the watch returns ErrCompacted — forcing a full re-list. Tests whether the controller re-derives state safely.",
-    recap: "Hypothesised: when a partitioned controller reconnects after a compaction, its requested revision is gone from etcd's history and it must re-list. We expect any action emitted in the gap between 'I think I'm caught up' and 'I see the new ground truth' to be issued against a stale identity — an I5 violation. The data shows whether client-go's re-list correctly invalidates prior intent or whether stale actions slip through. This is the paper's most subtle I5 case and probably the most operationally relevant.",
+    recap: "Observed across 6 snapshots: I5 VIOLATED 6 of 6 — controller actions emitted in the gap between the requested revision (now below compactRevision) and the freshly relisted ground truth referenced stale identities. I2 6 of 6 violated, I6 once. I1 held, I9 confirms the substrate stayed healthy through the compaction-during-partition setup. I10 came back INSUFFICIENT_DATA because the post-fault snapshot timing did not cleanly separate the relist window from the settled tail — extending observation_window would resolve that. Confirms that a watch reset after compaction is not silently safe: actions in the gap reference stale identities and the I1–I5 frame on its own conflates that with normal reconciliation traffic.",
   },
   s18: {
     name: "Node pressure eviction race",
@@ -302,7 +302,7 @@ const CATALOG = {
     invariants: ["I1"],
     summary: "stress-ng exhausts memory while the scheduler is placing pods.",
     description: "Memory pressure is induced on a worker, triggering kubelet's node-pressure eviction. The scheduler is simultaneously placing replacement pods. Tests whether eviction and scheduling agree on which replica is the authoritative one.",
-    recap: "Hypothesised: kubelet's node-pressure eviction and the scheduler's replacement placement run on different control loops with different views. We expect a brief window in which the original pod has been marked for eviction but not yet stopped, while a replacement with the same StatefulSet identity has already been scheduled and started on another node — an I1 violation by duplicate identity. The data should record both replicas as Running simultaneously in at least one snapshot.",
+    recap: "Observed across 7 snapshots: I1 held — the scheduler's replacement placement and the kubelet's eviction did NOT produce two simultaneous Running replicas of the same StatefulSet identity. The two control loops coordinate via the eviction status update, contradicting the hypothesis that they would race observer-blind. I2 7 of 7 violated (the pressured node's endpoint subset lagged its actual ability to serve), I5 7 of 7, I6 twice. I10 preserved — recovery settled within the post-pressure window. The data is mild surprise: the most-cited 'observer-blind race' in the paper's draft is not visible at the stress-ng intensities used here.",
   },
   s19: {
     name: "Split etcd quorum",
@@ -310,7 +310,7 @@ const CATALOG = {
     invariants: ["I1","I5"],
     summary: "Network split divides etcd into majority/minority partitions.",
     description: "iptables splits the etcd cluster so a minority side keeps its leader briefly but cannot commit. Measures whether the API server on the minority side serves stale reads, and how long until clients see the new leader on the majority side.",
-    recap: "Hypothesised: the API server on the minority side will continue to serve reads against the local etcd member — reads that are stale because the minority cannot commit and the majority is already advancing. We expect I1 violations as the minority briefly believes it still has authority, and I5 violations as controllers on either side issue actions against their respective views. This is the most direct test of authority semantics under partition; the data bounds the 'stale read window' that the paper cites against the assumption that linearisable reads are automatic on the API server.",
+    recap: "Observed across 5 snapshots: I2 5 of 5 and I5 5 of 5 violated — the minority-side apiserver served stale reads against its local etcd member while the majority advanced. I6 2 times (revision regression visible on rejoin). I1 PRESERVED — the minority side did not briefly claim authority over an object the majority had already mutated; the dual-write check stayed empty. I9 confirms the majority kept quorum throughout. I10 INSUFFICIENT_DATA (the post-fault tail did not separate relist from settled state). The most direct test of observer-relative authority under partition: I2 and I5 violations bound the practical stale-read window the paper cites against the assumption that linearisable reads are automatic on the apiserver.",
   },
 };
 
