@@ -166,6 +166,14 @@
   .recap.observed .recap-label { background: rgba(158, 206, 106, 0.16); color: var(--ok); }
   .recap.hypothesised .recap-label { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
 
+  details.ref-card .grow { flex: 1; }
+  .badge.paper-badge { background: var(--bg-elev2); color: var(--fg-dim); font-weight: 500; }
+  .badge.ext-badge {
+    background: rgba(122, 162, 247, 0.18);
+    color: var(--accent);
+    font-weight: 500;
+  }
+
   .scenario-blurb { color: var(--fg-dim); max-width: 820px; margin: 8px 0 12px; }
   .scenario-blurb a { font-size: 11px; }
   .invariant-row .desc { color: var(--fg-dim); font-size: 12px; margin-top: 4px; }
@@ -306,35 +314,63 @@ const CATALOG = {
   },
 };
 
-// ── Invariant glossary (paper §4) ────────────────────────────────────────────
+// ── Invariant glossary ───────────────────────────────────────────────────────
+// I1–I5 are the paper's original invariants (§4). I6, I9, I10 are extended
+// invariants implemented by scripts/check-invariants.sh — see commit history
+// for the rationale of each. I6/I9/I10 are evaluated against every scenario
+// (they are universal substrate/observer properties, not scenario-specific).
 const INVARIANTS = {
   I1: {
     name: "Exclusive authority",
     description: "At most one process holds the authoritative role (controller-manager lease, scheduler lease, primary StatefulSet replica) at any wall-clock instant.",
     violation: "Two simultaneous distinct lease holders observed across snapshots, or duplicate StatefulSet pod identities running on different nodes.",
+    origin: "paper",
   },
   I2: {
     name: "Reachability publication",
     description: "Endpoints published for a service correspond to backends that can actually serve traffic. Clients reading published endpoints should not be told to talk to a backend that has stopped.",
     violation: "Endpoints list contains addresses of pods that are not Running, or the external probe (cluster-IP HTTP request) returns non-200 while endpoints are listed as Ready.",
+    origin: "paper",
   },
   I3: {
     name: "Failure declaration consistency",
     description: "A node declared NotReady by the control plane has actually stopped running its workloads from the node's own perspective. Declaration and reality agree.",
     violation: "Node status shows Ready=False in the API while node-local crictl reports containers in CONTAINER_RUNNING state.",
+    origin: "paper",
   },
   I4: {
     name: "Recovery coherence",
     description: "After a fault is removed, the cluster converges to a state that is uniquely determined by the inputs — not dependent on which controller noticed recovery first.",
     violation: "Across repeated runs of the same fault, the post-fault snapshots disagree on lease holder, pod placement, or endpoint membership. Only S6 can evaluate this; single-shot scenarios report INSUFFICIENT_DATA.",
+    origin: "paper",
   },
   I5: {
     name: "Observation-action consistency",
     description: "Controllers do not act on observations they can prove are stale. Reconciliation traffic should correlate with state change, not race ahead of it.",
     violation: "etcd revision advances by more than 500 between snapshots without any change in pod state or lease holder (high reconciliation churn on unchanged state), or Warning events claim NodeNotReady while the same snapshot shows Ready=True nodes.",
+    origin: "paper",
+  },
+  I6: {
+    name: "Watch progress monotonicity",
+    description: "Between consecutive observations, the etcd revision the cluster reports never decreases. A backward revision means a controller (or the API server) has reset its view to an earlier point — e.g. after a watch re-list following compaction, or because a minority etcd partition briefly served stale reads.",
+    violation: "Two consecutive snapshots where snapshot[k+1].etcd.current_revision < snapshot[k].etcd.current_revision.",
+    origin: "extension",
+  },
+  I9: {
+    name: "Quorum continuity",
+    description: "At every observation point, a majority of etcd members are alive and responding to status queries. This is the substrate-side counterpart to I1: it distinguishes 'the cluster lost quorum' (a design failure) from 'the cluster kept quorum but its observers diverged' (the paper's observer-relative result). Without I9 holding, the other invariants' verdicts cannot be attributed to observer-side effects.",
+    violation: "At any snapshot, fewer than ⌈n/2⌉+1 etcd members respond to etcdctl endpoint status. Cluster size n is inferred as the maximum members observed across the run.",
+    origin: "extension",
+  },
+  I10: {
+    name: "Reconciliation termination",
+    description: "After fault removal, the cluster stops emitting new Warning events about the affected workload within the observation window. Asks 'did recovery converge at all?' as opposed to I4's 'did recovery converge to the same place?'. Catches the silent oscillation failure mode where the cluster appears structurally healthy but is still firing reconciliation events forever.",
+    violation: "Between the first and last post-fault snapshots, new (involvedObject.name, reason) pairs appear in .control_plane.warning_events — i.e. fresh problems are still being raised. Requires ≥ 2 post-fault snapshots to evaluate.",
+    origin: "extension",
   },
 };
 const INVARIANT_NAMES = Object.fromEntries(Object.entries(INVARIANTS).map(([k,v]) => [k, v.name.toLowerCase()]));
+const INVARIANT_IDS = Object.keys(INVARIANTS);
 const PHASE_OF = (label) => {
   if (!label) return "?";
   if (label === "pre_fault") return "pre";
@@ -502,7 +538,7 @@ function renderOverview() {
   `;
 
   html += `<table class="heatmap"><thead><tr><th></th>`;
-  for (const inv of ["I1","I2","I3","I4","I5"]) {
+  for (const inv of INVARIANT_IDS) {
     const tip = INVARIANTS[inv] ? `${INVARIANTS[inv].name} — ${INVARIANTS[inv].description}` : "";
     html += `<th title="${escapeHtml(tip)}"><a href="#/reference/${inv}" style="color:inherit">${inv}</a></th>`;
   }
@@ -515,7 +551,7 @@ function renderOverview() {
       ? `<td class="scenario"><a href="#/scenario/${sc}">${sc.toUpperCase()}</a> <span style="color:var(--fg-faint);font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`
       : `<td class="scenario" style="color:var(--fg-faint)">${sc.toUpperCase()} <span style="font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`;
     html += `<tr>${labelCell}`;
-    for (const inv of ["I1","I2","I3","I4","I5"]) {
+    for (const inv of INVARIANT_IDS) {
       html += verdictCell(v[inv]);
     }
     html += `</tr>`;
@@ -734,14 +770,22 @@ function renderReference() {
     <p class="ref-intro">The five invariants below are evaluated against each snapshot of a scenario run. A scenario's verdict is the conjunction across all its snapshots: <span class="badge ok">PRESERVED</span> if the invariant held in every snapshot, <span class="badge err">VIOLATED</span> if it failed in at least one, and <span class="badge warn">INSUFFICIENT_DATA</span> if there were too few snapshots to evaluate (only relevant for I4 outside S6).</p>
   `;
   for (const [iid, inv] of Object.entries(INVARIANTS)) {
-    const usedBy = Object.entries(CATALOG)
-      .filter(([_, sc]) => sc.invariants.includes(iid))
-      .map(([sid, _]) => `<a href="#/reference/${sid}">${sid.toUpperCase()}</a>`)
-      .join(", ");
+    const isExtension = inv.origin === "extension";
+    const usedBy = isExtension
+      ? `<span title="Extension invariants are evaluated against every scenario that has snapshot data">all scenarios with snapshot data</span>`
+      : Object.entries(CATALOG)
+          .filter(([_, sc]) => sc.invariants.includes(iid))
+          .map(([sid, _]) => `<a href="#/reference/${sid}">${sid.toUpperCase()}</a>`)
+          .join(", ");
+    const originBadge = isExtension
+      ? `<span class="badge ext-badge" title="Not in the paper's original I1–I5; added by scripts/check-invariants.sh">EXTENSION</span>`
+      : `<span class="badge paper-badge" title="Original invariant from the paper §4">PAPER</span>`;
     html += `<details class="ref-card" id="ref-${iid}" open>
       <summary class="ref-head">
         <span class="id">${iid}</span>
         <span class="name">${escapeHtml(inv.name)}</span>
+        <div class="grow"></div>
+        ${originBadge}
       </summary>
       <div class="ref-body">
         <p>${escapeHtml(inv.description)}</p>
