@@ -22,6 +22,12 @@ observation_window: 120     # seconds we collect metrics after fault removal
 convergence_timeout: 300    # seconds we wait for semantic convergence
 poll_interval: 5            # seconds between observer state snapshots
 
+# ── Container tooling ─────────────────────────────────────────────────────────
+# crictl (cri-tools) — CRI debug client used by metrics-collect for node-local
+# container truth. Compatible across adjacent k8s minors; v1.31 talks to the
+# 1.36 containerd CRI v1 socket fine.
+crictl_version: v1.31.1
+
 # ── etcd ──────────────────────────────────────────────────────────────────────
 etcd_cert_dir: /etc/etcd/pki
 etcdctl_env:

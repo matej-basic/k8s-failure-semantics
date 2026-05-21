@@ -99,18 +99,35 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_60 }
 
-    # node-monitor-grace-period is 40s by default — by t+60 the node
-    # should be marked NotReady. By t+120 eviction should begin.
+    # node-monitor-grace-period is 40s by default — by t+60 the node is
+    # marked NotReady, which adds the node.kubernetes.io/unreachable taint.
     - pause: { seconds: 60 }
       run_once: true
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_120 }
 
-    # Capture state at eviction window
     - pause: { seconds: 60 }
       run_once: true
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_180 }
+
+    # The unreachable taint carries the default tolerationSeconds: 300, so
+    # the API does not evict worker1's pods until ~300s after the taint
+    # (~t+340). Only then does the control plane reschedule them onto
+    # another worker — while worker1, partitioned OUTBOUND, never receives
+    # the delete and keeps the originals running. Dual ownership exists
+    # only in this window, so the fault must stay active past it. The
+    # snapshots at t+300 and t+360 straddle the eviction; the earlier ones
+    # establish the pre-eviction baseline.
+    - pause: { seconds: 120 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_300 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_360 }
 
 - name: S2 — Check for dual ownership (pods still running on worker1 AND rescheduled)
   hosts: worker1

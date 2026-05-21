@@ -34,8 +34,30 @@ snap_field() {
 }
 
 # ── I1: Exclusive authority ────────────────────────────────────────────────────
-# Violation: two simultaneous distinct non-null lease holders observed
-# OR more than one pod in Running phase with the same StatefulSet identity
+# Violation: the same pod identity (namespace/podName) has a CONTAINER_RUNNING
+# container on more than one node at the same instant.
+#
+# Why node-local crictl, not the API view:
+#   The previous implementation read .control_plane.pod_states — the API
+#   server's `kubectl get pods`. That has a structural blind spot exactly
+#   where the paper predicts the most interesting result:
+#     * a container still running on a partitioned node the API has written
+#       off is, by construction, absent from the API list;
+#     * `group_by(.name)` can never collide for Deployment pods (unique
+#       random suffix) and the API never lists a StatefulSet pod name twice.
+#   So the API-side check returned PRESERVED by construction, not by
+#   measurement.
+#   This implementation instead groups every CONTAINER_RUNNING container in
+#   .nodes[].containers (node-local crictl output, gathered by direct SSH to
+#   each kubelet) by pod identity and counts the distinct nodes it runs on.
+#   It does not depend on the API being able to see the partitioned node.
+#
+# Scope: this definitively catches StatefulSet dual ownership — a stable
+# identity (postgres-stateful-0) recreated on n' while the original survives
+# on n. Deployment over-replication (the ReplicaSet creating a 4th pod while
+# an orphan still runs) is not caught here because each Deployment pod has a
+# distinct name; that needs a desired-vs-actual replica count comparison and
+# is left as a follow-up.
 
 check_i1() {
   local violations=()
@@ -45,20 +67,34 @@ check_i1() {
     label=$(snap_field "$snap" '.snapshot_label')
     ts=$(snap_field "$snap" '.timestamp')
 
-    # Check controller-manager lease — should have exactly one holder
-    cm_holder=$(snap_field "$snap" '.control_plane.controller_manager_lease.holder // "null"')
+    # Primary: cross-node dual ownership from node-local crictl truth.
+    # .nodes[].containers is a JSON *string* (crictl stdout); tolerate the
+    # legacy "" / already-parsed-array forms, and dedupe hosts so the old
+    # node_snapshots accumulation bug cannot inflate the node count.
+    dup=$(jq -c '
+      [ .nodes[]?
+        | .host as $h
+        | ( .containers
+            | if type == "string" then (fromjson? // []) else (. // []) end )[]?
+        | select(.state == "CONTAINER_RUNNING" and .podName != null)
+        | { host: $h, identity: ((.podNamespace // "default") + "/" + .podName) }
+      ]
+      | group_by(.identity)
+      | map({ identity: .[0].identity, nodes: (map(.host) | unique) })
+      | map(select(.nodes | length > 1))
+    ' "$snap" 2>/dev/null || echo '[]')
+    dup_count=$(echo "$dup" | jq 'length' 2>/dev/null || echo 0)
+    [ -z "$dup_count" ] && dup_count=0
 
-    # Check for duplicate pod ownership (StatefulSet pods with same ordinal on different nodes)
-    dupes=$(snap_field "$snap" '
+    # Secondary: the API server itself ever listing a duplicate pod name.
+    api_dupes=$(snap_field "$snap" '
       .control_plane.pod_states // [] |
-      group_by(.name) |
-      map(select(length > 1)) |
-      length
-    ')
+      group_by(.name) | map(select(length > 1)) | length')
+    { [ "$api_dupes" = "null" ] || [ -z "$api_dupes" ]; } && api_dupes=0
 
-    if [ "$dupes" != "0" ] && [ "$dupes" != "null" ]; then
+    if [ "$dup_count" != "0" ] || [ "$api_dupes" != "0" ]; then
       violations+=("$label")
-      detail+=("{\"snapshot\": \"$label\", \"ts\": \"$ts\", \"duplicate_pods\": $dupes, \"cm_holder\": \"$cm_holder\"}")
+      detail+=("{\"snapshot\": \"$label\", \"ts\": \"$ts\", \"cross_node_duplicate_identities\": $dup, \"api_duplicate_names\": $api_dupes}")
     fi
   done
 

@@ -106,6 +106,25 @@
     enabled: yes
     state: started
 
+# crictl is the CRI debug client. metrics-collect and the I1/I3 invariant
+# checks need node-local container truth (what is *actually* running on a
+# node, independent of the API server's view) — without crictl the
+# .nodes[].containers field is empty and dual-ownership cannot be detected.
+- name: Install crictl (CRI debug client)
+  unarchive:
+    src: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-amd64.tar.gz"
+    dest: /usr/local/bin
+    remote_src: yes
+    creates: /usr/local/bin/crictl
+
+- name: Configure crictl to talk to the containerd CRI socket
+  copy:
+    dest: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+
 # Minor version (e.g. 1.36) derived from k8s_version (e.g. 1.36.1) — the
 # pkgs.k8s.io repo is published per minor release.
 - name: Derive Kubernetes minor version for the apt repository

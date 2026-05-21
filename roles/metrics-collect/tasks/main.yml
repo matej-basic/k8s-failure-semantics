@@ -182,9 +182,25 @@
   ignore_unreachable: yes
 
 - name: Collect running containers from crictl on each node
+  # This is the node-local ground truth used by the I1 (dual ownership) and
+  # I3 (failure-declaration) checks — what is *actually* running on the node,
+  # independent of the API server's view. `set -o pipefail` is essential:
+  # without it, if crictl is missing/fails, jq receives empty input, exits 0,
+  # the `|| echo '[]'` fallback never fires, and the field silently becomes
+  # "" — which is exactly how dual ownership went undetected before.
+  # Captures podName / podNamespace / podUid so the I1 check can group a
+  # single pod identity across nodes.
   shell: |
+    set -o pipefail
     crictl ps -o json 2>/dev/null \
-      | jq '[.containers[] | {id: .id, name: .metadata.name, state: .state, podName: .labels."io.kubernetes.pod.name"}]' \
+      | jq -c '[.containers[] | {
+          id: .id,
+          name: .metadata.name,
+          state: .state,
+          podName: .labels."io.kubernetes.pod.name",
+          podNamespace: .labels."io.kubernetes.pod.namespace",
+          podUid: .labels."io.kubernetes.pod.uid"
+        }]' \
     || echo '[]'
   register: crictl_containers
   when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
@@ -210,6 +226,16 @@
   ignore_errors: yes
 
 # ── Assemble and write snapshot ───────────────────────────────────────────────
+
+- name: Reset per-node accumulator before assembling this snapshot
+  # set_fact facts persist for the whole play, so without this reset
+  # node_snapshots accumulates across every metrics-collect call in a
+  # scenario — a 3-snapshot play ended up with 18 entries for 6 hosts,
+  # each host triplicated. Start each snapshot from an empty list.
+  set_fact:
+    node_snapshots: []
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
 
 - name: Assemble per-node data (gathered on observer)
   set_fact:
