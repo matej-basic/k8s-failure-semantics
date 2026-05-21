@@ -62,6 +62,48 @@
       delegate_to: "{{ groups['observer'][0] }}"
       run_once: true
 
+    # ── Pin postgres-stateful-0 onto worker1 ────────────────────────────
+    # I1 (dual ownership) is a StatefulSet-identity property, so the
+    # partition target (worker1) must actually host the StatefulSet pod.
+    # Cordon the other workers, delete the pod so the StatefulSet
+    # reschedules it — with only worker1 schedulable it lands there —
+    # then uncordon so the mid-fault replacement can go elsewhere.
+    - name: Cordon worker2 and worker3 so postgres-stateful-0 can only land on worker1
+      shell: kubectl cordon worker2 worker3
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Delete postgres-stateful-0 so the StatefulSet reschedules it onto worker1
+      shell: kubectl delete pod postgres-stateful-0 -n default --ignore-not-found --wait=false
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for postgres-stateful-0 to be Running on worker1
+      shell: |
+        NODE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+        PHASE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.status.phase}' 2>/dev/null)
+        echo "node=$NODE phase=$PHASE"
+        test "$NODE" = "worker1" -a "$PHASE" = "Running"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 30
+      delay: 6
+      register: pg_placement
+      until: pg_placement.rc == 0
+
+    - name: Uncordon worker2 and worker3
+      shell: kubectl uncordon worker2 worker3
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
   roles:
     - role: metrics-collect
 
@@ -80,15 +122,23 @@
       - etcd1
       - etcd2
       - etcd3
+    # The kubelet reaches the apiserver through the keepalived VIP, not the
+    # cp node IPs directly — so the VIP must be blocked too, or worker1
+    # keeps heartbeating and never goes NotReady.
+    extra_peer_ips:
+      - "{{ api_vip }}"
   roles:
     - role: fault-inject
 
-- name: S2 — Poll observer state every 30s during fault window
+- name: S2 — Poll observer state, force-delete mid-fault, observe dual ownership
   hosts: k8s_cluster:etcd
   gather_facts: no
   vars:
     scenario_id: s2
   tasks:
+    # t+30 / t+60: partition active, worker1 transitioning to NotReady
+    # (node-monitor-grace-period is ~40s; the VIP is now blocked so the
+    # heartbeat genuinely stops).
     - pause: { seconds: 30 }
       run_once: true
     - include_role: { name: metrics-collect }
@@ -99,8 +149,26 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_60 }
 
-    # node-monitor-grace-period is 40s by default — by t+60 the node is
-    # marked NotReady, which adds the node.kubernetes.io/unreachable taint.
+    # ── The trigger ─────────────────────────────────────────────────────
+    # By t+60 worker1 is NotReady and partitioned — its kubelet cannot be
+    # reached to stop the pod. Force-deleting postgres-stateful-0 removes
+    # the pod object from the API, so the StatefulSet controller instantly
+    # recreates it on a healthy worker (worker2/3, uncordoned in pre-flight)
+    # — WHILE the original keeps running on worker1. That is the dual
+    # ownership. Kubernetes never creates the second copy on its own:
+    # StatefulSet is at-most-one by design, the pod just sits Terminating.
+    # The force-delete is the documented operator footgun that breaks it,
+    # so without this step I1 cannot be violated.
+    - name: Force-delete postgres-stateful-0 (operator cleanup of the stuck pod)
+      shell: kubectl delete pod postgres-stateful-0 -n default --force --grace-period=0 --wait=false
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # t+120 onward: the recreated postgres-stateful-0 is Running on a
+    # healthy worker; the original is still Running on partitioned worker1.
+    # crictl on both nodes sees the same identity -> I1 VIOLATED.
     - pause: { seconds: 60 }
       run_once: true
     - include_role: { name: metrics-collect }
@@ -111,23 +179,10 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_180 }
 
-    # The unreachable taint carries the default tolerationSeconds: 300, so
-    # the API does not evict worker1's pods until ~300s after the taint
-    # (~t+340). Only then does the control plane reschedule them onto
-    # another worker — while worker1, partitioned OUTBOUND, never receives
-    # the delete and keeps the originals running. Dual ownership exists
-    # only in this window, so the fault must stay active past it. The
-    # snapshots at t+300 and t+360 straddle the eviction; the earlier ones
-    # establish the pre-eviction baseline.
-    - pause: { seconds: 120 }
-      run_once: true
-    - include_role: { name: metrics-collect }
-      vars: { snapshot_label: t_plus_300 }
-
     - pause: { seconds: 60 }
       run_once: true
     - include_role: { name: metrics-collect }
-      vars: { snapshot_label: t_plus_360 }
+      vars: { snapshot_label: t_plus_240 }
 
 - name: S2 — Check for dual ownership (pods still running on worker1 AND rescheduled)
   hosts: worker1

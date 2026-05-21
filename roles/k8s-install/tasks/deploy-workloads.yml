@@ -91,14 +91,20 @@
             volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-      volumeClaimTemplates:
-      - metadata:
-          name: data
-        spec:
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 1Gi
+          # emptyDir, not a volumeClaimTemplate. The lab has no storage
+          # provisioner, and installing a node-pinned one (e.g.
+          # local-path-provisioner) would actively defeat the I1 scenario:
+          # its PVs carry nodeAffinity, so a force-deleted postgres-stateful-0
+          # would be dragged back to the partitioned node and stay Pending
+          # instead of producing a second running copy elsewhere. emptyDir
+          # keeps the StatefulSet's *identity* guarantees (stable pod name,
+          # ordinal, network id) — which is exactly what I1 tests — while
+          # letting the replacement schedule on a healthy node so dual
+          # ownership can actually be observed. The cost is no data
+          # persistence, which the identity-focused scenarios do not need.
+          volumes:
+          - name: data
+            emptyDir: {}
     ---
     apiVersion: v1
     kind: Service

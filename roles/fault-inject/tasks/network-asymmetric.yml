@@ -12,8 +12,13 @@
     direction: "{{ direction | default('outbound') }}"
 
 - name: Resolve peer IPs
+  # extra_peer_ips: raw IPs to block that are not inventory hosts — most
+  # importantly the API VIP. Without it, a worker whose kubelet reaches the
+  # apiserver through the VIP keeps heartbeating during the "partition" and
+  # the node never goes NotReady, so the fault has no observable effect.
   set_fact:
-    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+    peer_ips: "{{ (peer_hosts | map('extract', hostvars, 'ansible_host') | list)
+                  + (extra_peer_ips | default([])) }}"
 
 - name: Block outbound traffic only (asymmetric — target cannot reach peers)
   iptables:
