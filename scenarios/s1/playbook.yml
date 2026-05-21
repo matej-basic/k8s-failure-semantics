@@ -54,12 +54,11 @@
     scenario_id: s1
     fault_type: network_partition
     target_host: cp1
-    peer_hosts:
-      - cp2
-      - cp3
-      - etcd1
-      - etcd2
-      - etcd3
+    # All etcd members, derived from the inventory — with a 5-member etcd
+    # cluster a hardcoded etcd1-3 list would leave etcd4/etcd5 reachable
+    # (a healthy quorum), so cp1's apiserver would just fail over to them
+    # and the partition would have no effect.
+    peer_hosts: "{{ ['cp2', 'cp3'] + groups['etcd'] }}"
   roles:
     - role: fault-inject
 

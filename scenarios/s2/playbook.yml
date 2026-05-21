@@ -108,13 +108,8 @@
     fault_type: network_asymmetric
     target_host: worker1
     direction: outbound
-    peer_hosts:
-      - cp1
-      - cp2
-      - cp3
-      - etcd1
-      - etcd2
-      - etcd3
+    # cp nodes + every etcd member, derived from the inventory.
+    peer_hosts: "{{ ['cp1', 'cp2', 'cp3'] + groups['etcd'] }}"
     # The kubelet reaches the apiserver through the keepalived VIP, not the
     # cp node IPs directly — so the VIP must be blocked too, or worker1
     # keeps heartbeating and never goes NotReady.

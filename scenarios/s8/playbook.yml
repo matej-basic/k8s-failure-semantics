@@ -65,13 +65,11 @@
     fault_type: network_asymmetric
     target_host: worker2
     direction: outbound
-    peer_hosts:
-      - cp1
-      - cp2
-      - cp3
-      - etcd1
-      - etcd2
-      - etcd3
+    # cp nodes + every etcd member (see S1: a hardcoded etcd1-3 list would
+    # leave etcd4/etcd5 reachable on a 5-member cluster).
+    peer_hosts: "{{ ['cp1', 'cp2', 'cp3'] + groups['etcd'] }}"
+    extra_peer_ips:
+      - "{{ api_vip }}"
   roles:
     - role: fault-inject
 

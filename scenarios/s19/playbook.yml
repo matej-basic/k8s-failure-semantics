@@ -2,22 +2,26 @@
 # scenarios/s19/playbook.yml
 # S19: Split etcd quorum with asymmetric member visibility
 #
-# What it does:
-#   Isolates etcd1 from etcd2 and etcd3 asymmetrically:
-#   - etcd1 cannot reach etcd2/etcd3 (loses quorum on its side)
-#   - etcd2 and etcd3 maintain quorum with each other
-#   - Some API servers may still be pointed at etcd1 (stale reads)
-#
-# Note: This requires cp1's API server to be configured to prefer etcd1,
-#       while cp2 and cp3 prefer etcd2/etcd3. This is done by manipulating
-#       the kube-apiserver static pod manifests.
+# What it does (5-member etcd cluster):
+#   Partitions the etcd cluster into two groups that cannot reach each
+#   other's peer port (2380):
+#     - minority = etcd1 + etcd2   (2 of 5 — loses quorum, cannot commit)
+#     - majority = etcd3+etcd4+etcd5 (3 of 5 — retains quorum, keeps serving)
+#   cp1's API server is pinned to a minority etcd (etcd1); cp2's API server
+#   is pinned to a majority etcd (etcd3). The two API servers therefore sit
+#   on opposite sides of the split.
 #
 # What we measure:
-#   - Whether the API server connected to etcd1 continues serving stale reads
-#   - Whether writes fail on etcd1's side (correct) but reads succeed (dangerous)
-#   - Whether two API servers return different object versions simultaneously (I5)
-#   - Whether the control plane produces split-brain write actions
+#   - Whether the API server on the minority side keeps serving stale reads
+#   - Whether writes fail on the minority side (correct) but reads succeed
+#     (dangerous)
+#   - Whether the two API servers return different object versions
+#     simultaneously (I5 / I6)
 #   - How the system behaves when quorum is restored
+#
+# The minority/majority split is derived from groups['etcd']: first two
+# members are the minority, the rest the majority. With the lab's 5-member
+# cluster that is the meaningful 3/2 split.
 
 - name: S19 — Pre-flight baseline
   hosts: k8s_cluster:etcd
@@ -26,6 +30,8 @@
     scenario_id: s19
     scenario_name: "Split etcd quorum with asymmetric member visibility"
     snapshot_label: pre_fault
+    s19_minority: "{{ groups['etcd'][0:2] }}"
+    s19_majority: "{{ groups['etcd'][2:] }}"
   tasks:
     - name: Create results directory
       file:
@@ -35,7 +41,7 @@
       delegate_to: "{{ groups['observer'][0] }}"
       run_once: true
 
-    - name: Verify etcd cluster is healthy (all 3 members)
+    - name: Verify etcd cluster is healthy (all members)
       shell: |
         ETCDCTL_API=3 etcdctl \
           --endpoints={{ etcd_endpoints }} \
@@ -61,11 +67,15 @@
   roles:
     - role: metrics-collect
 
-- name: S19 — Configure cp1 API server to use etcd1 only (preference)
-  hosts: cp1
+- name: S19 — Pin cp1 API server to a minority etcd, cp2 to a majority etcd
+  hosts: cp1:cp2
   gather_facts: no
   vars:
     scenario_id: s19
+    # cp1 -> first minority member; cp2 -> first majority member.
+    s19_apiserver_etcd: >-
+      {{ groups['etcd'][0] if inventory_hostname == 'cp1'
+         else groups['etcd'][2] }}
   tasks:
     - name: Backup kube-apiserver manifest
       copy:
@@ -73,51 +83,55 @@
         dest: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
         remote_src: yes
 
-    - name: Set cp1 API server to prefer etcd1 endpoint
+    - name: Pin this API server to a single etcd endpoint
       shell: |
-        # Replace the full etcd endpoint list with etcd1 only
-        sed -i "s|--etcd-servers=.*|--etcd-servers=https://{{ hostvars['etcd1']['ansible_host'] }}:2379|g" \
+        sed -i "s|--etcd-servers=.*|--etcd-servers=https://{{ hostvars[s19_apiserver_etcd]['ansible_host'] }}:2379|g" \
           /etc/kubernetes/manifests/kube-apiserver.yaml
 
-    - name: Wait for cp1 API server to restart
+    - name: Wait for this API server to restart
       wait_for:
         port: 6443
         host: "{{ ansible_host }}"
         delay: 5
-        timeout: 60
+        timeout: 90
 
-- name: S19 — Isolate etcd1 from etcd2 and etcd3
-  hosts: etcd1
+- name: S19 — Partition etcd into minority and majority groups
+  # Each minority node (etcd1, etcd2) drops both directions of peer-port
+  # (2380) traffic to every majority node. etcd1<->etcd2 stays open, as
+  # does etcd3<->etcd4<->etcd5, so the cluster cleanly splits 2 / 3.
+  hosts: "{{ groups['etcd'][0:2] }}"
   gather_facts: no
   vars:
     scenario_id: s19
+    s19_majority: "{{ groups['etcd'][2:] }}"
   tasks:
-    - name: Block etcd1 peer communication to etcd2 and etcd3
+    - name: Block outbound peer traffic from this minority node to the majority
       iptables:
         chain: OUTPUT
-        destination: "{{ item }}"
+        destination: "{{ hostvars[item]['ansible_host'] }}"
         destination_port: 2380
         protocol: tcp
         jump: DROP
         comment: "fault-inject-quorum-split-{{ scenario_id }}"
-      loop:
-        - "{{ hostvars['etcd2']['ansible_host'] }}"
-        - "{{ hostvars['etcd3']['ansible_host'] }}"
+      loop: "{{ s19_majority }}"
 
-    - name: Also block client port to force etcd1 off quorum writes
+    - name: Block inbound peer traffic from the majority to this minority node
       iptables:
         chain: INPUT
-        source: "{{ item }}"
-        source_port: 2380
+        source: "{{ hostvars[item]['ansible_host'] }}"
+        destination_port: 2380
         protocol: tcp
         jump: DROP
         comment: "fault-inject-quorum-split-{{ scenario_id }}"
-      loop:
-        - "{{ hostvars['etcd2']['ansible_host'] }}"
-        - "{{ hostvars['etcd3']['ansible_host'] }}"
+      loop: "{{ s19_majority }}"
 
-    - debug:
-        msg: "etcd1 isolated from peers — etcd2+etcd3 retain quorum, etcd1 loses writes"
+    - name: Log the split
+      debug:
+        msg: >-
+          etcd split: minority {{ groups['etcd'][0:2] | join('+') }}
+          (no quorum) | majority {{ groups['etcd'][2:] | join('+') }}
+          (retains quorum)
+      run_once: true
 
 - name: S19 — Observe split-quorum behavior
   hosts: k8s_cluster:etcd
@@ -140,30 +154,30 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: split_t120 }
 
-- name: S19 — Compare API server responses across split
+- name: S19 — Compare API server responses across the split
   hosts: "{{ groups['observer'][0] }}"
   gather_facts: no
   vars:
     scenario_id: s19
   tasks:
-    - name: Query cp1 (backed by isolated etcd1) for node list
+    - name: Query cp1 (minority-side etcd) for node list
       shell: |
         curl -sk \
           --cert /tmp/admin-client.crt --key /tmp/admin-client.key \
           --cacert /tmp/k8s-ca.crt \
           https://{{ hostvars['cp1']['ansible_host'] }}:6443/api/v1/nodes \
-          | jq '{source: "cp1_etcd1", resourceVersion: .metadata.resourceVersion,
+          | jq '{source: "cp1_minority", resourceVersion: .metadata.resourceVersion,
                  nodeCount: (.items | length)}'
       register: cp1_node_view
       ignore_errors: yes
 
-    - name: Query cp2 (backed by etcd2+etcd3 quorum) for node list
+    - name: Query cp2 (majority-side etcd) for node list
       shell: |
         curl -sk \
           --cert /tmp/admin-client.crt --key /tmp/admin-client.key \
           --cacert /tmp/k8s-ca.crt \
           https://{{ hostvars['cp2']['ansible_host'] }}:6443/api/v1/nodes \
-          | jq '{source: "cp2_etcd2_3", resourceVersion: .metadata.resourceVersion,
+          | jq '{source: "cp2_majority", resourceVersion: .metadata.resourceVersion,
                  nodeCount: (.items | length)}'
       register: cp2_node_view
       ignore_errors: yes
@@ -173,8 +187,8 @@
         dest: "{{ results_dir }}/api_divergence_during_split.json"
         content: |
           {
-            "cp1_view": {{ cp1_node_view.stdout | default('null') }},
-            "cp2_view": {{ cp2_node_view.stdout | default('null') }}
+            "cp1_view": {{ cp1_node_view.stdout | default('null', true) }},
+            "cp2_view": {{ cp2_node_view.stdout | default('null', true) }}
           }
 
 - name: S19 — Test write behavior under split quorum
@@ -183,7 +197,7 @@
   vars:
     scenario_id: s19
   tasks:
-    - name: Attempt write via cp1 (etcd1 — no quorum — should fail)
+    - name: Attempt write via cp1 (minority — no quorum — should fail)
       shell: |
         START=$(date +%s%3N)
         RESULT=$(curl -sk -X PATCH \
@@ -194,11 +208,11 @@
           -d '{"metadata":{"annotations":{"s19-write-test":"cp1"}}}' \
           -w "\n%{http_code}" 2>/dev/null)
         END=$(date +%s%3N)
-        echo "{\"via\": \"cp1\", \"http_code\": $(echo $RESULT | tail -1), \"latency_ms\": $((END-START))}"
+        echo "{\"via\": \"cp1\", \"http_code\": $(echo \"$RESULT\" | tail -1), \"latency_ms\": $((END-START))}"
       register: cp1_write_test
       ignore_errors: yes
 
-    - name: Attempt write via cp2 (etcd2+etcd3 — has quorum — should succeed)
+    - name: Attempt write via cp2 (majority — has quorum — should succeed)
       shell: |
         START=$(date +%s%3N)
         RESULT=$(curl -sk -X PATCH \
@@ -209,7 +223,7 @@
           -d '{"metadata":{"annotations":{"s19-write-test":"cp2"}}}' \
           -w "\n%{http_code}" 2>/dev/null)
         END=$(date +%s%3N)
-        echo "{\"via\": \"cp2\", \"http_code\": $(echo $RESULT | tail -1), \"latency_ms\": $((END-START))}"
+        echo "{\"via\": \"cp2\", \"http_code\": $(echo \"$RESULT\" | tail -1), \"latency_ms\": $((END-START))}"
       register: cp2_write_test
       ignore_errors: yes
 
@@ -217,10 +231,10 @@
       copy:
         dest: "{{ results_dir }}/write_tests_during_split.json"
         content: |
-          [{{ cp1_write_test.stdout | default('null') }}, {{ cp2_write_test.stdout | default('null') }}]
+          [{{ cp1_write_test.stdout | default('null', true) }}, {{ cp2_write_test.stdout | default('null', true) }}]
 
 - name: S19 — Restore etcd quorum
-  hosts: etcd1
+  hosts: "{{ groups['etcd'][0:2] }}"
   gather_facts: no
   vars:
     scenario_id: s19
@@ -230,8 +244,8 @@
         iptables-save | grep -v "fault-inject-quorum-split-{{ scenario_id }}" \
           | iptables-restore
 
-- name: S19 — Restore cp1 API server to full etcd endpoint list
-  hosts: cp1
+- name: S19 — Restore cp1 and cp2 API servers to the full etcd endpoint list
+  hosts: cp1:cp2
   gather_facts: no
   vars:
     scenario_id: s19
@@ -242,7 +256,7 @@
         dest: /etc/kubernetes/manifests/kube-apiserver.yaml
         remote_src: yes
 
-    - name: Wait for cp1 API server to recover
+    - name: Wait for this API server to recover
       wait_for:
         port: 6443
         host: "{{ ansible_host }}"
@@ -275,4 +289,7 @@
       register: r
     - copy:
         dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
         content: "{{ r.stdout }}"

@@ -70,14 +70,21 @@ resource "vsphere_folder" "vms" {
 }
 
 # ---------------------------------------------------------------------------
-# Cluster topology — single source of truth for the 9 VMs from INFRASTRUCTURE.md.
+# Cluster topology — single source of truth for the 11 VMs.
 # The observer / Ansible-controller host is intentionally NOT created here:
 # you run Ansible from your own machine against these VMs.
 #
 #   role           name        mgmt + pod octet   vCPU   RAM      disk
 #   control_plane  cp1..cp3     50 51 52           4      8 GB     60 GB
 #   workers        worker1..3   53 54 55           4      8 GB     60 GB
-#   etcd           etcd1..3     56 57 58           2      4 GB     40 GB
+#   etcd           etcd1..5     56 57 58 60 61     2      4 GB     40 GB
+#
+# A 5-member etcd cluster (was 3): etcd4/etcd5 give S19 (split quorum) a
+# meaningful 3/2 majority/minority split. octet 59 is the API VIP, so the
+# two new etcd nodes take 60 and 61. The whole etcd path — inventory
+# generation (outputs.tf), CA/peer cert SANs and the --initial-cluster
+# systemd flag (roles/k8s-install) — already iterates groups['etcd'], so
+# this map is the only place the member count is set.
 #
 # Each VM gets the same host octet on both the management and pod networks.
 # ---------------------------------------------------------------------------
@@ -93,11 +100,13 @@ locals {
     etcd1   = { role = "etcd", octet = 56, num_cpus = 2, memory = 4096, disk_size = 40 }
     etcd2   = { role = "etcd", octet = 57, num_cpus = 2, memory = 4096, disk_size = 40 }
     etcd3   = { role = "etcd", octet = 58, num_cpus = 2, memory = 4096, disk_size = 40 }
+    etcd4   = { role = "etcd", octet = 60, num_cpus = 2, memory = 4096, disk_size = 40 }
+    etcd5   = { role = "etcd", octet = 61, num_cpus = 2, memory = 4096, disk_size = 40 }
   }
 }
 
 # ---------------------------------------------------------------------------
-# Deploy the 9 cluster VMs via the vm module
+# Deploy the 11 cluster VMs via the vm module
 # ---------------------------------------------------------------------------
 
 module "vms" {
