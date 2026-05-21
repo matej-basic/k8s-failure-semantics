@@ -14,6 +14,45 @@
 #   - Whether pods are rescheduled to other nodes while originals still run (I1)
 #   - Whether endpoints still include worker1's pods after eviction (I2, I3)
 #   - Divergence between kubelet local belief and control-plane belief
+#
+# Control-plane operations run on cp2 (control_plane[1]), not cp1
+# (control_plane[0]). cp1 holds the keepalived VIP and is the busiest node;
+# its sshd intermittently rejects bursty connections, which derails plays
+# that delegate to it. cp2 has the same admin.conf and kubectl.
+
+- name: S2 — Pin postgres-stateful-0 onto worker1
+  # I1 (dual ownership) is a StatefulSet-identity property, so the partition
+  # target (worker1) must actually host the StatefulSet pod. Cordon the other
+  # workers, delete the pod so the StatefulSet reschedules it — with only
+  # worker1 schedulable it lands there — then uncordon so the mid-fault
+  # replacement can go elsewhere. Runs directly on cp2 (no delegate / no
+  # run_once) so a cp1 ssh hiccup cannot abort it.
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Cordon worker2 and worker3 so postgres-stateful-0 can only land on worker1
+      shell: kubectl cordon worker2 worker3
+
+    - name: Delete postgres-stateful-0 so the StatefulSet reschedules it onto worker1
+      shell: kubectl delete pod postgres-stateful-0 -n default --ignore-not-found --wait=false
+
+    - name: Wait for postgres-stateful-0 to be Running on worker1
+      shell: |
+        NODE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+        PHASE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.status.phase}' 2>/dev/null)
+        echo "node=$NODE phase=$PHASE"
+        test "$NODE" = "worker1" -a "$PHASE" = "Running"
+      retries: 30
+      delay: 6
+      register: pg_placement
+      until: pg_placement.rc == 0
+
+    - name: Uncordon worker2 and worker3
+      shell: kubectl uncordon worker2 worker3
 
 - name: S2 — Pre-flight baseline
   hosts: k8s_cluster:etcd
@@ -26,15 +65,11 @@
     - name: Verify cluster is healthy
       shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
       register: not_ready_count
-      delegate_to: "{{ groups['control_plane'][0] }}"
+      delegate_to: "{{ groups['control_plane'][1] }}"
       run_once: true
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       failed_when: not_ready_count.stdout | int > 0
-      ignore_unreachable: yes
-      retries: 3
-      delay: 5
-      until: not_ready_count is succeeded
 
     - name: Create results directory
       file:
@@ -50,7 +85,7 @@
           --field-selector spec.nodeName=worker1 -o json \
           | jq '[.items[] | {name: .metadata.name, namespace: .metadata.namespace, phase: .status.phase}]'
       register: worker1_pods_prefault
-      delegate_to: "{{ groups['control_plane'][0] }}"
+      delegate_to: "{{ groups['control_plane'][1] }}"
       run_once: true
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
@@ -61,48 +96,6 @@
         content: "{{ worker1_pods_prefault.stdout }}"
       delegate_to: "{{ groups['observer'][0] }}"
       run_once: true
-
-    # ── Pin postgres-stateful-0 onto worker1 ────────────────────────────
-    # I1 (dual ownership) is a StatefulSet-identity property, so the
-    # partition target (worker1) must actually host the StatefulSet pod.
-    # Cordon the other workers, delete the pod so the StatefulSet
-    # reschedules it — with only worker1 schedulable it lands there —
-    # then uncordon so the mid-fault replacement can go elsewhere.
-    - name: Cordon worker2 and worker3 so postgres-stateful-0 can only land on worker1
-      shell: kubectl cordon worker2 worker3
-      delegate_to: "{{ groups['control_plane'][0] }}"
-      run_once: true
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-
-    - name: Delete postgres-stateful-0 so the StatefulSet reschedules it onto worker1
-      shell: kubectl delete pod postgres-stateful-0 -n default --ignore-not-found --wait=false
-      delegate_to: "{{ groups['control_plane'][0] }}"
-      run_once: true
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-
-    - name: Wait for postgres-stateful-0 to be Running on worker1
-      shell: |
-        NODE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.spec.nodeName}' 2>/dev/null)
-        PHASE=$(kubectl get pod postgres-stateful-0 -n default -o jsonpath='{.status.phase}' 2>/dev/null)
-        echo "node=$NODE phase=$PHASE"
-        test "$NODE" = "worker1" -a "$PHASE" = "Running"
-      delegate_to: "{{ groups['control_plane'][0] }}"
-      run_once: true
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      retries: 30
-      delay: 6
-      register: pg_placement
-      until: pg_placement.rc == 0
-
-    - name: Uncordon worker2 and worker3
-      shell: kubectl uncordon worker2 worker3
-      delegate_to: "{{ groups['control_plane'][0] }}"
-      run_once: true
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
 
   roles:
     - role: metrics-collect
@@ -161,7 +154,7 @@
     # so without this step I1 cannot be violated.
     - name: Force-delete postgres-stateful-0 (operator cleanup of the stuck pod)
       shell: kubectl delete pod postgres-stateful-0 -n default --force --grace-period=0 --wait=false
-      delegate_to: "{{ groups['control_plane'][0] }}"
+      delegate_to: "{{ groups['control_plane'][1] }}"
       run_once: true
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
@@ -184,17 +177,15 @@
     - include_role: { name: metrics-collect }
       vars: { snapshot_label: t_plus_240 }
 
-- name: S2 — Check for dual ownership (pods still running on worker1 AND rescheduled)
+- name: "S2 — Capture node-local container truth on worker1 during partition"
   hosts: worker1
   gather_facts: no
   vars:
     scenario_id: s2
   tasks:
     - name: List actually-running containers on worker1 during partition
-      # Block scalar avoids YAML parsing the flow-mapping `{name: ...}` inside
-      # the jq expression as if it were Ansible task arguments.
       shell: |
-        crictl ps -o json | jq '[.containers[] | {name: .metadata.name, state: .state}]'
+        crictl ps -o json | jq '[.containers[] | {name: .metadata.name, state: .state, podName: .labels."io.kubernetes.pod.name"}]'
       register: worker1_actual_containers
 
     - name: Save worker1 actual container state
@@ -243,4 +234,7 @@
       register: invariant_report
     - copy:
         dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
         content: "{{ invariant_report.stdout }}"
