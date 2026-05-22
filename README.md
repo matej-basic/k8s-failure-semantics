@@ -7,91 +7,113 @@ Ansible-based fault injection and measurement framework for the paper
 
 ## Quick Start
 
-### Step 1 — Provision hosts
+Terraform provisions the VMs; Ansible installs the cluster on them. The two
+tools are kept separate — `deploy.sh` runs them in sequence.
 
-Stand up 10 Linux hosts (Ubuntu 22.04 LTS recommended) as described in
-`INFRASTRUCTURE.md`. Configure passwordless SSH from the observer host to all
-others.
+### Step 1 — Prerequisites
 
-### Step 2 — Configure inventory
+- **Terraform ≥ 1.5** and **Ansible** on your own machine. That machine is the
+  observer / controller — no observer VM is provisioned.
+- A VMware vSphere environment with an `ubuntu-24.04-template` VM template
+  carrying the `ansible` user, your SSH public key, Python 3, and passwordless
+  sudo.
+- `terraform/terraform.tfvars` — copy `terraform/terraform.tfvars.example` and
+  fill in the vCenter connection details.
 
-Edit `inventory/hosts.ini` and replace the IP addresses with your actual host IPs.
-
-```ini
-cp1 ansible_host=YOUR_CP1_IP
-cp2 ansible_host=YOUR_CP2_IP
-...
-```
-
-### Step 3 — Bootstrap the cluster
-
-From the **observer host**, run:
+### Step 2 — Deploy the lab
 
 ```bash
 cd k8s-failure-semantics
-
-# Install prerequisites and build the cluster (~15 minutes)
-ansible-playbook -i inventory/hosts.ini playbooks/setup-cluster.yml
+./deploy.sh
 ```
 
-This installs containerd, kubeadm, etcd, Toxiproxy, stress-ng, node_exporter,
-and Prometheus on all hosts, then bootstraps the HA Kubernetes cluster.
+`deploy.sh` provisions 11 VMs (3 control-plane, 3 worker, 5 etcd), writes
+`inventory/hosts.ini`, waits for SSH, then installs containerd, kubeadm, the
+external 5-member etcd cluster, Toxiproxy, stress-ng, and the HA Kubernetes
+control plane (~20 minutes total). The admin kubeconfig is left on **cp1** at
+`/tmp/admin.conf`.
 
-### Step 4 — Verify the cluster
+Either step can also be run on its own:
 
 ```bash
-# Should show 6 Ready nodes
-kubectl get nodes
+./deploy.sh vms        # Terraform only — provision/refresh the VMs
+./deploy.sh cluster    # Ansible only  — (re)install the cluster on existing VMs
+```
 
-# Should show 3 healthy etcd members
+### Step 3 — Verify the cluster
+
+```bash
+# Should show 6 Ready nodes (3 control-plane + 3 worker)
+ansible -i inventory/hosts.ini cp1 -m shell -a \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes"
+
+# Should show 5 healthy etcd members
 ansible -i inventory/hosts.ini etcd[0] -m shell -a \
   "ETCDCTL_API=3 etcdctl --endpoints=... endpoint health"
 ```
 
-### Step 5 — Run a single scenario
+### Step 4 — Run a single scenario
 
 ```bash
 # Example: run S2 (asymmetric worker isolation)
-ansible-playbook -i inventory/hosts.ini scenarios/s2/playbook.yml
+ansible-playbook -i inventory/hosts.ini scenarios/s2/playbook.yml \
+  -e results_base=$(pwd)/results
 
-# Results are written to /opt/k8s-results/s2/<timestamp>/
+# Results are written to results/s2/<timestamp>/
 ```
 
-### Step 6 — Run all scenarios
+### Step 5 — Run all scenarios
 
 ```bash
 # Run everything in sequence (takes 2–3 hours)
-ansible-playbook -i inventory/hosts.ini playbooks/run-all-scenarios.yml
+ansible-playbook -i inventory/hosts.ini playbooks/run-all-scenarios.yml \
+  -e results_base=$(pwd)/results
 
 # Run a subset by tag
 ansible-playbook -i inventory/hosts.ini playbooks/run-all-scenarios.yml \
-  --tags "s1,s2,s11"
+  --tags "s1,s2,s11" -e results_base=$(pwd)/results
+
+# Long unattended runs — detach so they survive a closed terminal
+scripts/run-sweep-detached.sh
 ```
 
-### Step 7 — Inspect results
+### Step 6 — Inspect results
 
-Results are written to `/opt/k8s-results/` on the observer host:
+Each scenario writes a timestamped directory of snapshot JSON plus an
+`invariant_report.json`:
 
 ```
-/opt/k8s-results/
-  s1/
-    20240420_143012/
-      snapshot_pre_fault.json
-      snapshot_t_plus_30.json
-      snapshot_t_plus_60.json
-      ...
-      invariant_report.json
-  s2/
+results/
+  s1/20260520_143012/
+    snapshot_pre_fault.json
+    snapshot_t_plus_30.json
     ...
+    invariant_report.json
+  s2/ ...
   aggregate_report.json          ← cross-scenario heatmap + timing
 ```
 
-### Step 8 — Reset the cluster
-
-If a scenario leaves the cluster in a broken state:
+Build a single self-contained HTML viewer over them:
 
 ```bash
+scripts/aggregate-results.sh results > results/aggregate_report.json
+scripts/build-report.sh results report.html
+open report.html
+```
+
+`report.html` has an overview heatmap, a per-invariant **Findings** page, a
+scenario/invariant **Reference**, and per-snapshot drill-down — no server, no
+CDN, shareable on its own.
+
+### Step 7 — Reset or rebuild
+
+```bash
+# Reset the cluster in place if a scenario left it broken
 ansible-playbook -i inventory/hosts.ini playbooks/reset-cluster.yml
+
+# Or tear the VMs down and rebuild from scratch
+terraform -chdir=terraform destroy
+./deploy.sh
 ```
 
 ---
