@@ -1,0 +1,46 @@
+# roles/k8s-install/files/nginx-stateless.yml
+# Stateless test workload: an nginx Deployment behind a ClusterIP Service.
+# The scenarios use this as the "stateless app" whose endpoint membership
+# and reachability are observed (invariant I2).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-stateless
+  namespace: default
+  labels:
+    app: nginx-stateless
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx-stateless
+  template:
+    metadata:
+      labels:
+        app: nginx-stateless
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-stateless
+  namespace: default
+spec:
+  selector:
+    app: nginx-stateless
+  ports:
+  - port: 80
+    targetPort: 80

@@ -1,123 +1,23 @@
 ---
 # roles/k8s-install/tasks/deploy-workloads.yml
-# Deploys the standard stateless and stateful workloads used by all scenarios
+# Deploys the standard stateless and stateful workloads used by all scenarios.
+#
+# The manifests live as plain YAML in this role's files/ directory
+# (nginx-stateless.yml, postgres-stateful.yml) — edit them there. They are
+# applied with `kubectl apply -f -`, fed from the controller via stdin, so
+# no copy of the manifest is left on the node.
 
-- name: Deploy stateless nginx workload
-  shell: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata:
-      name: nginx-stateless
-      namespace: default
-      labels:
-        app: nginx-stateless
-    spec:
-      replicas: 3
-      selector:
-        matchLabels:
-          app: nginx-stateless
-      template:
-        metadata:
-          labels:
-            app: nginx-stateless
-        spec:
-          terminationGracePeriodSeconds: 30
-          containers:
-          - name: nginx
-            image: nginx:1.25
-            ports:
-            - containerPort: 80
-            readinessProbe:
-              httpGet:
-                path: /
-                port: 80
-              initialDelaySeconds: 5
-              periodSeconds: 5
-    ---
-    apiVersion: v1
-    kind: Service
-    metadata:
-      name: nginx-stateless
-      namespace: default
-    spec:
-      selector:
-        app: nginx-stateless
-      ports:
-      - port: 80
-        targetPort: 80
-    EOF
+- name: Apply the stateless nginx workload
+  shell: kubectl apply -f -
+  args:
+    stdin: "{{ lookup('file', 'nginx-stateless.yml') }}"
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
 
-- name: Deploy stateful PostgreSQL workload
-  shell: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: ConfigMap
-    metadata:
-      name: postgres-config
-      namespace: default
-    data:
-      POSTGRES_DB: testdb
-      POSTGRES_USER: testuser
-      POSTGRES_PASSWORD: testpass
-    ---
-    apiVersion: apps/v1
-    kind: StatefulSet
-    metadata:
-      name: postgres-stateful
-      namespace: default
-    spec:
-      serviceName: postgres-stateful
-      replicas: 1
-      selector:
-        matchLabels:
-          app: postgres-stateful
-      template:
-        metadata:
-          labels:
-            app: postgres-stateful
-        spec:
-          terminationGracePeriodSeconds: 60
-          containers:
-          - name: postgres
-            image: postgres:15
-            ports:
-            - containerPort: 5432
-            envFrom:
-            - configMapRef:
-                name: postgres-config
-            volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-          # emptyDir, not a volumeClaimTemplate. The lab has no storage
-          # provisioner, and installing a node-pinned one (e.g.
-          # local-path-provisioner) would actively defeat the I1 scenario:
-          # its PVs carry nodeAffinity, so a force-deleted postgres-stateful-0
-          # would be dragged back to the partitioned node and stay Pending
-          # instead of producing a second running copy elsewhere. emptyDir
-          # keeps the StatefulSet's *identity* guarantees (stable pod name,
-          # ordinal, network id) — which is exactly what I1 tests — while
-          # letting the replacement schedule on a healthy node so dual
-          # ownership can actually be observed. The cost is no data
-          # persistence, which the identity-focused scenarios do not need.
-          volumes:
-          - name: data
-            emptyDir: {}
-    ---
-    apiVersion: v1
-    kind: Service
-    metadata:
-      name: postgres-stateful
-      namespace: default
-    spec:
-      clusterIP: None
-      selector:
-        app: postgres-stateful
-      ports:
-      - port: 5432
-    EOF
+- name: Apply the stateful PostgreSQL workload
+  shell: kubectl apply -f -
+  args:
+    stdin: "{{ lookup('file', 'postgres-stateful.yml') }}"
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
 

@@ -1,0 +1,69 @@
+# roles/k8s-install/files/postgres-stateful.yml
+# Stateful test workload: a single-replica PostgreSQL StatefulSet with a
+# headless Service. The scenarios use this as the workload with a stable
+# identity (postgres-stateful-0) — the subject of the I1 dual-ownership test.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: default
+data:
+  POSTGRES_DB: testdb
+  POSTGRES_USER: testuser
+  POSTGRES_PASSWORD: testpass
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-stateful
+  namespace: default
+spec:
+  serviceName: postgres-stateful
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-stateful
+  template:
+    metadata:
+      labels:
+        app: postgres-stateful
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+        envFrom:
+        - configMapRef:
+            name: postgres-config
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      # emptyDir, not a volumeClaimTemplate. The lab has no storage
+      # provisioner, and installing a node-pinned one (e.g.
+      # local-path-provisioner) would actively defeat the I1 scenario:
+      # its PVs carry nodeAffinity, so a force-deleted postgres-stateful-0
+      # would be dragged back to the partitioned node and stay Pending
+      # instead of producing a second running copy elsewhere. emptyDir
+      # keeps the StatefulSet's identity guarantees (stable pod name,
+      # ordinal, network id) — which is exactly what I1 tests — while
+      # letting the replacement schedule on a healthy node so dual
+      # ownership can actually be observed. The cost is no data
+      # persistence, which the identity-focused scenarios do not need.
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-stateful
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: postgres-stateful
+  ports:
+  - port: 5432
