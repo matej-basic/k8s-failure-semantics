@@ -2,6 +2,36 @@
 # roles/common/tasks/main.yml
 # Installs all prerequisites on every cluster host
 
+# Disable Ubuntu's unattended-upgrades and apt auto-update timers FIRST.
+# In a fault-injection lab they are pure interference: they grab the
+# dpkg/apt lock (which makes this role's own apt tasks fail with
+# "Could not get lock"), and they can restart services or reboot a node
+# mid-experiment — perturbing the exact cluster state a scenario is trying
+# to measure. `state: stopped` also releases the lock if a run is already
+# in progress when the bootstrap starts.
+- name: Disable unattended-upgrades and apt auto-update timers
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+    masked: yes
+  loop:
+    - unattended-upgrades.service
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+    - apt-daily.service
+    - apt-daily-upgrade.service
+  # Housekeeping units; tolerate any that a minimal image does not ship.
+  failed_when: false
+
+- name: Turn off APT periodic update/upgrade
+  copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+    mode: '0644'
+
 - name: Disable swap
   command: swapoff -a
   changed_when: false
