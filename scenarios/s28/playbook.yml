@@ -1,0 +1,1169 @@
+---
+# scenarios/s28/playbook.yml
+# S28: Stale etcd member rejoining after compaction
+#
+# Extends S17 into the recovery phase. S17 isolates a CONTROLLER from etcd,
+# compacts, and measures the relist it forces. S28 isolates an etcd MEMBER,
+# compacts the keyspace past that member's log position, reconnects it, and
+# measures what the cluster — and every API server watching it — does while
+# the member is re-seeded. That re-seed window is the watch-gap question S17
+# opens and does not close.
+#
+# What it does:
+#   1. Verifies a healthy N-member cluster and that losing ONE member leaves
+#      quorum intact, both while it is isolated (N voting, N-1 alive) and
+#      while it is being re-seeded (N-1 voting, N-1 alive).
+#   2. Isolates exactly one member (default etcd5) at both etcd ports — 2380
+#      from its peers, 2379 from its peers and from every API server — so it
+#      neither replicates nor serves.
+#   3. Drives the keyspace forward with a revision pump, then compacts
+#      (--physical) at the new revision and defragments the survivors, so the
+#      compacted revision is provably ABOVE the isolated member's frozen one.
+#   4. Records the evidence: leader's compacted revision, the isolated
+#      member's last revision / raft term / raft index, and the ErrCompacted
+#      failure a client resuming from that member's position receives.
+#   5. Reconnects the member and gives it a catch-up window ON ITS OWN, and
+#      records whether it converged — see the honesty note below.
+#   6. Re-seeds it (remove, wipe, re-add as learner, start with
+#      --initial-cluster-state=existing, promote once in sync) and snapshots
+#      the cluster mid-window.
+#   7. Observes for `observation_window`, then runs check-invariants.sh.
+#
+# ── What is guaranteed, and what is not ──────────────────────────────────────
+# GUARANTEED. That MVCC compaction passes the isolated member's revision. The
+#   member is frozen at revision R_m the moment it is isolated (it receives no
+#   raft entries), the pump advances the cluster to R_c > R_m, and compaction
+#   runs at R_c. The playbook measures the margin R_c - R_m and records it as
+#   `compaction_margin_revisions`; a run where the margin is not positive is
+#   flagged `condition_established: false` in the evidence file and its
+#   verdicts must not be read as measuring this scenario.
+#
+# GUARANTEED. That a client resuming from the member's position gets the
+#   classic signal: `etcdctl watch --rev=R_m` returns
+#   "required revision has been compacted" (ErrCompacted), and an API-server
+#   list continuation issued before the pump returns 410 Gone, because the
+#   continue token embeds the pre-compaction etcd revision. Both are captured
+#   verbatim.
+#
+# NOT GUARANTEED — say so in the paper. That MVCC compaction is what makes the
+#   member unable to catch up. etcd replicates the RAFT LOG, not MVCC history:
+#   a follower that has fallen behind is normally repaired by an automatic
+#   raft snapshot transfer from the leader, and `etcdctl compact` does not
+#   prevent that. The condition where a member genuinely cannot catch up is
+#   governed by --snapshot-count (default 100000 entries), which no scenario
+#   of this length can drive past, and which cannot be lowered from inside
+#   S28 without restarting the other members' etcd units — out of this
+#   scenario's blast radius by design.
+#   So S28 does NOT claim etcd forced the re-seed. It (a) measures whether the
+#   member caught up on its own during `s28_catchup_wait`, recording the
+#   answer as `caught_up_without_reseed`, and (b) performs the re-seed as the
+#   documented operational remedy either way, because the re-seed window — not
+#   the mechanism that motivates it — is what this scenario measures. Making
+#   the "cannot catch up" condition deterministic needs a central change:
+#   a low --snapshot-count on the etcd unit in roles/k8s-install.
+#
+# ── Recovery is the primary requirement ──────────────────────────────────────
+# This is the most dangerous scenario in the suite: it removes a member from
+# a live etcd cluster and erases its data directory. Everything therefore
+# lives in ONE play under a single block/rescue/always, so teardown cannot be
+# skipped by an early failure, an unreachable host or a Ctrl-C-free abort:
+#   always: remove the isolation rules on every etcd host; make sure etcd is
+#           running on the target; drop the pump keys and defragment; REPAIR
+#           the membership if the main path left it short; then verify
+#           N voting members, no learners, all endpoints healthy — and fail
+#           loudly if not.
+# The re-seed itself is factored into tasks/reseed-member.yml precisely so the
+# repair path can re-run it without duplicating the logic.
+#
+# Parameters (override with -e):
+#   s28_isolate_member    which member to isolate         (default etcd5)
+#   s28_pump_seconds      revision-pump wall clock        (default 120)
+#   s28_pump_parallel     concurrent pump writers         (default 8)
+#   s28_catchup_wait      seconds to let it catch up      (default 120)
+#   s28_reseed            perform the re-seed at all      (default true)
+
+- name: S28 — Stale etcd member rejoining after compaction
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s28
+    scenario_name: "Stale etcd member rejoining after compaction"
+
+    # ── target selection ──────────────────────────────────────────────────
+    # etcd5 by default. It must not be groups['etcd'][0]: metrics-collect
+    # delegates every etcd query of every snapshot to that host, so isolating
+    # it would blind the measurement instead of the member.
+    s28_target: "{{ s28_isolate_member | default('etcd5') }}"
+    # `reject` and not `difference`: difference() goes through a set and
+    # comes back in arbitrary order, which would make the control host — and
+    # the isolation's peer list — differ between runs of the same scenario.
+    s28_ctl: "{{ (groups['etcd'] | reject('equalto', s28_target) | list)[0] }}"
+
+    # Everything the isolated member must not be able to reach, and that must
+    # not be able to reach it: the other etcd members (raft on 2380, health
+    # and status on 2379) and every API server (2379).
+    s28_peer_ips: >-
+      {{ ((groups['etcd'] | reject('equalto', s28_target) | list) + groups['control_plane'])
+         | map('extract', hostvars, 'ansible_host') | list }}
+
+    s28_iptables_comment: "fault-inject-stale-member-s28"
+
+    # ── quorum arithmetic, asserted below rather than assumed ─────────────
+    s28_members_total: "{{ groups['etcd'] | length }}"
+    s28_quorum_isolated: "{{ ((groups['etcd'] | length) // 2) + 1 }}"
+    s28_alive_isolated: "{{ (groups['etcd'] | length) - 1 }}"
+    s28_quorum_reseed: "{{ (((groups['etcd'] | length) - 1) // 2) + 1 }}"
+    s28_alive_reseed: "{{ (groups['etcd'] | length) - 1 }}"
+
+    # ── timing ────────────────────────────────────────────────────────────
+    s28_settle: 30                 # seconds isolated before the pump starts
+    s28_pump_seconds: 120          # revision-pump wall clock
+    s28_pump_parallel: 8           # concurrent writers
+    s28_pump_per_worker: 20000     # per-worker cap; the deadline usually wins
+    s28_extra_hold: 30             # extra isolation after compaction
+    s28_catchup_wait: 120          # let the member try to catch up unaided
+    s28_reseed: true
+
+    # ── etcdctl ───────────────────────────────────────────────────────────
+    # Certificates exist only on etcd nodes, so every etcdctl call in this
+    # scenario runs on an etcd host (s28_ctl, or the target for its own
+    # local view). etcdctl_env in group_vars is not used here because the
+    # endpoint list has to vary per call.
+    s28_ectl: >-
+      ETCDCTL_API=3 etcdctl
+      --cacert={{ etcd_cert_dir }}/ca.crt
+      --cert={{ etcd_cert_dir }}/server.crt
+      --key={{ etcd_cert_dir }}/server.key
+
+    s28_rs_initial_cluster_fallback: >-
+      {%- for h in groups['etcd'] -%}
+      {{ h }}=https://{{ hostvars[h]['ansible_host'] }}:2380
+      {%- if not loop.last %},{% endif %}
+      {%- endfor -%}
+
+    s28_reseed_phase: primary
+    s28_reseed_snapshots: true
+
+  tasks:
+    - block:
+
+        # ── 0. pre-flight ────────────────────────────────────────────────
+        - name: Create results directory
+          file:
+            path: "{{ results_dir }}"
+            state: directory
+            mode: '0755'
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: The target must be a real etcd member, and not the one we measure from
+          assert:
+            that:
+              - s28_target in groups['etcd']
+              - s28_target != groups['etcd'][0]
+              - s28_ctl != s28_target
+            fail_msg: >-
+              s28_isolate_member must name a member of groups['etcd'] other
+              than {{ groups['etcd'][0] }}, which metrics-collect uses as its
+              etcd vantage point for every snapshot. Got '{{ s28_target }}'.
+          run_once: true
+
+        - name: Isolating one member must leave quorum intact, both while isolated and while re-seeding
+          # Verified, not assumed. With N=5: isolated -> 5 voting, 4 alive,
+          # quorum 3. Re-seeding -> 4 voting, 4 alive, quorum 3. With N=3 both
+          # still hold (2 of 2 voting after the remove). With N=2 or N=1 they
+          # do not, and the scenario refuses to run.
+          assert:
+            that:
+              - (s28_alive_isolated | int) >= (s28_quorum_isolated | int)
+              - (s28_alive_reseed | int) >= (s28_quorum_reseed | int)
+            fail_msg: >-
+              Isolating one member of a {{ s28_members_total }}-member cluster
+              would lose quorum: {{ s28_alive_isolated }} alive vs quorum
+              {{ s28_quorum_isolated }} while isolated,
+              {{ s28_alive_reseed }} alive vs quorum {{ s28_quorum_reseed }}
+              while re-seeding. Refusing to inject.
+            success_msg: >-
+              quorum safe: {{ s28_alive_isolated }}/{{ s28_members_total }}
+              alive vs quorum {{ s28_quorum_isolated }} while isolated;
+              {{ s28_alive_reseed }}/{{ s28_alive_reseed }} voting vs quorum
+              {{ s28_quorum_reseed }} while re-seeding
+          run_once: true
+
+        - name: Collect baseline endpoint status for every member
+          shell: |
+            {{ s28_ectl }} --endpoints={{ etcd_endpoints }} \
+              --command-timeout=20s endpoint status -w table
+          register: s28_baseline_status
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+          retries: 3
+          delay: 10
+          until: s28_baseline_status.rc == 0
+
+        - name: Collect baseline endpoint health for every member
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints={{ etcd_endpoints }} \
+              --command-timeout=20s endpoint health -w json \
+              | jq -c '[.[] | {endpoint: .endpoint, health: .health}]'
+          register: s28_baseline_health
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+
+        - name: Every member must be healthy before anything is injected
+          assert:
+            that:
+              - ((s28_baseline_health.stdout | default('[]', true) | from_json)
+                 | selectattr('health') | list | length) == (s28_members_total | int)
+            fail_msg: >-
+              Baseline etcd is not whole — {{ s28_baseline_health.stdout }}.
+              S28 removes and re-seeds a member; it will not start from a
+              cluster that is already degraded.
+          run_once: true
+
+        - name: Read the target member's own view before isolation
+          # Its ID, whether it leads, its raft term/index and its revision, read
+          # from the member itself over 127.0.0.1. `endpoint status` is served
+          # locally without quorum, so the same call still works once the
+          # member is cut off — which is how its frozen position is measured.
+          # Parsed from the table, not from JSON: member IDs are uint64 and jq
+          # rounds anything above 2^53, and a wrong ID passed to
+          # `member remove` is the one mistake this scenario must never make.
+          shell: |
+            set -o pipefail
+            S=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w table 2>/dev/null || true)
+            J=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w json 2>/dev/null || echo '[]')
+            fld() { echo "$S" | awk -F'|' -v c="$1" '/https/ { gsub(/^ +| +$/,"",$c); print $c }' | head -1; }
+            REV=$(echo "$J" | jq -r '.[0].Status.header.revision // empty')
+            printf '{"host":"%s","member_id":"%s","is_leader":%s,"is_learner":%s,"raft_term":"%s","raft_index":"%s","raft_applied_index":"%s","revision":%s}\n' \
+              "{{ s28_target }}" "$(fld 3)" "$(fld 6 | grep -q true && echo true || echo false)" \
+              "$(fld 7 | grep -q true && echo true || echo false)" \
+              "$(fld 8)" "$(fld 9)" "$(fld 10)" "${REV:-null}"
+          register: s28_target_before
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          changed_when: false
+
+        - name: Never isolate the leader — that is a different fault
+          # Isolating the leader forces an election and measures leader
+          # failover, not a stale follower. Fail with instructions rather than
+          # silently re-targeting: which member is torn down and repaired must
+          # never be decided implicitly.
+          assert:
+            that:
+              - not ((s28_target_before.stdout | default('{}', true) | from_json).is_leader | default(false))
+            fail_msg: >-
+              {{ s28_target }} is currently the etcd leader. Isolating it would
+              trigger a leader election and measure failover instead of a stale
+              follower. Re-run with -e s28_isolate_member=<a follower>, or move
+              leadership first with `etcdctl move-leader`.
+          run_once: true
+
+        - name: Save the baseline etcd state
+          copy:
+            dest: "{{ results_dir }}/etcd_baseline.txt"
+            content: |
+              === endpoint status ===
+              {{ s28_baseline_status.stdout }}
+              === endpoint health ===
+              {{ s28_baseline_health.stdout }}
+              === target ({{ s28_target }}) before isolation ===
+              {{ s28_target_before.stdout }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Baseline snapshot
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: pre_fault
+
+        # ── 1. capture the pre-compaction client positions ────────────────
+        - name: Capture a pre-compaction list continuation from each API server
+          # The deterministic client-visible gap. A `continue` token embeds the
+          # etcd revision the first page was read at; replaying it after that
+          # revision has been compacted makes the API server return 410 Gone
+          # ("continue parameter is too old"). Unlike a watch resumption, this
+          # cannot be satisfied from the API server's watch cache — it goes
+          # through to etcd — so it is caused by our compaction and nothing
+          # else. Captured per API server, addressed by its own IP rather than
+          # through the VIP, for the same reason metrics-collect does.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            SERVER="https://{{ ansible_host }}:6443"
+            page=$(kubectl --server="$SERVER" --request-timeout=10s \
+                     get --raw '/api/v1/pods?limit=1' 2>/dev/null || echo '')
+            cont=$(echo "$page"  | jq -r '.metadata.continue // empty' 2>/dev/null || echo '')
+            rv=$(echo "$page"    | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || echo '')
+            jq -cn --arg host "{{ inventory_hostname }}" --arg c "$cont" --arg r "$rv" \
+              '{host: $host, continue_token: $c, resource_version: $r, ok: (($c | length) > 0)}'
+          register: s28_api_before
+          when: inventory_hostname in groups['control_plane']
+          changed_when: false
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the pre-compaction client positions
+          copy:
+            dest: "{{ results_dir }}/apiserver_positions_pre_compaction.json"
+            content: |
+              [
+              {% for h in groups['control_plane'] %}
+              {{ hostvars[h].s28_api_before.stdout | default('{"host": "' ~ h ~ '", "ok": false, "error": "no_result"}', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+              ]
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── 2. isolate exactly one member ────────────────────────────────
+        - name: Isolate the target etcd member at both etcd ports
+          # Written as raw iptables rather than the iptables module: 7 peers x
+          # 2 ports x 4 rules is 56 module invocations and 56 SSH round trips.
+          # Both port directions are covered on both chains so an established
+          # peer connection cannot keep limping along on ephemeral ports. The
+          # comment is the one the teardown greps for; SSH (22) is untouched,
+          # so the member stays manageable while it is cut off.
+          shell: |
+            set -euo pipefail
+            for ip in {{ s28_peer_ips | join(' ') }}; do
+              for port in 2379 2380; do
+                iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" \
+                  -m comment --comment "{{ s28_iptables_comment }}" -j DROP
+                iptables -A OUTPUT -p tcp -d "$ip" --sport "$port" \
+                  -m comment --comment "{{ s28_iptables_comment }}" -j DROP
+                iptables -A INPUT -p tcp -s "$ip" --dport "$port" \
+                  -m comment --comment "{{ s28_iptables_comment }}" -j DROP
+                iptables -A INPUT -p tcp -s "$ip" --sport "$port" \
+                  -m comment --comment "{{ s28_iptables_comment }}" -j DROP
+              done
+            done
+            iptables-save | grep -c "{{ s28_iptables_comment }}"
+          register: s28_isolation_rules
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+
+        - name: Record the isolation timestamp
+          set_fact:
+            s28_isolate_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          run_once: true
+
+        - name: Declare what this fault must observably do
+          # etcd_members_dropped is the right signal and the only one that can
+          # fire here. The fault's target is an etcd VM, which is not a
+          # Kubernetes node, so it never appears in .control_plane.node_conditions
+          # and target_node_status_changed / node_status_changed are structurally
+          # inapplicable. What the injection must produce is exactly a drop in
+          # responding members: metrics-collect asks all {{ s28_members_total }}
+          # endpoints from {{ groups['etcd'][0] }} on 2379, that host is on the
+          # far side of the block, and `endpoint status` prints only the members
+          # that answered — so .etcd.member_status shrinks from
+          # {{ s28_members_total }} to {{ s28_alive_isolated }} for every
+          # snapshot taken while the member is isolated or removed. If it does
+          # not, the isolation did not reach the member and the run's invariant
+          # verdicts describe an undisturbed cluster.
+          # Leases and placement are deliberately NOT required: a correctly
+          # working cluster loses one etcd member of five without moving a pod
+          # or dropping a lease, and requiring that would mark a successful
+          # injection ineffective.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "fault_type": "etcd_stale_member",
+                "efficacy": {
+                  "target_node": "",
+                  "require": ["etcd_members_dropped"]
+                }
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Report the isolation
+          debug:
+            msg: >-
+              {{ s28_target }} isolated at {{ s28_isolate_ts }}
+              ({{ s28_isolation_rules.stdout | trim }} iptables rules);
+              cluster continues on {{ s28_alive_isolated }}/{{ s28_members_total }}
+              members, quorum {{ s28_quorum_isolated }}
+          run_once: true
+
+        - name: Let the isolation settle
+          pause:
+            seconds: "{{ s28_settle }}"
+          run_once: true
+
+        - name: Snapshot while isolated, before the pump
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: isolated_t30
+
+        # ── 3. drive the revision forward, then compact past the member ───
+        - name: Record the cluster revision before the pump
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=10s endpoint status -w json \
+              | jq '.[0].Status.header.revision'
+          register: s28_rev_before_pump
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+
+        - name: Install the revision pump
+          # An idle cluster produces almost no writes, so waiting cannot create
+          # the condition this scenario needs — the revision has to be driven.
+          # Each `etcdctl put` is one process, so a single serial loop tops out
+          # around 50-100 writes/s; N parallel writers get this to a few
+          # thousand revisions over the pump window, which is the margin the
+          # compaction then has to clear. Keys live under /s28-pump/, outside
+          # the /registry/ prefix Kubernetes owns, and are deleted in teardown.
+          copy:
+            dest: /tmp/s28-rev-pump.sh
+            mode: '0755'
+            content: |
+              #!/bin/bash
+              # S28 revision pump — writes until the deadline or the per-worker cap.
+              DEADLINE=$(( $(date +%s) + {{ s28_pump_seconds }} ))
+              worker() {
+                local w="$1" i=0
+                while [ "$i" -lt {{ s28_pump_per_worker }} ]; do
+                  if [ "$(date +%s)" -ge "$DEADLINE" ]; then break; fi
+                  {{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                    --command-timeout=5s \
+                    put "/s28-pump/{{ run_id }}/w$w/k$i" "$i" >/dev/null 2>&1 || true
+                  i=$(( i + 1 ))
+                done
+                echo "worker $w wrote $i"
+              }
+              for w in $(seq 1 {{ s28_pump_parallel }}); do worker "$w" & done
+              wait
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+
+        - name: Run the revision pump
+          shell: /tmp/s28-rev-pump.sh
+          register: s28_pump
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+
+        - name: Record the cluster revision after the pump
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=10s endpoint status -w json \
+              | jq '.[0].Status.header.revision'
+          register: s28_rev_after_pump
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+
+        - name: Read the isolated member's frozen position
+          # Same local call as before isolation. The member has received no
+          # raft entries since, so this is the log position compaction must
+          # pass — and the revision every ErrCompacted probe below resumes
+          # from.
+          shell: |
+            set -o pipefail
+            S=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w table 2>/dev/null || true)
+            J=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w json 2>/dev/null || echo '[]')
+            fld() { echo "$S" | awk -F'|' -v c="$1" '/https/ { gsub(/^ +| +$/,"",$c); print $c }' | head -1; }
+            REV=$(echo "$J" | jq -r '.[0].Status.header.revision // empty')
+            printf '{"host":"%s","member_id":"%s","raft_term":"%s","raft_index":"%s","raft_applied_index":"%s","revision":%s}\n' \
+              "{{ s28_target }}" "$(fld 3)" "$(fld 8)" "$(fld 9)" "$(fld 10)" "${REV:-null}"
+          register: s28_target_frozen
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          changed_when: false
+
+        - name: Compute the compaction target and the margin over the isolated member
+          set_fact:
+            s28_member_rev: "{{ (s28_target_frozen.stdout | default('{}', true) | from_json).revision | default(0, true) | int }}"
+            s28_compact_rev: "{{ s28_rev_after_pump.stdout | default('0', true) | trim | int }}"
+          run_once: true
+
+        - name: The compaction point must be above the isolated member's revision
+          # Not fatal, and deliberately so: a run that cannot establish the
+          # condition should be RECORDED as not having established it, not
+          # aborted with the cluster half torn down. condition_established
+          # travels into the evidence file so the run can be excluded.
+          set_fact:
+            s28_condition_established: "{{ (s28_compact_rev | int) > (s28_member_rev | int) }}"
+            s28_compaction_margin: "{{ (s28_compact_rev | int) - (s28_member_rev | int) }}"
+          run_once: true
+
+        - name: Report the margin
+          debug:
+            msg: >-
+              isolated member is frozen at revision {{ s28_member_rev }};
+              cluster is at {{ s28_compact_rev }}; compacting there leaves a
+              margin of {{ s28_compaction_margin }} revisions
+              (condition_established={{ s28_condition_established }})
+          run_once: true
+
+        - name: Compact the keyspace past the isolated member's position
+          # --physical waits for the space to actually be reclaimed rather than
+          # only marking the revision compacted, so the ErrCompacted probes
+          # below cannot race the compactor.
+          shell: |
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=120s compact --physical {{ s28_compact_rev }}
+          register: s28_compact
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          when: s28_condition_established | bool
+
+        - name: Defragment every reachable member
+          # Serial, one member at a time, and never the isolated one — defrag
+          # blocks the member it runs against, so doing them in parallel would
+          # risk quorum for the duration.
+          shell: |
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[item]['ansible_host'] }}:2379 \
+              --command-timeout=120s defrag
+          loop: "{{ groups['etcd'] | reject('equalto', s28_target) | list }}"
+          register: s28_defrag
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          ignore_errors: yes
+          when: s28_condition_established | bool
+
+        # ── 4. the evidence: what a client resuming from the member sees ──
+        - name: Probe an etcd watch resuming from the isolated member's revision
+          # The classic signal. A watch created at the member's frozen revision
+          # is below the compacted revision, so etcd cancels it with
+          # "required revision has been compacted" (ErrCompacted). This is the
+          # etcd-level proof that the member's log position is gone.
+          shell: |
+            # `env` is required: s28_ectl begins with an ETCDCTL_API=3
+            # assignment, and `timeout ETCDCTL_API=3 etcdctl ...` would try to
+            # execute the assignment as a program.
+            timeout 20 env {{ s28_ectl }} \
+              --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              watch --prefix --rev={{ s28_member_rev }} /registry/ 2>&1 | head -20
+            exit 0
+          register: s28_watch_probe
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+
+        - name: Save the ErrCompacted probe
+          copy:
+            dest: "{{ results_dir }}/errcompacted_probe.txt"
+            content: |
+              watch --rev={{ s28_member_rev }} (the isolated member's frozen revision)
+              against a cluster compacted at {{ s28_compact_rev }}:
+              ---
+              {{ s28_watch_probe.stdout | default('') }}
+              {{ s28_watch_probe.stderr | default('') }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Replay each API server's pre-compaction continuation
+          # Two probes per API server:
+          #   continue_replay  — deterministic. The token embeds the
+          #                      pre-compaction revision, goes through to etcd,
+          #                      and must come back 410 Gone.
+          #   watch_replay     — corroborating only. A 410 here confirms a
+          #                      client-observed gap, but a 200 does NOT
+          #                      disprove the compaction: the API server can
+          #                      still answer from its watch cache, which holds
+          #                      a window of events independent of etcd's MVCC
+          #                      history. Recorded, not asserted on.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            SERVER="https://{{ ansible_host }}:6443"
+            CONT={{ (hostvars[inventory_hostname].s28_api_before.stdout | default('{}', true) | from_json).continue_token | default('') | quote }}
+            RV={{ (hostvars[inventory_hostname].s28_api_before.stdout | default('{}', true) | from_json).resource_version | default('') | quote }}
+            cont_out='(not attempted)'
+            watch_out='(not attempted)'
+            if [ -n "$CONT" ]; then
+              cont_out=$(kubectl --server="$SERVER" --request-timeout=10s \
+                get --raw "/api/v1/pods?limit=1&continue=$CONT" 2>&1 | head -c 600 || true)
+            fi
+            if [ -n "$RV" ]; then
+              watch_out=$(kubectl --server="$SERVER" --request-timeout=10s \
+                get --raw "/api/v1/namespaces/kube-system/configmaps?watch=true&resourceVersion=$RV&timeoutSeconds=3" 2>&1 | head -c 600 || true)
+            fi
+            jq -cn --arg host "{{ inventory_hostname }}" \
+                   --arg phase "{{ s28_probe_phase | default('post_compaction') }}" \
+                   --arg c "$cont_out" --arg w "$watch_out" \
+              '{host: $host, phase: $phase, continue_replay: $c, watch_replay: $w,
+                continue_gap_observed: ($c | test("too old|Gone|410|compacted")),
+                watch_gap_observed: ($w | test("too old|Gone|410|compacted"))}'
+          register: s28_api_probe_compaction
+          when: inventory_hostname in groups['control_plane']
+          changed_when: false
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the post-compaction client-gap probes
+          copy:
+            dest: "{{ results_dir }}/apiserver_gap_post_compaction.json"
+            content: |
+              [
+              {% for h in groups['control_plane'] %}
+              {{ hostvars[h].s28_api_probe_compaction.stdout | default('{"host": "' ~ h ~ '", "error": "no_result"}', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+              ]
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Snapshot after compaction, member still isolated
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: pre_reconnect
+
+        - name: Hold the isolation a little longer
+          pause:
+            seconds: "{{ s28_extra_hold }}"
+          run_once: true
+
+        # ── 5. restore connectivity and see whether it can catch up ───────
+        - name: Record the reconnect timestamp
+          set_fact:
+            s28_reconnect_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          run_once: true
+
+        - name: Remove the isolation rules from the target
+          shell: |
+            iptables-save | grep -v "{{ s28_iptables_comment }}" | iptables-restore
+            iptables-save | grep -c "{{ s28_iptables_comment }}" || true
+          register: s28_unisolate
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+
+        - name: Let the member try to catch up on its own
+          # The honest measurement. etcd repairs a lagging follower with a raft
+          # snapshot transfer, which MVCC compaction does not block, so the
+          # member may well converge here without any re-seed at all. Whichever
+          # happens is recorded; neither is assumed.
+          pause:
+            seconds: "{{ s28_catchup_wait }}"
+          run_once: true
+
+        - name: Read the member's position after the catch-up window
+          shell: |
+            set -o pipefail
+            S=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w table 2>/dev/null || true)
+            J=$({{ s28_ectl }} --endpoints=https://127.0.0.1:2379 \
+                  --command-timeout=10s endpoint status -w json 2>/dev/null || echo '[]')
+            fld() { echo "$S" | awk -F'|' -v c="$1" '/https/ { gsub(/^ +| +$/,"",$c); print $c }' | head -1; }
+            REV=$(echo "$J" | jq -r '.[0].Status.header.revision // empty')
+            printf '{"host":"%s","raft_term":"%s","raft_index":"%s","revision":%s}\n' \
+              "{{ s28_target }}" "$(fld 8)" "$(fld 9)" "${REV:-null}"
+          register: s28_target_after_reconnect
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Read the cluster revision after the catch-up window
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=10s endpoint status -w json \
+              | jq '.[0].Status.header.revision'
+          register: s28_rev_after_reconnect
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+
+        - name: Capture what the member reported on reconnect
+          # The member's own log is where the rejoin failure surfaces:
+          # ErrCompacted / "required revision has been compacted", raft
+          # snapshot transfers, term bumps, cluster-ID mismatches.
+          shell: |
+            journalctl -u etcd --since "{{ s28_catchup_wait | int + 600 }} seconds ago" --no-pager 2>/dev/null \
+              | grep -i -E "compact|snapshot|rejoin|mismatch|raft|term|leader|slow|lost" \
+              | tail -80
+            exit 0
+          register: s28_target_journal
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          changed_when: false
+
+        - name: Save the reconnect evidence
+          copy:
+            dest: "{{ results_dir }}/member_reconnect_evidence.txt"
+            content: |
+              reconnected_at={{ s28_reconnect_ts }}
+              catchup_wait_seconds={{ s28_catchup_wait }}
+              member_frozen_at={{ s28_target_frozen.stdout | default('') }}
+              member_after_catchup={{ s28_target_after_reconnect.stdout | default('(unreadable)') }}
+              cluster_revision_after_catchup={{ s28_rev_after_reconnect.stdout | default('') | trim }}
+              === etcd journal on {{ s28_target }} ===
+              {{ s28_target_journal.stdout | default('') }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Decide whether the member caught up unaided
+          # "Caught up" = it answers locally AND its revision is within
+          # s28_catchup_tolerance of the cluster's. A member that cannot be
+          # read at all counts as not caught up.
+          set_fact:
+            s28_caught_up: >-
+              {{ (s28_target_after_reconnect.rc | default(1)) == 0
+                 and ((s28_target_after_reconnect.stdout | default('{}', true) | from_json).revision | default(0, true) | int)
+                     >= ((s28_rev_after_reconnect.stdout | default('0', true) | trim | int)
+                         - (s28_catchup_tolerance | default(100) | int)) }}
+          run_once: true
+
+        - name: Snapshot after the catch-up window
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_reconnect
+
+        # ── 6. re-seed ───────────────────────────────────────────────────
+        - name: Report the re-seed decision
+          debug:
+            msg: >-
+              caught_up_without_reseed={{ s28_caught_up }};
+              re-seeding {{ s28_target }} because s28_reseed={{ s28_reseed }}
+              (the re-seed window, not the mechanism that motivates it, is
+              what this scenario measures)
+          run_once: true
+
+        - name: Re-seed the stale member
+          import_tasks: tasks/reseed-member.yml
+          vars:
+            s28_reseed_phase: primary
+            s28_reseed_snapshots: true
+          when: s28_reseed | bool
+
+        - name: Snapshot immediately after the re-seed
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_reseed_t0
+
+        - name: Replay the client-gap probes after the re-seed
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            SERVER="https://{{ ansible_host }}:6443"
+            CONT={{ (hostvars[inventory_hostname].s28_api_before.stdout | default('{}', true) | from_json).continue_token | default('') | quote }}
+            cont_out='(not attempted)'
+            if [ -n "$CONT" ]; then
+              cont_out=$(kubectl --server="$SERVER" --request-timeout=10s \
+                get --raw "/api/v1/pods?limit=1&continue=$CONT" 2>&1 | head -c 600 || true)
+            fi
+            live=$(kubectl --server="$SERVER" --request-timeout=10s \
+              get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1' 2>&1 \
+              | jq -r '.metadata.resourceVersion // "unreadable"' 2>/dev/null || echo unreadable)
+            errs=$(journalctl -u kubelet --since "10 minutes ago" --no-pager 2>/dev/null \
+              | grep -c -i -E "too old resource version|required revision has been compacted|watch chan error" || true)
+            jq -cn --arg host "{{ inventory_hostname }}" --arg c "$cont_out" \
+                   --arg rv "$live" --arg e "${errs:-0}" \
+              '{host: $host, phase: "post_reseed", continue_replay: $c,
+                live_resource_version: $rv, compaction_log_hits: $e}'
+          register: s28_api_probe_post
+          when: inventory_hostname in groups['control_plane']
+          changed_when: false
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the post-re-seed client-gap probes
+          copy:
+            dest: "{{ results_dir }}/apiserver_gap_post_reseed.json"
+            content: |
+              [
+              {% for h in groups['control_plane'] %}
+              {{ hostvars[h].s28_api_probe_post.stdout | default('{"host": "' ~ h ~ '", "error": "no_result"}', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+              ]
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── 7. observation window ────────────────────────────────────────
+        - name: Observe for a third of the observation window
+          pause:
+            seconds: "{{ (observation_window | int / 3) | round(0, 'ceil') | int }}"
+          run_once: true
+        - include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_reseed_t1
+
+        - name: Observe for a second third of the observation window
+          pause:
+            seconds: "{{ (observation_window | int / 3) | round(0, 'ceil') | int }}"
+          run_once: true
+        - include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_reseed_t2
+
+        - name: Observe for the last third of the observation window
+          pause:
+            seconds: "{{ (observation_window | int / 3) | round(0, 'ceil') | int }}"
+          run_once: true
+        - include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_reseed_t3
+
+        - name: Collect API server compaction and relist log lines
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            POD=$(kubectl get pods -n kube-system -l component=kube-apiserver \
+                    --field-selector spec.nodeName={{ inventory_hostname }} \
+                    -o name 2>/dev/null | head -1)
+            if [ -n "$POD" ]; then
+              kubectl logs -n kube-system "$POD" --since=25m 2>/dev/null \
+                | grep -i -E "compacted|too old resource version|watch chan error|etcd.*unhealthy|reflector" \
+                | tail -40
+            fi
+            exit 0
+          register: s28_apiserver_logs
+          when: inventory_hostname in groups['control_plane']
+          changed_when: false
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the API server logs for the re-seed window
+          copy:
+            dest: "{{ results_dir }}/apiserver_reseed_window_logs.txt"
+            content: |
+              {% for h in groups['control_plane'] %}
+              === {{ h }} ===
+              {{ hostvars[h].s28_apiserver_logs.stdout | default('(no result)') }}
+              {% endfor %}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+      rescue:
+        - name: Record that the scenario aborted
+          set_fact:
+            s28_failed: true
+            s28_failure: "{{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('') }}"
+          run_once: true
+
+        - name: Save the failure record
+          copy:
+            dest: "{{ results_dir }}/scenario_failure.txt"
+            content: |
+              S28 aborted before it finished.
+              failed_task={{ ansible_failed_task.name | default('unknown') }}
+              msg={{ ansible_failed_result.msg | default('') }}
+              stderr={{ ansible_failed_result.stderr | default('') }}
+              The `always` block below still runs: isolation is removed and the
+              etcd membership is repaired and verified.
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+      # ── TEARDOWN — unconditional ─────────────────────────────────────────
+      # Ordered so the cheapest and most important undo happens first. Every
+      # step tolerates having already been done: the scenario reaches here
+      # from a clean finish, from a mid-injection failure, and from the repair
+      # path of a previous aborted run.
+      always:
+        - name: TEARDOWN — remove S28 isolation rules from every etcd host
+          # Run per host rather than delegated to one, so a single unreachable
+          # host cannot leave rules behind anywhere else. Only S28's own
+          # comment is filtered, so a rule belonging to any other scenario is
+          # left exactly as it was.
+          shell: |
+            iptables-save | grep -v "{{ s28_iptables_comment }}" | iptables-restore
+            echo "remaining: $(iptables-save | grep -c '{{ s28_iptables_comment }}' || true)"
+          when: inventory_hostname in groups['etcd']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: TEARDOWN — make sure etcd is running on the target
+          systemd:
+            name: etcd
+            state: started
+            enabled: yes
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: TEARDOWN — remove any leftover rejoin drop-in
+          file:
+            path: /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+            state: absent
+          delegate_to: "{{ s28_target }}"
+          run_once: true
+          ignore_errors: yes
+          # Deliberately not followed by a restart: etcd ignores every
+          # --initial-cluster* flag once the data directory is populated, and
+          # restarting a member that has just been re-seeded would throw away
+          # the catch-up it has just done.
+
+        - name: TEARDOWN — read the membership
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=20s member list \
+              | awk -F', *' 'NF >= 6 { t++; if ($6 ~ /^true$/) l++; if ($4 == "https://{{ hostvars[s28_target]['ansible_host'] }}:2380") p++ } END { printf "%d %d %d\n", t+0, l+0, p+0 }'
+          register: s28_td_members
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+          retries: 6
+          delay: 10
+          until: s28_td_members.rc == 0
+          ignore_errors: yes
+
+        - name: TEARDOWN — decide whether the membership needs repairing
+          # Repair if the cluster is short of members, if the target is
+          # missing, or if it is still sitting there as a learner.
+          #
+          # The counts are normalised by appending a spare "0 0 0" before the
+          # split: an unreadable or empty stdout then still yields a
+          # three-element list of zeros instead of raising IndexError inside
+          # the teardown, which would abort the repair before it started.
+          set_fact:
+            s28_td_counts: >-
+              {{ ((s28_td_members.stdout | default('', true) | trim) ~ ' 0 0 0').split() }}
+          run_once: true
+          ignore_errors: yes
+
+        - name: TEARDOWN — set the repair flag
+          set_fact:
+            s28_repair_needed: >-
+              {{ (s28_td_members.rc | default(1)) != 0
+                 or (s28_td_counts[0] | int) != (s28_members_total | int)
+                 or (s28_td_counts[1] | int) != 0
+                 or (s28_td_counts[2] | int) != 1 }}
+          run_once: true
+          ignore_errors: yes
+
+        - name: TEARDOWN — repair the membership
+          # The same re-seed procedure, re-run to put the cluster back
+          # together. Wrapped in its own block/rescue so that a repair that
+          # cannot succeed still reaches the verification below and fails
+          # there, loudly and with the real numbers, instead of aborting the
+          # teardown halfway.
+          block:
+            - name: Repair — re-seed the missing or non-voting member
+              import_tasks: tasks/reseed-member.yml
+              vars:
+                s28_reseed_phase: repair
+                s28_reseed_snapshots: false
+          rescue:
+            - name: Record that the repair failed
+              copy:
+                dest: "{{ results_dir }}/reseed_repair_failed.txt"
+                content: |
+                  The teardown repair of {{ s28_target }} did not complete.
+                  failed_task={{ ansible_failed_task.name | default('unknown') }}
+                  msg={{ ansible_failed_result.msg | default('') }}
+                  The verification below reports the membership as it actually
+                  stands. Do NOT run another scenario until it is whole.
+              delegate_to: "{{ groups['observer'][0] }}"
+              run_once: true
+              ignore_errors: yes
+          # If the flag could not be computed at all, attempt the repair:
+          # the re-seed's own first task re-reads the membership and fails
+          # into the rescue below if it cannot, so the safe default is to
+          # try rather than to walk away from a cluster we cannot describe.
+          when: (s28_repair_needed | default(true)) | bool
+
+        - name: TEARDOWN — delete the pump keys
+          shell: |
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=60s del --prefix "/s28-pump/"
+          register: s28_td_delkeys
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: TEARDOWN — remove the pump script
+          file:
+            path: /tmp/s28-rev-pump.sh
+            state: absent
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: TEARDOWN — compact and defragment away the pump's revisions
+          # The pump wrote tens of thousands of revisions the next scenario has
+          # no reason to carry. Compact at the current revision and defragment
+          # each member in turn, never in parallel.
+          shell: |
+            set -o pipefail
+            REV=$({{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+                    --command-timeout=10s endpoint status -w json \
+                    | jq '.[0].Status.header.revision')
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=120s compact --physical "$REV" || true
+            for ip in {{ groups['etcd'] | map('extract', hostvars, 'ansible_host') | join(' ') }}; do
+              {{ s28_ectl }} --endpoints="https://${ip}:2379" --command-timeout=120s defrag || true
+            done
+            echo "compacted at $REV"
+          register: s28_td_compact
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          ignore_errors: yes
+
+        # ── verification: the cluster must be whole ──────────────────────
+        - name: VERIFY — membership
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+              --command-timeout=20s member list \
+              | awk -F', *' 'NF >= 6 { t++; if ($6 ~ /^true$/) l++; if ($2 ~ /^started$/) s++ } END { printf "%d %d %d\n", t+0, l+0, s+0 }'
+          register: s28_verify_members
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+          retries: 18
+          delay: 10
+          until: >-
+            s28_verify_members.rc == 0
+            and (((s28_verify_members.stdout | default('', true) | trim) ~ ' 0 0 0').split()[0] | int)
+                == (s28_members_total | int)
+            and (((s28_verify_members.stdout | default('', true) | trim) ~ ' 0 0 0').split()[1] | int) == 0
+            and (((s28_verify_members.stdout | default('', true) | trim) ~ ' 0 0 0').split()[2] | int)
+                == (s28_members_total | int)
+          ignore_errors: yes
+
+        - name: VERIFY — normalise the membership counts
+          # Same normalisation as the teardown decision: the final assert must
+          # fail with its own message, not with an IndexError from an empty
+          # stdout.
+          set_fact:
+            s28_final_counts: >-
+              {{ ((s28_verify_members.stdout | default('', true) | trim) ~ ' 0 0 0').split() }}
+          run_once: true
+          ignore_errors: yes
+
+        - name: VERIFY — endpoint health of every member
+          shell: |
+            set -o pipefail
+            {{ s28_ectl }} --endpoints={{ etcd_endpoints }} \
+              --command-timeout=20s endpoint health -w json \
+              | jq -c '[.[] | {endpoint: .endpoint, health: .health}]'
+          register: s28_verify_health
+          delegate_to: "{{ s28_ctl }}"
+          run_once: true
+          changed_when: false
+          retries: 18
+          delay: 10
+          until: >-
+            s28_verify_health.rc == 0
+            and ((s28_verify_health.stdout | default('[]', true) | from_json)
+                 | selectattr('health') | list | length) == (s28_members_total | int)
+          ignore_errors: yes
+
+        - name: VERIFY — save the final etcd state
+          copy:
+            dest: "{{ results_dir }}/etcd_final_state.txt"
+            content: |
+              member_list_counts(total learners started)={{ s28_verify_members.stdout | default('unreadable') | trim }}
+              expected_total={{ s28_members_total }}
+              endpoint_health={{ s28_verify_health.stdout | default('unreadable') }}
+              repair_needed_at_teardown={{ s28_repair_needed | default('unknown') }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Write the compaction evidence file
+          copy:
+            dest: "{{ results_dir }}/s28_compaction_evidence.json"
+            content: "{{ s28_evidence | to_nice_json }}"
+          vars:
+            s28_evidence:
+              scenario_id: "{{ scenario_id }}"
+              run_id: "{{ run_id }}"
+              isolated_member: "{{ s28_target }}"
+              control_member: "{{ s28_ctl }}"
+              members_total: "{{ s28_members_total | int }}"
+              quorum_while_isolated: "{{ s28_quorum_isolated | int }}"
+              alive_while_isolated: "{{ s28_alive_isolated | int }}"
+              isolated_at: "{{ s28_isolate_ts | default('') }}"
+              reconnected_at: "{{ s28_reconnect_ts | default('') }}"
+              member_before_isolation: "{{ s28_target_before.stdout | default('') }}"
+              member_frozen_position: "{{ s28_target_frozen.stdout | default('') }}"
+              member_after_catchup: "{{ s28_target_after_reconnect.stdout | default('') }}"
+              revision_before_pump: "{{ s28_rev_before_pump.stdout | default('') | trim }}"
+              revision_after_pump: "{{ s28_rev_after_pump.stdout | default('') | trim }}"
+              pump_report: "{{ s28_pump.stdout | default('') }}"
+              compacted_revision: "{{ s28_compact_rev | default('') }}"
+              isolated_member_revision: "{{ s28_member_rev | default('') }}"
+              compaction_margin_revisions: "{{ s28_compaction_margin | default('') }}"
+              condition_established: "{{ s28_condition_established | default(false) }}"
+              errcompacted_probe: "{{ s28_watch_probe.stdout | default('') }}"
+              caught_up_without_reseed: "{{ s28_caught_up | default('unknown') }}"
+              reseed_performed: "{{ s28_reseed | bool }}"
+              repair_needed_at_teardown: "{{ s28_repair_needed | default('unknown') }}"
+              final_member_counts: "{{ s28_verify_members.stdout | default('unreadable') | trim }}"
+              final_endpoint_health: "{{ s28_verify_health.stdout | default('unreadable') }}"
+              honesty_note: >-
+                Compaction is guaranteed to pass the isolated member's revision
+                (see compaction_margin_revisions), and a client resuming from
+                that revision is guaranteed ErrCompacted. It is NOT guaranteed
+                that compaction is what prevented the member from catching up:
+                etcd repairs a lagging follower with a raft snapshot transfer,
+                which MVCC compaction does not block. caught_up_without_reseed
+                records what actually happened. The re-seed is performed as the
+                operational remedy either way, because the re-seed window is
+                what this scenario measures.
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Invariant report
+          script: ../../scripts/check-invariants.sh {{ results_dir }}
+          register: s28_invariants
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Save the invariant report
+          copy:
+            dest: "{{ results_dir }}/{{ item }}"
+            content: "{{ s28_invariants.stdout | default('') }}"
+          loop:
+            - invariant_report.txt
+            - invariant_report.json
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        # Last task in `always`, so nothing it could pre-empt is left undone.
+        - name: FAIL LOUDLY unless a healthy {{ groups['etcd'] | length }}-member etcd cluster was restored
+          assert:
+            that:
+              - (s28_verify_members.rc | default(1)) == 0
+              - (s28_final_counts[0] | int) == (s28_members_total | int)
+              - (s28_final_counts[1] | int) == 0
+              - (s28_final_counts[2] | int) == (s28_members_total | int)
+              - (s28_verify_health.rc | default(1)) == 0
+              - ((s28_verify_health.stdout | default('[]', true) | from_json)
+                 | selectattr('health') | list | length) == (s28_members_total | int)
+            fail_msg: >-
+              S28 DID NOT RESTORE THE ETCD CLUSTER. Expected
+              {{ s28_members_total }} started voting members, all healthy; got
+              counts (total learners started) =
+              "{{ s28_verify_members.stdout | default('unreadable') | trim }}"
+              and health {{ s28_verify_health.stdout | default('unreadable') }}.
+              DO NOT RUN ANOTHER SCENARIO. Repair by hand on {{ s28_ctl }}:
+              `etcdctl member list`; if {{ s28_target }} is missing, re-add it
+              with `member add {{ s28_target }} --learner
+              --peer-urls=https://{{ hostvars[s28_target]['ansible_host'] }}:2380`
+              and start etcd on {{ s28_target }} with
+              --initial-cluster-state=existing (its pre-wipe data directory
+              was moved aside to {{ etcd_data_dir }}.stale-s28-* on
+              {{ s28_target }}), then
+              `member promote`. Or roll the fleet back with
+              scripts/revert-baseline.sh --yes.
+            success_msg: >-
+              etcd restored: {{ s28_members_total }} started voting members,
+              no learners, all endpoints healthy.
+          run_once: true

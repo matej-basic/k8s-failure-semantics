@@ -1,0 +1,1003 @@
+---
+# scenarios/s26/playbook.yml
+# S26: Node object deleted while the kubelet lives
+#
+# What it does:
+#   `kubectl delete node <target>` — an API-only operation. Nothing is done to
+#   the machine: the kubelet is not stopped, restarted, signalled or firewalled,
+#   the containers it runs are not touched, and no iptables/tc rule is added
+#   anywhere. The substrate stays completely alive while its API identity is
+#   destroyed. The kubelet notices its Node object is gone on its next status
+#   update and re-registers under the SAME NAME with a NEW UID.
+#
+# Why this scenario exists (relation to S2):
+#   S2 reaches invariant I1 (exclusive authority / dual ownership) through an
+#   operator force-delete of a pod on a partitioned node — a documented footgun,
+#   and a reviewer can always answer "then do not do that". S26 reaches identity
+#   re-creation through a single, unremarkable, entirely supported API call that
+#   operators make routinely (draining a node from an inventory system, a
+#   cluster-autoscaler removing a stale object, a `kubectl delete node` typo).
+#   No partition, no force-delete, no lost heartbeat: the machine is healthy the
+#   entire time. I1 therefore gets a second, mechanically independent path with
+#   a live substrate.
+#
+# What we measure:
+#   - The Node object's UID BEFORE deletion vs AFTER re-registration. Same name,
+#     different UID, is precisely the identity re-creation I1 is about: every
+#     reference to "the node called worker1" now points at a different object,
+#     while the physical machine and its running containers never changed.
+#   - The orphan window: what happens to the pods bound to the deleted Node
+#     between deletion and re-registration — when their API objects disappear
+#     (pod GC deletes pods bound to a non-existent node), whether replacements
+#     are created elsewhere, and how long the gap is.
+#   - Whether TWO COPIES of one identity exist at any instant: a container still
+#     CONTAINER_RUNNING on the target (node-local crictl truth) while the API
+#     reports the same identity Running on another node. For the StatefulSet
+#     (stable name) that is a direct I1 violation; for Deployment pods the
+#     corresponding evidence is a ghost container — one whose pod object no
+#     longer exists in the API at all — running next to its replacement.
+#   - The usual invariant battery, via metrics-collect snapshots.
+#
+# Target node:
+#   Parameterised. Defaults to worker1; override per run with
+#     ansible-playbook scenarios/s26/playbook.yml -e s26_target_node=worker2
+#   `hosts:` is templated at play-parse time, so the override must come from
+#   extra-vars (or the inventory), not from play vars. The scenario never
+#   ASSUMES the target hosts any workload: the baseline plays record the
+#   placement actually observed and warn if the target is empty, because a run
+#   with no pods on the target still measures identity re-creation but cannot
+#   measure an orphan window.
+#
+# Vantage point:
+#   All kubectl runs on control_plane[1] (cp2), the same host metrics-collect
+#   uses by default. Nothing in this scenario partitions anything, so cp1 would
+#   work too, but cp1 holds the keepalived VIP and its sshd is the flakiest of
+#   the three (see the S2 header); cp2 keeps the sampler's SSH session stable.
+#
+# Sampling cadence vs the expected window (this is the crux of the scenario):
+#   Re-registration is driven by the kubelet's own node-status loop
+#   (nodeStatusUpdateFrequency, 10 s by default): the kubelet's status update
+#   fails with NotFound and it re-registers immediately, so the Node object is
+#   typically absent for something between ~1 s and ~10 s. The coarse
+#   metrics-collect snapshots take several seconds each to gather and therefore
+#   CANNOT be relied on to land inside that window — a scenario built only on
+#   them would routinely report an undisturbed cluster.
+#   So the window is measured by three dedicated samplers, started BEFORE the
+#   deletion and running across it:
+#     - node identity, API-side, every 0.25 s  -> ~40 samples in a 10 s window,
+#       and still ~4 samples if re-registration takes only 1 s;
+#     - default-namespace pods, API-side, every 0.5 s -> the pod GC / reschedule
+#       tail runs for tens of seconds, so 0.5 s is ~20x finer than the effect;
+#     - node-local `crictl ps` on the target, every 1 s -> a crictl call costs
+#       ~100-300 ms, so 1 s is the honest floor; the container-lifetime effects
+#       it measures (orphans surviving, then being killed after re-registration)
+#       last tens of seconds.
+#   Each sampler self-terminates after s26_sampler_max_seconds (default 900) so
+#   a mid-run abort cannot leave a loop running on a lab node.
+#
+# Fault efficacy (D6): see the scenario_meta.json task for the reasoning.
+#
+# Recovery:
+#   The fault has no teardown — there is no rule to remove — but recovery is
+#   NOT assumed. A dedicated play waits, bounded by convergence_timeout, for the
+#   Node object to exist again and report Ready=True and for both workloads to
+#   be healthy, and records the result. If it does not recover, the run still
+#   writes its evidence and its invariant report, and then a final gate play
+#   fails loudly: a missing node would otherwise silently corrupt every later
+#   scenario. This scenario deliberately does NOT touch the kubelet even in the
+#   recovery path — restarting it would destroy the very property under test —
+#   so the loud failure names the manual remediation instead.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Baseline
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Pre-flight baseline and pre-deletion identity record
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    scenario_name: "Node object deleted while the kubelet lives"
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Verify cluster is healthy (every node Ready)
+      shell: kubectl get nodes --no-headers | grep -v ' Ready' | wc -l
+      register: not_ready_count
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready_count.stdout | int > 0
+
+    - name: Verify the target node exists and is Ready before the fault
+      shell: |
+        set -o pipefail
+        kubectl get node {{ target_node }} -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+      register: target_ready_prefault
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: target_ready_prefault.stdout != "True"
+
+    # The UID is the whole point of the scenario, so it is captured explicitly
+    # here (not only inside the sampler trace) together with the machine-level
+    # identifiers that do NOT change across the deletion — machineID/systemUUID/
+    # bootID stay identical, which is the evidence that the substrate never
+    # moved while its API identity was replaced.
+    - name: Record the target Node object identity BEFORE deletion
+      shell: |
+        set -o pipefail
+        kubectl get node {{ target_node }} -o json \
+          | jq '{
+              name: .metadata.name,
+              uid: .metadata.uid,
+              creationTimestamp: .metadata.creationTimestamp,
+              resourceVersion: .metadata.resourceVersion,
+              ready: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing"),
+              machineID: .status.nodeInfo.machineID,
+              systemUUID: .status.nodeInfo.systemUUID,
+              bootID: .status.nodeInfo.bootID,
+              kubeletVersion: .status.nodeInfo.kubeletVersion
+            }'
+      register: node_identity_prefault
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save the pre-deletion Node identity
+      copy:
+        dest: "{{ results_dir }}/node_identity_prefault.json"
+        content: "{{ node_identity_prefault.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    # "Do not silently depend on the placement" — record what was actually
+    # there. The whole default-namespace placement is saved, not just the
+    # target's share, so the paper can state the observed distribution rather
+    # than the intended one.
+    - name: Record the observed placement of the test workloads at baseline
+      shell: |
+        set -o pipefail
+        kubectl get pods -n {{ stateful_app_namespace }} -o json \
+          | jq --arg target "{{ target_node }}" '{
+              target_node: $target,
+              all_pods: [.items[] | {
+                name: .metadata.name,
+                uid: .metadata.uid,
+                node: .spec.nodeName,
+                phase: .status.phase,
+                owner: (.metadata.ownerReferences[0].name // null),
+                ownerKind: (.metadata.ownerReferences[0].kind // null)
+              }],
+              on_target: [.items[] | select(.spec.nodeName == $target) | .metadata.name],
+              on_target_count: ([.items[] | select(.spec.nodeName == $target)] | length),
+              nodes_in_use: ([.items[].spec.nodeName] | unique)
+            }'
+      register: placement_prefault
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save the baseline placement
+      copy:
+        dest: "{{ results_dir }}/workload_placement_prefault.json"
+        content: "{{ placement_prefault.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Warn if the target node hosts no test workload
+      # Not fatal: identity re-creation is still measurable. But the orphan
+      # window will be empty, and that must be visible in the run log rather
+      # than inferred later from an empty analysis file.
+      debug:
+        msg: >-
+          WARNING: {{ target_node }} hosts 0 pods in {{ stateful_app_namespace }}.
+          S26 will measure identity re-creation but the orphan window will be
+          empty. Re-run against a node that hosts workload
+          (-e s26_target_node=<node>) if the orphan window is the object of
+          interest.
+      when: (placement_prefault.stdout | from_json).on_target_count | int == 0
+      run_once: true
+
+    - name: Baseline snapshot
+      # metrics-collect is included here rather than listed under `roles:`
+      # because `roles:` execute BEFORE `tasks:`; the baseline snapshot should
+      # be taken after the identity/placement record above, not before it.
+      include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: pre_fault
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Samplers (started before the fault, running across it)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Start the API-side samplers on the control-plane vantage point
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  tasks:
+    - name: Clear any stop-flag left by an earlier run
+      file:
+        path: /tmp/s26-sampler.stop
+        state: absent
+
+    - name: Install the node-identity sampler (0.25 s)
+      copy:
+        dest: /tmp/s26-node-sampler.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # S26 node-identity sampler. Read-only: a single GET per tick.
+          # 0.25 s because the Node object can be absent for as little as ~1 s
+          # if the kubelet's status loop happens to fire right after the delete.
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          TARGET="{{ target_node }}"
+          OUT="/tmp/s26-node-identity.jsonl"
+          STOP="/tmp/s26-sampler.stop"
+          INTERVAL="{{ s26_node_sample_interval | default('0.25') }}"
+          MAX="{{ s26_sampler_max_seconds | default(900) }}"
+          # Millisecond clock. GNU date (%N) is present on every lab node and
+          # S15 already depends on it, but if it were ever missing --argjson
+          # would reject the non-numeric value and EVERY tick would be lost
+          # silently — the one failure mode this scenario cannot afford. Fall
+          # back to second resolution instead of emitting an empty trace.
+          ms_now() {
+            local v
+            v=$(date -u +%s%3N)
+            case "$v" in ''|*[!0-9]*) v="$(date -u +%s)000" ;; esac
+            printf '%s' "$v"
+          }
+          : > "$OUT"
+          START=$(date +%s)
+          while [ ! -f "$STOP" ] && [ $(( $(date +%s) - START )) -lt "$MAX" ]; do
+            TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+            MS=$(ms_now)
+            LINE=$(kubectl get node "$TARGET" -o json 2>/dev/null \
+              | jq -c --arg ts "$TS" --argjson ms "$MS" '{
+                  ts: $ts, ts_ms: $ms, present: true,
+                  uid: .metadata.uid,
+                  created: .metadata.creationTimestamp,
+                  rv: .metadata.resourceVersion,
+                  ready: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing")
+                }' 2>/dev/null)
+            if [ -z "$LINE" ]; then
+              LINE=$(jq -cn --arg ts "$TS" --argjson ms "$MS" '{
+                ts: $ts, ts_ms: $ms, present: false,
+                uid: null, created: null, rv: null, ready: null
+              }')
+            fi
+            printf '%s\n' "$LINE" >> "$OUT"
+            sleep "$INTERVAL"
+          done
+
+    - name: Install the pod-state sampler (0.5 s)
+      copy:
+        dest: /tmp/s26-pod-sampler.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # S26 pod-state sampler. Read-only: one LIST per tick over the test
+          # namespace only. 0.5 s against a pod GC / reschedule tail that runs
+          # for tens of seconds.
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          OUT="/tmp/s26-pods.jsonl"
+          STOP="/tmp/s26-sampler.stop"
+          INTERVAL="{{ s26_pod_sample_interval | default('0.5') }}"
+          MAX="{{ s26_sampler_max_seconds | default(900) }}"
+          # Millisecond clock. GNU date (%N) is present on every lab node and
+          # S15 already depends on it, but if it were ever missing --argjson
+          # would reject the non-numeric value and EVERY tick would be lost
+          # silently — the one failure mode this scenario cannot afford. Fall
+          # back to second resolution instead of emitting an empty trace.
+          ms_now() {
+            local v
+            v=$(date -u +%s%3N)
+            case "$v" in ''|*[!0-9]*) v="$(date -u +%s)000" ;; esac
+            printf '%s' "$v"
+          }
+          : > "$OUT"
+          START=$(date +%s)
+          while [ ! -f "$STOP" ] && [ $(( $(date +%s) - START )) -lt "$MAX" ]; do
+            TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+            MS=$(ms_now)
+            LINE=$(kubectl get pods -n {{ stateful_app_namespace }} -o json 2>/dev/null \
+              | jq -c --arg ts "$TS" --argjson ms "$MS" '{
+                  ts: $ts, ts_ms: $ms,
+                  pods: [.items[] | {
+                    name: .metadata.name,
+                    uid: .metadata.uid,
+                    node: .spec.nodeName,
+                    phase: .status.phase,
+                    deleting: (.metadata.deletionTimestamp != null),
+                    owner: (.metadata.ownerReferences[0].name // null),
+                    ready: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing")
+                  }]
+                }' 2>/dev/null)
+            if [ -z "$LINE" ]; then
+              LINE=$(jq -cn --arg ts "$TS" --argjson ms "$MS" '{ts: $ts, ts_ms: $ms, pods: null}')
+            fi
+            printf '%s\n' "$LINE" >> "$OUT"
+            sleep "$INTERVAL"
+          done
+
+    - name: Launch the API-side samplers
+      shell: |
+        nohup /tmp/s26-node-sampler.sh > /dev/null 2>&1 &
+        echo $! > /tmp/s26-node-sampler.pid
+        nohup /tmp/s26-pod-sampler.sh > /dev/null 2>&1 &
+        echo $! > /tmp/s26-pod-sampler.pid
+
+- name: S26 — Start the node-local container sampler on the target itself
+  # Read-only observation of the substrate. `crictl ps` does not touch the
+  # kubelet or the containers; nothing here alters the machine's state.
+  hosts: "{{ s26_target_node | default('worker1') }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+  tasks:
+    - name: Clear any stop-flag left by an earlier run
+      file:
+        path: /tmp/s26-sampler.stop
+        state: absent
+
+    - name: Install the crictl sampler (1 s)
+      copy:
+        dest: /tmp/s26-crictl-sampler.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # S26 node-local container sampler. This is the ground truth the API
+          # cannot give: what is still RUNNING on the machine after its Node
+          # object — and therefore its pods — ceased to exist in the API.
+          # 1 s is the practical floor (a crictl call costs ~100-300 ms) and is
+          # ample against container lifetimes measured in tens of seconds.
+          OUT="/tmp/s26-crictl.jsonl"
+          STOP="/tmp/s26-sampler.stop"
+          INTERVAL="{{ s26_crictl_sample_interval | default('1') }}"
+          MAX="{{ s26_sampler_max_seconds | default(900) }}"
+          # Millisecond clock. GNU date (%N) is present on every lab node and
+          # S15 already depends on it, but if it were ever missing --argjson
+          # would reject the non-numeric value and EVERY tick would be lost
+          # silently — the one failure mode this scenario cannot afford. Fall
+          # back to second resolution instead of emitting an empty trace.
+          ms_now() {
+            local v
+            v=$(date -u +%s%3N)
+            case "$v" in ''|*[!0-9]*) v="$(date -u +%s)000" ;; esac
+            printf '%s' "$v"
+          }
+          : > "$OUT"
+          START=$(date +%s)
+          while [ ! -f "$STOP" ] && [ $(( $(date +%s) - START )) -lt "$MAX" ]; do
+            TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+            MS=$(ms_now)
+            LINE=$(crictl ps -o json 2>/dev/null \
+              | jq -c --arg ts "$TS" --argjson ms "$MS" '{
+                  ts: $ts, ts_ms: $ms,
+                  containers: [.containers[] | {
+                    id: .id,
+                    name: .metadata.name,
+                    state: .state,
+                    podName: .labels."io.kubernetes.pod.name",
+                    podNamespace: .labels."io.kubernetes.pod.namespace",
+                    podUid: .labels."io.kubernetes.pod.uid"
+                  }]
+                }' 2>/dev/null)
+            if [ -z "$LINE" ]; then
+              LINE=$(jq -cn --arg ts "$TS" --argjson ms "$MS" '{ts: $ts, ts_ms: $ms, containers: null}')
+            fi
+            printf '%s\n' "$LINE" >> "$OUT"
+            sleep "$INTERVAL"
+          done
+
+    - name: Launch the crictl sampler
+      shell: |
+        nohup /tmp/s26-crictl-sampler.sh > /dev/null 2>&1 &
+        echo $! > /tmp/s26-crictl-sampler.pid
+
+    - name: Let the samplers record a few pre-deletion baseline ticks
+      pause:
+        seconds: 5
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Inject: delete the Node object, and nothing else
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Delete the target's Node object via the API
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Delete the Node object (API only — the machine is not touched)
+      shell: |
+        set -o pipefail
+        BEFORE_MS=$(date -u +%s%3N)
+        BEFORE_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+        kubectl delete node {{ target_node }} --wait=true --timeout=60s >/dev/null
+        RC=$?
+        AFTER_MS=$(date -u +%s%3N)
+        AFTER_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+        jq -cn \
+          --arg node "{{ target_node }}" \
+          --arg bts "$BEFORE_TS" --argjson bms "$BEFORE_MS" \
+          --arg ats "$AFTER_TS" --argjson ams "$AFTER_MS" \
+          --argjson rc "$RC" \
+          '{target_node: $node, delete_issued_ts: $bts, delete_issued_ts_ms: $bms,
+            delete_returned_ts: $ats, delete_returned_ts_ms: $ams, rc: $rc}'
+      register: delete_node
+
+    - name: Save the deletion timestamps
+      copy:
+        dest: "{{ results_dir }}/node_deletion.json"
+        content: "{{ delete_node.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+
+    # Fault efficacy (D6).
+    #
+    # Signals required: placement_changed.
+    #   Deleting a Node object makes the pod GC controller delete every pod
+    #   bound to it, and their controllers recreate them on the surviving
+    #   nodes; the orphaned containers on the target are then killed once the
+    #   kubelet re-registers and learns it has no pods assigned. The per-node
+    #   set of CONTAINER_RUNNING identities therefore CANNOT be equal to the
+    #   baseline set afterwards — this is the durable, snapshot-visible
+    #   consequence of the fault, and it survives whatever the coarse snapshot
+    #   cadence happens to catch.
+    #
+    # Signals deliberately NOT required, though both are recorded:
+    #   target_node_status_changed — it does fire whenever a coarse snapshot
+    #     lands while the Node object is absent (ready_map[target] goes from
+    #     "True" to missing), which is the single most direct evidence of
+    #     identity destruction available in the current vocabulary. But
+    #     re-registration can complete in ~1-10 s while a metrics-collect
+    #     snapshot takes several seconds to gather, so requiring it would
+    #     label a perfectly effective run INEFFECTIVE purely on a race. The
+    #     0.25 s node sampler is the instrument for that window, not the
+    #     snapshots.
+    #   There is no signal in the vocabulary for the thing this scenario
+    #   actually proves — the Node UID changed while the name did not. It is
+    #   measured into node_identity_transition.json; see the report for the
+    #   `node_identity_recreated` signal this scenario would like registered
+    #   centrally.
+    - name: Declare what this fault must observably do
+      copy:
+        dest: "{{ results_dir }}/scenario_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "fault_type": "node_object_deleted",
+            "efficacy": {
+              "target_node": "{{ target_node }}",
+              "require": ["placement_changed"]
+            }
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+
+    - name: Log the injection
+      debug:
+        msg: >-
+          FAULT INJECTED: Node object {{ target_node }} deleted through the API.
+          The machine, its kubelet and its containers were not touched.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Observe through re-registration
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Observe re-registration and the orphan window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  tasks:
+    # Taken immediately, with no pause: this is the coarse snapshot with any
+    # chance at all of landing inside the absence window. The fine-grained
+    # samplers are what actually measure it.
+    - name: Snapshot immediately after deletion
+      include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: t_plus_0
+
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_15 }
+
+    - pause: { seconds: 15 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_30 }
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_60 }
+
+    # Runs out the requested observation_window from the injection (default
+    # 120 s), so the trace covers re-registration plus the reschedule tail.
+    - pause:
+        seconds: "{{ [ (observation_window | int) - 60, 0 ] | max }}"
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: t_plus_observation_window }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Stop samplers and collect their traces (always, even on failure)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Stop the API-side samplers and fetch their traces
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+  tasks:
+    - block:
+        - name: Signal the samplers to stop
+          file:
+            path: /tmp/s26-sampler.stop
+            state: touch
+            mode: '0644'
+
+        - name: Give the loops one cycle to notice the stop-flag
+          pause:
+            seconds: 3
+
+        - name: Kill any sampler that did not exit on its own
+          shell: |
+            for p in /tmp/s26-node-sampler.pid /tmp/s26-pod-sampler.pid; do
+              [ -f "$p" ] && kill "$(cat $p)" 2>/dev/null
+            done
+            exit 0
+          ignore_errors: yes
+      always:
+        - name: Fetch the node-identity trace
+          fetch:
+            src: /tmp/s26-node-identity.jsonl
+            dest: "{{ results_dir }}/node_identity_watch.jsonl"
+            flat: yes
+          ignore_errors: yes
+
+        - name: Fetch the pod-state trace
+          fetch:
+            src: /tmp/s26-pods.jsonl
+            dest: "{{ results_dir }}/pod_watch.jsonl"
+            flat: yes
+          ignore_errors: yes
+
+- name: S26 — Stop the node-local sampler and fetch its trace
+  hosts: "{{ s26_target_node | default('worker1') }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+  tasks:
+    - block:
+        - name: Signal the crictl sampler to stop
+          file:
+            path: /tmp/s26-sampler.stop
+            state: touch
+            mode: '0644'
+
+        - name: Give the loop one cycle to notice the stop-flag
+          pause:
+            seconds: 3
+
+        - name: Kill the crictl sampler if it did not exit on its own
+          shell: |
+            [ -f /tmp/s26-crictl-sampler.pid ] && kill "$(cat /tmp/s26-crictl-sampler.pid)" 2>/dev/null
+            exit 0
+          ignore_errors: yes
+      always:
+        - name: Fetch the node-local container trace
+          fetch:
+            src: /tmp/s26-crictl.jsonl
+            dest: "{{ results_dir }}/target_crictl_watch.jsonl"
+            flat: yes
+          ignore_errors: yes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Analysis of the traces (on the observer, where all three now sit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Reduce the traces to the three measurements the paper needs
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  tasks:
+    # (a) Identity re-creation: same name, different UID.
+    - name: Compute the Node identity transition
+      shell: |
+        set -o pipefail
+        jq -s '
+          . as $s
+          | ([ $s[] | select(.present == false) ]) as $absent
+          | ([ $s[] | select(.present == true)  ]) as $present
+          | ($s[0]  // null) as $first
+          | ($s[-1] // null) as $last
+          | ($absent[0]  // null) as $gone
+          | ($absent[-1] // null) as $last_gone
+          | ([ $s[]
+               | select(.present == true
+                        and ($last_gone != null)
+                        and (.ts_ms > $last_gone.ts_ms)) ][0] // null) as $back
+          | (($back.uid // $last.uid) // null) as $uid_after
+          | {
+              samples: ($s | length),
+              node_absent_samples: ($absent | length),
+              uid_before_delete: ($first.uid // null),
+              uid_after_reregistration: $uid_after,
+              uid_changed: (($first.uid != null) and ($uid_after != null)
+                            and ($first.uid != $uid_after)),
+              distinct_uids_observed: ([ $present[].uid ] | unique),
+              creation_timestamp_before: ($first.created // null),
+              creation_timestamp_after: (($back.created // $last.created) // null),
+              first_absent_ts: ($gone.ts // null),
+              last_absent_ts: ($last_gone.ts // null),
+              reregistered_ts: ($back.ts // null),
+              absence_ms: (if ($gone != null and $back != null)
+                           then ($back.ts_ms - $gone.ts_ms) else null end),
+              ready_at_reregistration: ($back.ready // null),
+              ready_at_end_of_trace: ($last.ready // null),
+              note: "uid_changed=true with an unchanged node name is identity re-creation: every API reference to this node now points at a different object while the machine never moved. absence_ms is measured at the node sampler cadence; null means the sampler never caught the object missing (re-registration faster than one tick, or the trace is incomplete)."
+            }' "{{ results_dir }}/node_identity_watch.jsonl" \
+          > "{{ results_dir }}/node_identity_transition.json"
+      args:
+        creates: "{{ results_dir }}/node_identity_transition.json"
+      ignore_errors: yes
+
+    # (b) The orphan window, API-side: when each pod bound to the deleted node
+    #     vanished, and when/where a replacement came up.
+    - name: Compute the orphan window from the pod trace
+      shell: |
+        set -o pipefail
+        jq -s --arg target "{{ target_node }}" '
+          . as $s
+          | ($s[0].pods // []) as $base
+          | ([ $base[] | select(.node == $target) ]) as $victims
+          | ([ $victims[].uid ]) as $vuids
+          # Every pod UID that already existed at the first sample. A
+          # "replacement" is a pod object that did not exist before the
+          # deletion; filtering on victim UIDs alone would also count the pods
+          # that were quietly running on the other nodes all along.
+          # (No apostrophes in these comments: the jq program is a
+          # single-quoted shell string.)
+          | ([ $base[].uid ]) as $buids
+          | {
+              target_node: $target,
+              samples: ($s | length),
+              baseline_pods_on_target: $victims,
+              victims: [ $victims[]
+                | . as $v
+                | ([ $s[] | select(([.pods[]? | select(.uid == $v.uid)] | length) > 0) ]) as $seen
+                | ([ $s[] | select(([.pods[]? | select(.uid == $v.uid and .deleting)] | length) > 0) ]) as $marked
+                | ([ $s[] | select(($seen | length) > 0 and (.ts_ms > $seen[-1].ts_ms)) ]) as $after
+                | {
+                    name: $v.name, uid: $v.uid, owner: $v.owner,
+                    phase_at_baseline: $v.phase,
+                    first_marked_deleting_ts: ($marked[0].ts // null),
+                    last_seen_in_api_ts: ($seen[-1].ts // null),
+                    last_seen_in_api_ts_ms: ($seen[-1].ts_ms // null),
+                    gone_from_api_ts: ($after[0].ts // null),
+                    gone_from_api_ts_ms: ($after[0].ts_ms // null)
+                  } ],
+              replacements: [ ($s[-1].pods // [])[]
+                # `. as $r` FIRST: inside `$buids | index(...)` the input is
+                # the UID array, so a bare `.uid` there would be indexing an
+                # array with a string.
+                | . as $r
+                | select(($buids | index($r.uid)) == null)
+                | ([ $s[] | select(([.pods[]? | select(.uid == $r.uid)] | length) > 0) ]) as $seen
+                | ([ $s[] | select(([.pods[]? | select(.uid == $r.uid and .phase == "Running")] | length) > 0) ]) as $run
+                | {
+                    name: $r.name, uid: $r.uid, node: $r.node,
+                    owner: $r.owner, phase: $r.phase,
+                    first_seen_ts: ($seen[0].ts // null),
+                    first_seen_ts_ms: ($seen[0].ts_ms // null),
+                    first_running_ts: ($run[0].ts // null),
+                    first_running_ts_ms: ($run[0].ts_ms // null),
+                    replaces_victims: ([ $victims[] | select(.owner == $r.owner) | .name ])
+                  } ]
+            }
+          | . + {
+              victims_gone_from_api: ([ .victims[] | select(.gone_from_api_ts != null) ] | length),
+              replacements_off_target: ([ .replacements[] | select(.node != $target) ] | length),
+              first_victim_gone_ts_ms: ([ .victims[].gone_from_api_ts_ms | select(. != null) ] | min),
+              first_replacement_running_ts_ms:
+                ([ .replacements[] | select(.node != $target)
+                   | .first_running_ts_ms | select(. != null) ] | min)
+            }
+          | . + {
+              api_gap_ms: (if (.first_victim_gone_ts_ms != null
+                               and .first_replacement_running_ts_ms != null)
+                           then (.first_replacement_running_ts_ms - .first_victim_gone_ts_ms)
+                           else null end),
+              note: "Pods bound to a deleted Node are removed by the pod GC controller; their controllers recreate them elsewhere. api_gap_ms is the API-visible gap between the first original disappearing and the first replacement Running. It says nothing about whether the original containers were still executing — that is dual_ownership.json."
+            }' "{{ results_dir }}/pod_watch.jsonl" \
+          > "{{ results_dir }}/orphan_window.json"
+      args:
+        creates: "{{ results_dir }}/orphan_window.json"
+      ignore_errors: yes
+
+    # (c) The I1 question: did two copies of one identity exist at the same
+    #     instant? Joins the node-local crictl trace against the API pod trace
+    #     by nearest timestamp.
+    #       dual  — an identity CONTAINER_RUNNING on the target while the API
+    #               reports the same namespace/name Running on another node.
+    #               For postgres-stateful-0 (stable identity) that is a direct
+    #               I1 violation.
+    #       ghost — a container still CONTAINER_RUNNING on the target whose pod
+    #               object no longer exists in the API at all. Deployment pods
+    #               can only show up this way (a replacement gets a new name),
+    #               so this is the Deployment-side evidence of the same thing:
+    #               live processes nobody owns.
+    #     Only the test namespace is considered; kube-system containers (CNI,
+    #     kube-proxy) are outside the pod sampler's scope and would otherwise
+    #     all read as ghosts.
+    - name: Join the node-local container trace against the API pod trace
+      shell: |
+        set -o pipefail
+        jq -n --arg target "{{ target_node }}" \
+              --arg ns "{{ stateful_app_namespace }}" \
+              --slurpfile cri "{{ results_dir }}/target_crictl_watch.jsonl" \
+              --slurpfile api "{{ results_dir }}/pod_watch.jsonl" '
+          def absdiff($x; $y): (if $x > $y then $x - $y else $y - $x end);
+          def nearest($t): ($api | map(select(.ts_ms != null)) | min_by(absdiff(.ts_ms; $t)));
+          [ $cri[]
+            | . as $c
+            | (nearest($c.ts_ms)) as $ap
+            | ([ ($c.containers // [])[]
+                 | select(.state == "CONTAINER_RUNNING"
+                          and .podName != null
+                          and ((.podNamespace // "default") == $ns))
+                 | {identity: ((.podNamespace // "default") + "/" + .podName), uid: .podUid} ]) as $on_target
+            | {
+                ts: $c.ts, ts_ms: $c.ts_ms,
+                api_ts: ($ap.ts // null),
+                running_on_target: ([ $on_target[].identity ] | unique),
+                dual: ([ $on_target[]
+                         | . as $o
+                         | select(($ap.pods // [])
+                                  | any((($ns + "/" + .name) == $o.identity)
+                                        and ((.node // "") != $target)
+                                        and (.phase == "Running")))
+                         | $o.identity ] | unique),
+                ghost: ([ $on_target[]
+                          | . as $o
+                          | select((($ap.pods // []) | any(.uid == $o.uid)) | not)
+                          | $o.identity ] | unique)
+              } ]
+          | { target_node: $target,
+              samples: length,
+              dual_ownership_instants: [ .[] | select((.dual  | length) > 0) ],
+              ghost_container_instants: [ .[] | select((.ghost | length) > 0) ] }
+          | . + {
+              dual_ownership_observed: ((.dual_ownership_instants | length) > 0),
+              dual_ownership_identities: ([ .dual_ownership_instants[].dual[] ] | unique),
+              dual_ownership_window_ms:
+                (if (.dual_ownership_instants | length) > 0
+                 then (.dual_ownership_instants[-1].ts_ms - .dual_ownership_instants[0].ts_ms)
+                 else 0 end),
+              ghost_containers_observed: ((.ghost_container_instants | length) > 0),
+              ghost_identities: ([ .ghost_container_instants[].ghost[] ] | unique),
+              ghost_window_ms:
+                (if (.ghost_container_instants | length) > 0
+                 then (.ghost_container_instants[-1].ts_ms - .ghost_container_instants[0].ts_ms)
+                 else 0 end),
+              note: "dual = same namespace/name running on the target (crictl) while the API reports it Running elsewhere -> I1. ghost = container still running on the target with no pod object anywhere -> the orphan itself. Timestamps are joined to the nearest API sample, so the resolution is the pod sampler cadence."
+            }' > "{{ results_dir }}/dual_ownership.json"
+      args:
+        creates: "{{ results_dir }}/dual_ownership.json"
+      ignore_errors: yes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Recovery — verified, never assumed
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Verify recovery (re-registration, Ready, workloads healthy)
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Read the pre-deletion UID back from the observer's record
+      shell: jq -r '.uid' "{{ results_dir }}/node_identity_prefault.json"
+      register: uid_before
+      delegate_to: "{{ groups['observer'][0] }}"
+      ignore_errors: yes
+
+    - block:
+        # Bounded by convergence_timeout (default 300 s) in 10 s steps. The
+        # kubelet re-registers on its own; this play never touches it.
+        - name: Wait for the Node object to exist again and report Ready=True
+          shell: |
+            set -o pipefail
+            READY=$(kubectl get node {{ target_node }} \
+              -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || echo "ABSENT")
+            echo "ready=${READY:-ABSENT}"
+            test "$READY" = "True"
+          register: rereg
+          until: rereg.rc == 0
+          retries: "{{ ((convergence_timeout | int) / 10) | round | int }}"
+          delay: 10
+
+        - name: Record the Node object identity AFTER re-registration
+          shell: |
+            set -o pipefail
+            kubectl get node {{ target_node }} -o json \
+              | jq '{
+                  name: .metadata.name,
+                  uid: .metadata.uid,
+                  creationTimestamp: .metadata.creationTimestamp,
+                  resourceVersion: .metadata.resourceVersion,
+                  ready: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing"),
+                  machineID: .status.nodeInfo.machineID,
+                  systemUUID: .status.nodeInfo.systemUUID,
+                  bootID: .status.nodeInfo.bootID
+                }'
+          register: node_identity_post
+
+        - name: Save the post-re-registration Node identity
+          copy:
+            dest: "{{ results_dir }}/node_identity_postrecovery.json"
+            content: "{{ node_identity_post.stdout }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Wait for nginx-stateless to be fully rolled out again
+          shell: kubectl rollout status deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }} --timeout=180s
+          register: nginx_rollout
+
+        - name: Wait for postgres-stateful to be fully rolled out again
+          shell: kubectl rollout status statefulset/{{ stateful_app_name }} -n {{ stateful_app_namespace }} --timeout=180s
+          register: pg_rollout
+
+        - name: Verify every node is Ready and no test pod is left unhealthy
+          shell: |
+            set -o pipefail
+            NOT_READY=$(kubectl get nodes --no-headers | grep -v ' Ready' | wc -l | tr -d ' ')
+            BAD_PODS=$(kubectl get pods -n {{ stateful_app_namespace }} -o json \
+              | jq '[.items[] | select(.status.phase != "Running" and .status.phase != "Succeeded")] | length')
+            echo "not_ready_nodes=$NOT_READY unhealthy_pods=$BAD_PODS"
+            test "$NOT_READY" = "0" -a "$BAD_PODS" = "0"
+          register: cluster_health_post
+          until: cluster_health_post.rc == 0
+          retries: 12
+          delay: 10
+
+        - name: Mark the run as recovered
+          set_fact:
+            s26_recovered: true
+            s26_failure_reason: ""
+      rescue:
+        # Deliberately does NOT fail here: the evidence collected above and the
+        # invariant report below are more valuable than an early abort, and a
+        # failing play with a single host would end the run outright. The loud
+        # failure is the last play of the scenario.
+        - name: Mark the run as NOT recovered
+          set_fact:
+            s26_recovered: false
+            s26_failure_reason: >-
+              {{ ansible_failed_task.name | default('unknown task') }}:
+              {{ ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail')) }}
+      always:
+        - name: Save the recovery verification record
+          copy:
+            dest: "{{ results_dir }}/recovery_verification.json"
+            content: |
+              {
+                "target_node": "{{ target_node }}",
+                "recovered": {{ s26_recovered | default(false) | to_json }},
+                "node_uid_before_delete": {{ (uid_before.stdout | default('') | trim) | to_json }},
+                "node_uid_after_reregistration": {{ ((node_identity_post.stdout | default('{}') | from_json).uid | default('')) | to_json }},
+                "uid_changed": {{ (((uid_before.stdout | default('') | trim) != '')
+                                   and (((node_identity_post.stdout | default('{}') | from_json).uid | default('')) != '')
+                                   and ((uid_before.stdout | default('') | trim)
+                                        != ((node_identity_post.stdout | default('{}') | from_json).uid | default('')))) | to_json }},
+                "node_ready_after": {{ ((node_identity_post.stdout | default('{}') | from_json).ready | default('unknown')) | to_json }},
+                "reregistration_wait_attempts": {{ rereg.attempts | default(0) | int }},
+                "nginx_rollout": {{ (nginx_rollout.stdout | default('') | trim) | to_json }},
+                "postgres_rollout": {{ (pg_rollout.stdout | default('') | trim) | to_json }},
+                "cluster_health_after": {{ (cluster_health_post.stdout | default('') | trim) | to_json }},
+                "failure_reason": {{ (s26_failure_reason | default('') | trim) | to_json }},
+                "convergence_timeout_s": {{ convergence_timeout | int }}
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Report recovery outcome
+          debug:
+            msg: >-
+              {{ 'RECOVERED: ' + target_node + ' re-registered and is Ready; workloads healthy.'
+                 if (s26_recovered | default(false))
+                 else 'NOT RECOVERED: ' + target_node + ' did not come back within '
+                      + (convergence_timeout | string) + 's — see recovery_verification.json' }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Invariant report, then the loud gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: S26 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ invariant_report.stdout }}"
+
+- name: S26 — Fail loudly if the node never came back
+  # Runs last so that every trace, analysis file and invariant verdict is on
+  # disk first. A missing Node object is not a local failure: every later
+  # scenario would inherit a 5-node cluster and quietly measure something else.
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s26
+    target_node: "{{ s26_target_node | default('worker1') }}"
+  tasks:
+    - name: Read the recovery verification record
+      shell: cat "{{ results_dir }}/recovery_verification.json"
+      register: recovery_record
+      ignore_errors: yes
+
+    - name: Abort the run if recovery was not verified
+      fail:
+        msg: |
+          ============================================================
+          S26 DID NOT RECOVER — THE LAB IS LEFT DEGRADED
+          ============================================================
+          Node {{ target_node }} did not re-register and return to Ready
+          within {{ convergence_timeout }}s, or its workloads did not become
+          healthy again.
+
+          The cluster is now short one node and EVERY LATER SCENARIO WILL
+          MEASURE A DIFFERENT CLUSTER. Do not run the rest of the suite
+          until this is resolved.
+
+          Evidence: {{ results_dir }}/recovery_verification.json
+                    {{ results_dir }}/node_identity_transition.json
+
+          S26 never touches the kubelet by design — re-registration is the
+          property under test — so it will not repair this for you.
+          Remediate by hand, then re-baseline:
+            ssh ansible@{{ hostvars[target_node]['ansible_host'] | default(target_node) }} 'sudo systemctl restart kubelet'
+            # or, preferred between scenarios:
+            scripts/revert-baseline.sh --yes
+          ============================================================
+      # `or '{}'` covers the case where the record is missing entirely (the
+      # recovery play never reached its `always`): from_json on an empty
+      # string raises, and this gate must fire rather than error out
+      # ambiguously. Missing record, recovered:false and a malformed record
+      # all fire; only an explicit recovered:true skips.
+      when: >-
+        not ((((recovery_record.stdout | default('') | trim) or '{}')
+              | from_json).recovered | default(false))

@@ -1,0 +1,1112 @@
+---
+# scenarios/s23/playbook.yml
+# S23: etcd NOSPACE — the cluster goes read-only while every observer stays green
+#
+# What it does:
+#   1. Lowers `--quota-backend-bytes` on ONE etcd member (default etcd1) to a
+#      value below that member's current backend size, via a systemd drop-in,
+#      and restarts only that member.
+#   2. Issues a single write against that member. Its quota applier returns
+#      ErrNoSpace, and — per etcd's applyEntryNormal — the member then raises a
+#      NOSPACE alarm *through raft*, i.e. cluster-wide. Every member swaps in
+#      applierV3Capped and rejects every mutating request from that instant on.
+#   3. Holds for `fault_duration`, measuring the contrast this scenario exists
+#      for: writes rejected with "mvcc: database space exceeded", reads served
+#      normally by all three API servers, /healthz /livez /readyz all ok, and
+#      every Node still Ready.
+#   4. Tears the fault down unconditionally (block/always) and verifies the
+#      cluster is writable again.
+#   5. Observes recovery for `observation_window`, then runs the invariant
+#      checker.
+#
+# Targets I5 (observation–action consistency: controllers observe a live
+# cluster they cannot act on), I6 (watch progress: revisions freeze, then jump)
+# and I10 (reconciliation termination: whether the post-clear write storm and
+# the lease-expiry aftershock ever settle).
+#
+# ── Why the quota route and not a real disk fill ─────────────────────────────
+# The brief allows either. They are not equivalent faults:
+#
+#   * NOSPACE is etcd's *quota* alarm. It is raised by the backend quota
+#     applier comparing the boltdb file size against --quota-backend-bytes.
+#     It has nothing to do with the filesystem having free blocks.
+#   * Genuinely filling /var/lib/etcd does not raise NOSPACE. It makes the
+#     member fail to fsync its WAL, and the member dies with
+#     "no space left on device". That is member loss — S19's territory — and
+#     it is the one outcome this scenario must avoid, because it destroys the
+#     "everything is green" half of the contrast.
+#
+# Reversibility points the same way. The quota route writes exactly one file
+# (a systemd drop-in) and one throwaway etcd key; undoing it is `rm` +
+# `daemon-reload` + `restart` + `alarm disarm`, with nothing to reclaim, no
+# compaction and no defrag. The ballast route leaves a multi-GB file on a
+# 40 GB root disk and, if the member has already crashed, the undo has to
+# happen on a node whose etcd will not start.
+#
+# A ballast mode is kept behind `s23_use_ballast` (default false) for the
+# comparison run, and it writes to exactly ONE known path,
+# `s23_ballast_path`, which teardown removes unconditionally in BOTH modes.
+#
+# ── Why this is safe for the rest of the suite ───────────────────────────────
+# A NOSPACE alarm is persisted in the backend and SURVIVES an etcd restart.
+# Left armed, it would leave the whole cluster read-only for every scenario
+# that runs after this one. Teardown therefore:
+#   (a) restores the quota BEFORE disarming — disarming first would let the
+#       target's next applied write re-raise the alarm immediately;
+#   (b) disarms in a retry loop until `etcdctl alarm list` is empty;
+#   (c) proves writability with a real etcd put/del AND a real API-server
+#       write;
+#   (d) is repeated by an independent safety-net play at the end of the run
+#       that re-measures live state and fails loudly if anything is left.
+# Every teardown task carries ignore_errors so that a single failed step
+# cannot abort the play and skip the steps after it; the hard assertion is
+# the final safety-net play, which measures the cluster rather than trusting
+# the teardown's own bookkeeping.
+
+- name: S23 — etcd NOSPACE (cluster read-only, every observer green)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s23
+    scenario_name: "etcd NOSPACE alarm — read-only cluster with green observers"
+    fault_type: etcd_nospace
+
+    # Which member to starve. Exactly one — filling more than one is not a
+    # stronger version of this fault, it is a different one (quorum loss).
+    s23_target: "{{ s23_target_member | default(groups['etcd'][0]) }}"
+    s23_target_ip: "{{ hostvars[s23_target_member | default(groups['etcd'][0])]['ansible_host'] }}"
+
+    # A healthy peer to issue etcdctl from during teardown. If the target
+    # member failed to come back, disarming and the writability proof must not
+    # depend on it — the alarm is cluster-wide and any member can clear it.
+    # The trailing concat guarantees the expression is never empty.
+    s23_etcd_peer: >-
+      {{ ((groups['etcd'] | difference([ s23_target_member | default(groups['etcd'][0]) ]))
+          + [ s23_target_member | default(groups['etcd'][0]) ]) | first }}
+
+    # 1 MiB — safely below the lab's ~4.5 MB backend, so the very first
+    # applied write on the target trips the quota. etcd accepts small
+    # positive quotas; it only warns above MaxQuotaBytes (8 GiB).
+    s23_quota_bytes: 1048576
+
+    # The base unit (roles/k8s-install/templates/etcd.service.j2) does not pass
+    # --quota-backend-bytes, so ETCD_QUOTA_BACKEND_BYTES is the effective
+    # source. A drop-in that only adds an Environment= line needs no ExecStart
+    # override, which is what makes the undo a single `rm`.
+    s23_dropin_dir: /etc/systemd/system/etcd.service.d
+    s23_dropin_path: /etc/systemd/system/etcd.service.d/s23-nospace.conf
+
+    # Optional genuine-ENOSPC mode. Off by default (see header). One path.
+    s23_use_ballast: false
+    s23_ballast_path: "{{ etcd_data_dir }}/s23-nospace-ballast.bin"
+    s23_ballast_size: 28G
+
+    # Throwaway keys, outside /registry so they can never collide with the
+    # Kubernetes keyspace. Removed in teardown.
+    s23_trigger_key: /s23-nospace-trigger
+    s23_verify_key: /s23-teardown-verify
+
+    # Where the API-server read/write probe runs from. cp2 by default, the
+    # same vantage point metrics-collect uses.
+    s23_probe_host: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+    s23_probe_script: /tmp/s23-rw-probe.sh
+    s23_probe_cm: s23-write-probe
+
+  tasks:
+
+    # ── Pre-flight ───────────────────────────────────────────────────────────
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Target must be an etcd member
+      assert:
+        that:
+          - s23_target in groups['etcd']
+        fail_msg: >-
+          s23_target_member={{ s23_target }} is not in groups['etcd']
+          ({{ groups['etcd'] | join(', ') }}).
+      run_once: true
+
+    - name: Exactly one member may be starved
+      # Starving a second member is not a bigger NOSPACE, it is a different
+      # fault (quorum loss — S19's territory). The parameter must resolve to
+      # exactly one inventory hostname, never a list or a pattern.
+      assert:
+        that:
+          - (groups['etcd'] | select('equalto', s23_target) | list | length) == 1
+        fail_msg: >-
+          s23_target_member must name exactly one etcd member; it resolved to
+          "{{ s23_target }}".
+      run_once: true
+
+    - name: The target unit must not already pin --quota-backend-bytes
+      # If ExecStart set the flag explicitly, the environment variable is
+      # ignored and the injection would silently do nothing — a
+      # fault-ineffective run that still produces a full set of verdicts.
+      # Catch it before anything is changed.
+      shell: |
+        set -o pipefail
+        if grep -q -- '--quota-backend-bytes' /etc/systemd/system/etcd.service; then
+          echo "FLAG_PRESENT"
+        else
+          echo "FLAG_ABSENT"
+        fi
+      args:
+        executable: /bin/bash
+      register: s23_unit_flag
+      changed_when: false
+      delegate_to: "{{ s23_target }}"
+      run_once: true
+
+    - name: Fail early if the quota flag is hard-coded in the unit
+      assert:
+        that:
+          - "'FLAG_ABSENT' in s23_unit_flag.stdout"
+        fail_msg: >-
+          /etc/systemd/system/etcd.service on {{ s23_target }} passes
+          --quota-backend-bytes on the command line; ETCD_QUOTA_BACKEND_BYTES
+          would be ignored and the fault would not fire.
+      run_once: true
+
+    - name: No etcd alarm may already be armed
+      # Calibration: if the cluster is already read-only when we arrive, every
+      # measurement below describes someone else's fault. `etcdctl alarm list`
+      # prints nothing at all when the alarm store is empty.
+      shell: etcdctl alarm list
+      environment: "{{ etcdctl_env }}"
+      register: s23_alarm_baseline
+      changed_when: false
+      delegate_to: "{{ s23_target }}"
+      run_once: true
+
+    - name: Fail early if an alarm is already armed
+      assert:
+        that:
+          - (s23_alarm_baseline.stdout | trim | length) == 0
+        fail_msg: >-
+          An etcd alarm is already armed before injection:
+          {{ s23_alarm_baseline.stdout | trim }}. Disarm it
+          (`etcdctl alarm disarm`) before running S23.
+      run_once: true
+
+    - name: Record baseline etcd state and free space on the target
+      shell: |
+        set -o pipefail
+        echo "=== endpoint status ==="
+        etcdctl endpoint status --write-out=table 2>&1 || true
+        echo "=== endpoint health ==="
+        etcdctl endpoint health --write-out=table 2>&1 || true
+        echo "=== db sizes (bytes) ==="
+        etcdctl endpoint status --write-out=json 2>/dev/null \
+          | jq -c '[.[] | {endpoint: .Endpoint, dbSize: .Status.dbSize,
+                           dbSizeInUse: .Status.dbSizeInUse,
+                           errors: .Status.errors}]' 2>/dev/null || echo "[]"
+        echo "=== df {{ etcd_data_dir }} ==="
+        df -h {{ etcd_data_dir }} 2>&1 || true
+      args:
+        executable: /bin/bash
+      environment: "{{ etcdctl_env }}"
+      register: s23_etcd_baseline
+      changed_when: false
+      delegate_to: "{{ s23_target }}"
+      run_once: true
+
+    - name: Record baseline free bytes on the target data filesystem
+      shell: df -B1 --output=avail {{ etcd_data_dir }} | tail -1 | tr -d ' '
+      register: s23_avail_before
+      changed_when: false
+      delegate_to: "{{ s23_target }}"
+      run_once: true
+
+    - name: Save baseline etcd evidence
+      copy:
+        dest: "{{ results_dir }}/etcd_evidence_pre_fault.txt"
+        content: |
+          target_member: {{ s23_target }} ({{ s23_target_ip }})
+          avail_bytes: {{ s23_avail_before.stdout | trim }}
+          {{ s23_etcd_baseline.stdout }}
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Ensure the API write-probe ConfigMap exists
+      # The probe writes by annotating this object. It must be created while
+      # the cluster is still writable; teardown removes it.
+      shell: |
+        set -o pipefail
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl create configmap {{ s23_probe_cm }} \
+          -n {{ stateful_app_namespace }} \
+          --from-literal=scenario=s23 \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ s23_probe_host }}"
+      run_once: true
+
+    - name: Install the API-server read/write contrast probe
+      # One script, run at several phases. For EVERY API server it records, at
+      # the same instant:
+      #   read   — a linearizable list through to etcd (must keep working),
+      #   health — /healthz /livez /readyz plus the etcd line of
+      #            /readyz?verbose (must stay green: that is the finding),
+      #   write  — an annotation write (must be rejected while the alarm is
+      #            armed, with etcd's own message preserved verbatim).
+      # Reads and writes are taken per server rather than through the VIP, so
+      # "all API servers agree" is measured, not assumed.
+      copy:
+        dest: "{{ s23_probe_script }}"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # S23 read/write contrast probe. Argument 1 = phase label.
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          PHASE="${1:-unknown}"
+          NS="{{ stateful_app_namespace }}"
+          CM="{{ s23_probe_cm }}"
+          TMO="10s"
+          rows=""
+          for entry in {% for h in groups['control_plane'] %}{{ h }}={{ hostvars[h]['ansible_host'] }} {% endfor %}; do
+            name="${entry%%=*}"
+            ip="${entry#*=}"
+            S="https://$ip:6443"
+
+            rs=$(date +%s%3N)
+            if r_out=$(kubectl --server="$S" --request-timeout="$TMO" \
+                         get --raw "/api/v1/nodes" 2>&1); then r_rc=0; else r_rc=1; fi
+            re=$(date +%s%3N)
+
+            r_rv=$(printf '%s' "$r_out" | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || true)
+            r_cnt=$(printf '%s' "$r_out" | jq -r '[.items[]?] | length' 2>/dev/null || echo 0)
+            r_ready=$(printf '%s' "$r_out" | jq -c '[.items[]? | {
+                          key: .metadata.name,
+                          value: ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Missing")
+                        }] | from_entries' 2>/dev/null || echo null)
+            r_err=""
+            if [ "$r_rc" -ne 0 ]; then
+              r_err=$(printf '%s' "$r_out" | tr '\n' ' ' | head -c 300)
+            fi
+
+            hz=$(kubectl --server="$S" --request-timeout="$TMO" get --raw /healthz 2>&1 | tr -d '\n' | head -c 120)
+            lz=$(kubectl --server="$S" --request-timeout="$TMO" get --raw /livez   2>&1 | tr -d '\n' | head -c 120)
+            rz=$(kubectl --server="$S" --request-timeout="$TMO" get --raw /readyz  2>&1 | tr -d '\n' | head -c 120)
+            ez=$(kubectl --server="$S" --request-timeout="$TMO" get --raw '/readyz?verbose' 2>&1 \
+                   | grep -iE 'etcd' | tr '\n' ';' | head -c 300)
+
+            ws=$(date +%s%3N)
+            if w_out=$(kubectl --server="$S" --request-timeout="$TMO" annotate --overwrite \
+                         -n "$NS" configmap "$CM" \
+                         "s23-${PHASE}-${name}=$(date +%s%N)" 2>&1); then w_rc=0; else w_rc=1; fi
+            we=$(date +%s%3N)
+            w_msg=$(printf '%s' "$w_out" | tr '\n' ' ' | head -c 300)
+
+            row=$(jq -cn \
+              --arg phase "$PHASE" --arg api "$name" --arg server "$S" \
+              --argjson read_ok "$( [ "$r_rc" -eq 0 ] && echo true || echo false )" \
+              --arg read_rv "${r_rv:-}" \
+              --argjson read_count "${r_cnt:-0}" \
+              --argjson node_ready "${r_ready:-null}" \
+              --arg read_err "$r_err" \
+              --argjson read_ms "$((re-rs))" \
+              --argjson write_ok "$( [ "$w_rc" -eq 0 ] && echo true || echo false )" \
+              --arg write_msg "$w_msg" \
+              --argjson write_ms "$((we-ws))" \
+              --arg healthz "$hz" --arg livez "$lz" --arg readyz "$rz" \
+              --arg readyz_etcd "$ez" \
+              '{phase: $phase, apiserver: $api, server: $server,
+                read:   {ok: $read_ok, resourceVersion: $read_rv,
+                         node_count: $read_count, latency_ms: $read_ms,
+                         error: $read_err, node_ready: $node_ready},
+                write:  {ok: $write_ok, latency_ms: $write_ms, message: $write_msg},
+                health: {healthz: $healthz, livez: $livez, readyz: $readyz,
+                         readyz_etcd_checks: $readyz_etcd}}')
+            rows="${rows}${row}"$'\n'
+          done
+          printf '%s' "$rows" | jq -s '.'
+      delegate_to: "{{ s23_probe_host }}"
+      run_once: true
+
+    - name: Baseline read/write probe (both must succeed)
+      command: "{{ s23_probe_script }} pre_fault"
+      register: s23_probe_pre
+      changed_when: false
+      delegate_to: "{{ s23_probe_host }}"
+      run_once: true
+      ignore_errors: yes
+
+    - name: Save baseline read/write probe
+      copy:
+        dest: "{{ results_dir }}/rw_contrast_pre_fault.json"
+        content: "{{ s23_probe_pre.stdout | default('null', true) }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Baseline snapshot
+      include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: pre_fault
+
+    # ── Fault lifecycle ──────────────────────────────────────────────────────
+    # Everything from here to `always:` can fail; `always:` is the guarantee
+    # that the cluster is left writable. All snapshots stay inside this single
+    # play so metrics-collect's snapshot_index stays monotonic across the whole
+    # trace (it is a play-scoped fact; splitting the trace across plays restarts
+    # the counter and shuffles check-invariants.sh's chronological ordering).
+
+    - block:
+
+        - name: Declare what this fault must observably do
+          # D6 / fault efficacy.
+          #
+          # `require` is deliberately EMPTY, and that is the honest choice:
+          # NOT ONE of check-invariants.sh's current signals evidences a
+          # NOSPACE alarm.
+          #   target_node_status_changed / node_status_changed — no. Reads keep
+          #     working, so kubelets keep being *observed*; and the
+          #     node-lifecycle controller could not write a status change even
+          #     if it wanted to. "Every node stays Ready" IS the finding.
+          #   etcd_members_dropped — no. All five members answer `endpoint
+          #     status` throughout; NOSPACE is a refusal to mutate, not a
+          #     failure to respond.
+          #   probe_degraded / placement_changed — no. Running pods are
+          #     untouched; the service keeps serving.
+          #   api_view_lost — no. Every API server keeps answering.
+          #   lease_holder_changed — only as an aftershock: with
+          #     fault_duration > leaseDurationSeconds the controller-manager
+          #     and scheduler leaders cannot renew, drop leadership, and a
+          #     (possibly different) node re-acquires after the clear. Real,
+          #     but it evidences the read-only window's consequences, not the
+          #     alarm, and it is not deterministic — so requiring it would
+          #     mark honest runs INEFFECTIVE.
+          # With `require: []` the checker falls back to "any observable
+          # change against the baseline", which this fault does produce.
+          # `require_proposed` names the two signals that WOULD evidence the
+          # alarm directly; they do not exist in check-invariants.sh yet and
+          # are listed here (not in `require`) precisely so that an
+          # unimplemented signal cannot label every S23 run INEFFECTIVE. Move
+          # them into `require` in the same change that implements them.
+          #
+          # Until then the run carries its own first-class evidence:
+          # nospace_efficacy.json, computed below from measured alarm state
+          # and measured read/write outcomes.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": {{ scenario_id | to_json }},
+                "scenario_name": {{ scenario_name | to_json }},
+                "fault_type": {{ fault_type | to_json }},
+                "target_member": {{ s23_target | to_json }},
+                "target_member_ip": {{ s23_target_ip | to_json }},
+                "mode": {{ (s23_use_ballast | bool) | ternary('quota+ballast', 'quota') | to_json }},
+                "quota_backend_bytes": {{ s23_quota_bytes | int }},
+                "efficacy": {
+                  "target_node": "",
+                  "require": [],
+                  "require_proposed": ["etcd_alarm_armed", "cluster_writes_rejected"],
+                  "note": "Node Ready status cannot change under NOSPACE: reads keep working and no controller can write. See nospace_efficacy.json for the measured alarm/read/write evidence."
+                }
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Create the systemd drop-in directory on the target
+          file:
+            path: "{{ s23_dropin_dir }}"
+            state: directory
+            mode: '0755'
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Lower the backend quota on the target member only
+          copy:
+            dest: "{{ s23_dropin_path }}"
+            mode: '0644'
+            content: |
+              # Injected by scenarios/s23 — REMOVE ME.
+              # Lowers this member's backend quota below its current db size so
+              # the next applied write trips the quota applier and the member
+              # raises a cluster-wide NOSPACE alarm.
+              [Service]
+              Environment="ETCD_QUOTA_BACKEND_BYTES={{ s23_quota_bytes | int }}"
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Allocate the ballast file (optional genuine-ENOSPC mode)
+          # Single known path, removed unconditionally in teardown. Off by
+          # default: a truly full filesystem kills the member's WAL fsync and
+          # the member exits, which is member loss rather than NOSPACE.
+          shell: |
+            fallocate -l {{ s23_ballast_size }} {{ s23_ballast_path }}
+          args:
+            creates: "{{ s23_ballast_path }}"
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          when: s23_use_ballast | bool
+
+        - name: Restart the target member with the lowered quota
+          systemd:
+            name: etcd
+            state: restarted
+            daemon_reload: yes
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Wait for the target member's client port
+          wait_for:
+            host: "{{ s23_target_ip }}"
+            port: 2379
+            delay: 2
+            timeout: 90
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Wait for the target member to answer endpoint status again
+          shell: etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
+          environment: "{{ etcdctl_env }}"
+          register: s23_target_back
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: s23_target_back.rc == 0
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Trip the quota and arm the NOSPACE alarm
+          # The write is addressed to the target endpoint so the starved member
+          # is the one that applies-and-refuses; it then raises the alarm
+          # through raft and every member switches to the capped applier.
+          # Loop because the first put can be accepted by the leader before the
+          # target has applied it.
+          shell: |
+            set -o pipefail
+            for i in $(seq 1 30); do
+              etcdctl --endpoints=https://{{ s23_target_ip }}:2379 \
+                put {{ s23_trigger_key }} "s23-trip-$i" >/dev/null 2>&1 || true
+              if etcdctl alarm list 2>&1 | grep -qi 'NOSPACE'; then
+                echo "ARMED after $i write(s)"
+                break
+              fi
+              sleep 2
+            done
+            echo "=== alarm list ==="
+            etcdctl alarm list 2>&1 || true
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          register: s23_arm
+          changed_when: true
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+
+        - name: Record the injection timestamp
+          set_fact:
+            s23_inject_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          run_once: true
+
+        - name: Save the alarm-arming transcript
+          copy:
+            dest: "{{ results_dir }}/nospace_armed.txt"
+            content: |
+              injected_at: {{ s23_inject_ts }}
+              target_member: {{ s23_target }} ({{ s23_target_ip }})
+              quota_backend_bytes: {{ s23_quota_bytes | int }}
+              {{ s23_arm.stdout }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: The NOSPACE alarm must actually be armed
+          # A failure here still runs `always:` — that is the whole point of
+          # the block. It marks the run as a miss instead of letting it
+          # contribute verdicts describing an undisturbed cluster.
+          assert:
+            that:
+              - "'NOSPACE' in (s23_arm.stdout | upper)"
+            fail_msg: >-
+              NOSPACE was not raised on {{ s23_target }} after 30 write
+              attempts against a {{ s23_quota_bytes }}-byte quota. Check that
+              the member restarted with the drop-in applied
+              (`systemctl show etcd -p Environment`).
+          run_once: true
+
+        # ── Hold: measure the contrast ───────────────────────────────────────
+
+        - name: Hold — first observation point
+          pause:
+            seconds: 20
+          run_once: true
+
+        - name: Read/write contrast probe while the alarm is armed (t20)
+          command: "{{ s23_probe_script }} nospace_t20"
+          register: s23_probe_t20
+          changed_when: false
+          delegate_to: "{{ s23_probe_host }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save t20 read/write contrast
+          copy:
+            dest: "{{ results_dir }}/rw_contrast_nospace_t20.json"
+            content: "{{ s23_probe_t20.stdout | default('null', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: etcd-side evidence while armed (t20)
+          shell: |
+            set -o pipefail
+            echo "=== alarm list ==="
+            etcdctl alarm list 2>&1 || true
+            echo "=== endpoint status ==="
+            etcdctl endpoint status --write-out=table 2>&1 || true
+            echo "=== endpoint health ==="
+            etcdctl endpoint health --write-out=table 2>&1 || true
+            echo "=== per-endpoint errors / db size ==="
+            etcdctl endpoint status --write-out=json 2>/dev/null \
+              | jq -c '[.[] | {endpoint: .Endpoint, dbSize: .Status.dbSize,
+                               dbSizeInUse: .Status.dbSizeInUse,
+                               raftTerm: .Status.raftTerm,
+                               errors: .Status.errors}]' 2>/dev/null || echo "[]"
+            echo "=== direct etcd write attempt ==="
+            etcdctl put {{ s23_trigger_key }}-probe "t20" 2>&1 || true
+            echo "=== direct etcd read attempt ==="
+            etcdctl get --prefix --keys-only --limit=1 /registry 2>&1 | head -5 || true
+            echo "=== df {{ etcd_data_dir }} on {{ s23_target }} ==="
+            df -h {{ etcd_data_dir }} 2>&1 || true
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          register: s23_etcd_t20
+          changed_when: false
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save t20 etcd evidence
+          copy:
+            dest: "{{ results_dir }}/etcd_evidence_nospace_t20.txt"
+            content: "{{ s23_etcd_t20.stdout | default('', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Snapshot while the cluster is read-only (t20)
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: nospace_t20
+
+        - name: Hold — remainder of fault_duration
+          pause:
+            seconds: "{{ [ (fault_duration | int) - 20, 10 ] | max }}"
+          run_once: true
+
+        - name: Read/write contrast probe late in the fault window
+          command: "{{ s23_probe_script }} nospace_late"
+          register: s23_probe_late
+          changed_when: false
+          delegate_to: "{{ s23_probe_host }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save late read/write contrast
+          copy:
+            dest: "{{ results_dir }}/rw_contrast_nospace_late.json"
+            content: "{{ s23_probe_late.stdout | default('null', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Snapshot late in the fault window
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: nospace_late
+
+        - name: Derive the measured fault-efficacy evidence
+          # Self-contained, first-class efficacy evidence for this scenario:
+          # the alarm was armed, at least one API server rejected a write, and
+          # every API server still served a read. This is what
+          # check-invariants.sh cannot yet express (see scenario_meta.json).
+          copy:
+            dest: "{{ results_dir }}/nospace_efficacy.json"
+            content: |
+              {
+                "scenario_id": {{ scenario_id | to_json }},
+                "target_member": {{ s23_target | to_json }},
+                "alarm_armed": {{ ('NOSPACE' in (s23_arm.stdout | default('') | upper)) | to_json }},
+                "writes_rejected": {{ ((s23_probe_t20.stdout | default('[]', true) | from_json)
+                                       | selectattr('write.ok', 'equalto', false) | list | length) }},
+                "writes_attempted": {{ ((s23_probe_t20.stdout | default('[]', true) | from_json)
+                                       | list | length) }},
+                "reads_ok": {{ ((s23_probe_t20.stdout | default('[]', true) | from_json)
+                                | selectattr('read.ok', 'equalto', true) | list | length) }},
+                "verdict": {{ (
+                    ('NOSPACE' in (s23_arm.stdout | default('') | upper))
+                    and (((s23_probe_t20.stdout | default('[]', true) | from_json)
+                          | selectattr('write.ok', 'equalto', false) | list | length) > 0)
+                    and (((s23_probe_t20.stdout | default('[]', true) | from_json)
+                          | selectattr('read.ok', 'equalto', true) | list | length) > 0)
+                  ) | ternary('EFFECTIVE', 'INEFFECTIVE') | to_json }},
+                "note": "EFFECTIVE requires all three: the NOSPACE alarm armed, at least one API-server write rejected, and at least one API-server read still served."
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+      # ── Teardown — unconditional, ordered, verified ────────────────────────
+      # ORDER IS LOad-BEARING:
+      #   quota restored -> member restarted -> alarm disarmed -> writability
+      #   proven. Disarming before the quota is restored lets the target's very
+      #   next applied write re-raise NOSPACE, and the cluster stays read-only
+      #   for every scenario that follows.
+      # Every step carries ignore_errors so that one failure cannot skip the
+      # steps after it. The hard gate is the safety-net play at the end of the
+      # run, which re-measures live state.
+      always:
+
+        - name: Clear per-host error state so teardown runs everywhere
+          meta: clear_host_errors
+
+        - name: Record the teardown timestamp
+          set_fact:
+            s23_clear_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          run_once: true
+
+        - name: STEP 1 — remove the quota drop-in (restores the default quota)
+          file:
+            path: "{{ s23_dropin_path }}"
+            state: absent
+          register: s23_dropin_removed
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 2 — remove the ballast file (unconditional, both modes)
+          # Runs whether or not ballast mode was used, and whether or not the
+          # injection got that far. One known path; nothing else is touched.
+          file:
+            path: "{{ s23_ballast_path }}"
+            state: absent
+          register: s23_ballast_removed
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 3 — restart the target member on the restored quota
+          systemd:
+            name: etcd
+            state: restarted
+            daemon_reload: yes
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 4 — wait for the target member's client port
+          wait_for:
+            host: "{{ s23_target_ip }}"
+            port: 2379
+            delay: 2
+            timeout: 120
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 5 — wait for the target member to serve again
+          shell: etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
+          environment: "{{ etcdctl_env }}"
+          register: s23_target_recovered
+          changed_when: false
+          retries: 18
+          delay: 5
+          until: s23_target_recovered.rc == 0
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 6 — disarm the NOSPACE alarm until nothing is left armed
+          # Addressed at the full endpoint list, not just the target, so the
+          # disarm still lands if the target failed to come back. Alarm
+          # requests are exempt from the capped applier, so this works while
+          # the cluster is read-only. Loops because a straggling apply on the
+          # target can re-raise the alarm in the same second it is cleared.
+          shell: |
+            set -o pipefail
+            for i in $(seq 1 20); do
+              etcdctl alarm disarm >/dev/null 2>&1 || true
+              sleep 1
+              remaining=$(etcdctl alarm list 2>&1 || echo "ALARM_LIST_FAILED")
+              if [ -z "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]; then
+                echo "DISARM_CLEAN after $i attempt(s)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "DISARM_INCOMPLETE"
+            etcdctl alarm list 2>&1 || true
+            exit 0
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          register: s23_disarm
+          changed_when: true
+          delegate_to: "{{ s23_etcd_peer }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 7 — delete the throwaway trigger keys
+          shell: |
+            etcdctl del {{ s23_trigger_key }} 2>&1 || true
+            etcdctl del {{ s23_trigger_key }}-probe 2>&1 || true
+            etcdctl del {{ s23_verify_key }} 2>&1 || true
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          changed_when: true
+          delegate_to: "{{ s23_etcd_peer }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 8 — prove etcd accepts writes again
+          shell: |
+            set -o pipefail
+            if etcdctl put {{ s23_verify_key }} "$(date -u +%FT%TZ)" >/dev/null 2>&1; then
+              etcdctl del {{ s23_verify_key }} >/dev/null 2>&1 || true
+              echo "WRITABLE"
+            else
+              echo "NOT_WRITABLE"
+              etcdctl put {{ s23_verify_key }} probe 2>&1 | head -3
+            fi
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          register: s23_etcd_writable
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: "'WRITABLE' in (s23_etcd_writable.stdout | default(''))
+                  and 'NOT_WRITABLE' not in (s23_etcd_writable.stdout | default(''))"
+          delegate_to: "{{ s23_etcd_peer }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: STEP 9 — prove the API server accepts writes again
+          command: "{{ s23_probe_script }} post_clear"
+          register: s23_probe_post
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: >-
+            (s23_probe_post.stdout | default('[]', true) | from_json
+             | selectattr('write.ok', 'equalto', true) | list | length) > 0
+          delegate_to: "{{ s23_probe_host }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the post-clear read/write contrast
+          copy:
+            dest: "{{ results_dir }}/rw_contrast_post_clear.json"
+            content: "{{ s23_probe_post.stdout | default('null', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: STEP 10 — remove the probe ConfigMap and the probe script
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl delete configmap {{ s23_probe_cm }} \
+              -n {{ stateful_app_namespace }} --ignore-not-found 2>&1 || true
+            rm -f {{ s23_probe_script }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+          delegate_to: "{{ s23_probe_host }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        # ── Teardown verification (measured, not assumed) ────────────────────
+
+        - name: Re-measure the alarm store, quota source and disk
+          shell: |
+            set -o pipefail
+            echo "=== alarm list ==="
+            etcdctl alarm list 2>&1 || true
+            echo "=== endpoint status ==="
+            etcdctl endpoint status --write-out=table 2>&1 || true
+            echo "=== endpoint health ==="
+            etcdctl endpoint health --write-out=table 2>&1 || true
+            echo "=== effective etcd environment on {{ s23_target }} ==="
+            systemctl show etcd -p Environment 2>&1 || true
+            echo "=== df {{ etcd_data_dir }} ==="
+            df -h {{ etcd_data_dir }} 2>&1 || true
+          args:
+            executable: /bin/bash
+          environment: "{{ etcdctl_env }}"
+          register: s23_final_state
+          changed_when: false
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Re-measure the alarm store alone
+          shell: etcdctl alarm list
+          environment: "{{ etcdctl_env }}"
+          register: s23_alarm_after
+          changed_when: false
+          delegate_to: "{{ s23_etcd_peer }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Confirm the drop-in is gone
+          stat:
+            path: "{{ s23_dropin_path }}"
+          register: s23_dropin_stat
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Confirm the ballast file is gone
+          stat:
+            path: "{{ s23_ballast_path }}"
+          register: s23_ballast_stat
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Re-measure free bytes on the target data filesystem
+          shell: df -B1 --output=avail {{ etcd_data_dir }} | tail -1 | tr -d ' '
+          register: s23_avail_after
+          changed_when: false
+          delegate_to: "{{ s23_target }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Write the teardown verification record
+          copy:
+            dest: "{{ results_dir }}/teardown_verification.json"
+            content: |
+              {
+                "scenario_id": {{ scenario_id | to_json }},
+                "target_member": {{ s23_target | to_json }},
+                "cleared_at": {{ (s23_clear_ts | default('')) | to_json }},
+                "dropin_present": {{ (s23_dropin_stat.stat.exists | default(false)) | to_json }},
+                "ballast_present": {{ (s23_ballast_stat.stat.exists | default(false)) | to_json }},
+                "alarm_list_after": {{ (s23_alarm_after.stdout | default('') | trim) | to_json }},
+                "alarm_clear": {{ ((s23_alarm_after.stdout | default('') | trim | length) == 0) | to_json }},
+                "disarm_transcript": {{ (s23_disarm.stdout | default('') | trim) | to_json }},
+                "etcd_writable": {{ ('WRITABLE' in (s23_etcd_writable.stdout | default(''))
+                                     and 'NOT_WRITABLE' not in (s23_etcd_writable.stdout | default(''))) | to_json }},
+                "apiserver_writes_ok": {{ (s23_probe_post.stdout | default('[]', true) | from_json
+                                           | selectattr('write.ok', 'equalto', true) | list | length) }},
+                "avail_bytes_before": {{ (s23_avail_before.stdout | default('0') | trim | int) }},
+                "avail_bytes_after": {{ (s23_avail_after.stdout | default('0') | trim | int) }}
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Save the final etcd state transcript
+          copy:
+            dest: "{{ results_dir }}/etcd_evidence_post_clear.txt"
+            content: "{{ s23_final_state.stdout | default('', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Teardown self-check (recorded here, enforced by the safety-net play)
+          assert:
+            that:
+              - (s23_alarm_after.stdout | default('unknown') | trim | length) == 0
+              - not (s23_dropin_stat.stat.exists | default(true))
+              - not (s23_ballast_stat.stat.exists | default(true))
+              - "'WRITABLE' in (s23_etcd_writable.stdout | default(''))"
+              - "'NOT_WRITABLE' not in (s23_etcd_writable.stdout | default(''))"
+              - (s23_avail_after.stdout | default('0') | trim | int)
+                >= ((s23_avail_before.stdout | default('0') | trim | int) * 0.9) | int
+            fail_msg: >-
+              S23 TEARDOWN INCOMPLETE — alarm_list={{ s23_alarm_after.stdout | default('?') | trim }},
+              dropin_present={{ s23_dropin_stat.stat.exists | default('?') }},
+              ballast_present={{ s23_ballast_stat.stat.exists | default('?') }},
+              etcd_write={{ s23_etcd_writable.stdout | default('?') }}.
+              The cluster may still be read-only. The safety-net play will
+              retry and then fail the run.
+            success_msg: >-
+              S23 teardown clean: no alarms armed, quota drop-in and ballast
+              removed, etcd and the API servers accept writes.
+          run_once: true
+          ignore_errors: yes
+
+        # ── Post-clear observation window ────────────────────────────────────
+        # Inside `always` on purpose: the snapshot_index counter is a play fact,
+        # so moving these into a later play would restart it and scramble
+        # check-invariants.sh's chronological ordering. Labels start with
+        # `post_` because I10 selects its first/last post-fault snapshots by
+        # that prefix.
+
+        - name: Observe recovery — t+30
+          pause:
+            seconds: 30
+          run_once: true
+
+        - name: Snapshot post_clear_t30
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_clear_t30
+
+        - name: Observe recovery — t+90
+          pause:
+            seconds: 60
+          run_once: true
+
+        - name: Snapshot post_clear_t90
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_clear_t90
+
+        - name: Observe recovery — remainder of observation_window
+          pause:
+            seconds: "{{ [ (observation_window | int) - 90, 30 ] | max }}"
+          run_once: true
+
+        - name: Snapshot post_clear_final
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_clear_final
+
+- name: S23 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s23
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ r.stdout }}"
+
+- name: S23 — Safety net — the cluster MUST be left writable
+  # Independent of the main play's own bookkeeping. It re-applies the removals
+  # idempotently, re-measures the live alarm store, and only then fails. This
+  # is the hard gate: a left-armed NOSPACE alarm would make every subsequent
+  # scenario in the sweep run against a read-only cluster, and the invariant
+  # verdicts of those runs would be meaningless.
+  hosts: "{{ s23_target_member | default(groups['etcd'][0]) }}"
+  gather_facts: no
+  vars:
+    scenario_id: s23
+    s23_dropin_path: /etc/systemd/system/etcd.service.d/s23-nospace.conf
+    s23_ballast_path: "{{ etcd_data_dir }}/s23-nospace-ballast.bin"
+    s23_verify_key: /s23-teardown-verify
+  tasks:
+    - name: Quota drop-in must not exist
+      file:
+        path: "{{ s23_dropin_path }}"
+        state: absent
+      register: s23_net_dropin
+
+    - name: Ballast file must not exist
+      file:
+        path: "{{ s23_ballast_path }}"
+        state: absent
+      register: s23_net_ballast
+
+    - name: Restart etcd if the safety net had to remove something
+      systemd:
+        name: etcd
+        state: restarted
+        daemon_reload: yes
+      when: s23_net_dropin.changed or s23_net_ballast.changed
+
+    - name: Wait for etcd after a safety-net restart
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 2379
+        delay: 2
+        timeout: 120
+      when: s23_net_dropin.changed or s23_net_ballast.changed
+
+    - name: Disarm anything still armed
+      shell: |
+        set -o pipefail
+        for i in $(seq 1 15); do
+          remaining=$(etcdctl alarm list 2>&1 || echo "ALARM_LIST_FAILED")
+          if [ -z "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]; then
+            echo "CLEAN"
+            exit 0
+          fi
+          etcdctl alarm disarm >/dev/null 2>&1 || true
+          sleep 2
+        done
+        echo "STILL_ARMED"
+        etcdctl alarm list 2>&1 || true
+        exit 0
+      args:
+        executable: /bin/bash
+      environment: "{{ etcdctl_env }}"
+      register: s23_net_disarm
+      changed_when: "'CLEAN' not in s23_net_disarm.stdout"
+
+    - name: Final writability proof
+      shell: |
+        set -o pipefail
+        if etcdctl put {{ s23_verify_key }} "$(date -u +%FT%TZ)" >/dev/null 2>&1; then
+          etcdctl del {{ s23_verify_key }} >/dev/null 2>&1 || true
+          echo "WRITABLE"
+        else
+          echo "NOT_WRITABLE"
+          etcdctl put {{ s23_verify_key }} probe 2>&1 | head -3
+        fi
+      args:
+        executable: /bin/bash
+      environment: "{{ etcdctl_env }}"
+      register: s23_net_write
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: "'WRITABLE' in s23_net_write.stdout and 'NOT_WRITABLE' not in s23_net_write.stdout"
+      ignore_errors: yes
+
+    - name: The run fails here if S23 left the cluster read-only
+      assert:
+        that:
+          - "'STILL_ARMED' not in (s23_net_disarm.stdout | default(''))"
+          - "'WRITABLE' in (s23_net_write.stdout | default(''))"
+          - "'NOT_WRITABLE' not in (s23_net_write.stdout | default(''))"
+        fail_msg: >-
+          S23 SAFETY NET FAILED — the etcd cluster is still read-only.
+          disarm={{ s23_net_disarm.stdout | default('?') }},
+          write={{ s23_net_write.stdout | default('?') }}.
+          Do NOT run further scenarios: run
+          `etcdctl alarm disarm` against {{ etcd_endpoints }} and confirm
+          `etcdctl alarm list` is empty before continuing.
+        success_msg: >-
+          S23 safety net passed: no alarms armed, injected files removed,
+          etcd accepts writes.

@@ -1,0 +1,894 @@
+---
+# scenarios/s27/playbook.yml
+# S27: Negative and substrate clock skew
+#
+# S4 advances ONE control-plane node by +120 s. S27 adds the two skew
+# directions S4 does not cover. They are different mechanisms, not a
+# different magnitude:
+#
+#   variant: negative   (default)
+#     Moves a control-plane node's clock BACKWARDS by 120 s.
+#     Forward skew (S4) makes a candidate's local `now` jump past
+#     `observedTime + leaseDuration`, so the lease looks expired and the
+#     candidate immediately tries to steal it — leases expire EARLY.
+#     Backward skew does the opposite: from the skewed node every other
+#     holder's `renewTime` sits in its future, `observedTime + leaseDuration`
+#     is always After(now), and the lease NEVER expires from that vantage.
+#     The skewed node also stamps its own `renewTime` 120 s in the past, so
+#     unskewed observers see a holder that looks permanently stale and yet
+#     is never challenged. "Expired early" vs. "never expires" is the whole
+#     point, and it is only visible if renewTime is recorded from BOTH
+#     vantage points — which this scenario does.
+#
+#   variant: substrate
+#     Skews the etcd MEMBERS relative to the API servers, which moves the
+#     perturbation below the controllers entirely. The controller-manager
+#     and scheduler clocks stay correct; what moves is the clock of the
+#     store that holds the lease objects and that owns the etcd-level lease
+#     TTLs the API server attaches to (masterleases, event TTLs). The
+#     honest expectation is that etcd's raft timers and its lessor read Go
+#     monotonic time and are therefore insulated from a wall-clock step —
+#     in which case the measured result is a NEGATIVE one: storage-layer
+#     clock disagreement is not consequential at this magnitude. That is a
+#     publishable claim for a paper about observer-relative failure, and it
+#     is claimable only if the storage layer is actually sampled, which is
+#     why this variant samples `etcdctl lease timetolive` from skewed and
+#     unskewed members side by side.
+#
+# What we measure (both variants):
+#   - kube-controller-manager / kube-scheduler / node lease holderIdentity
+#     and renewTime, sampled every `poll_interval` seconds across the whole
+#     run from an UNSKEWED control-plane node (true clock) and, for the
+#     negative variant, from the SKEWED node itself. Each sample carries
+#     `renew_age_seconds` = sampler_now - renewTime; a NEGATIVE age means
+#     renewTime is in that observer's future, i.e. the lease can never
+#     expire for it.
+#   - For the substrate variant, per-member etcd lease TTL remaining, from
+#     every etcd member, so a skewed member's TTL arithmetic can be diffed
+#     against an unskewed member's at the same instant.
+#   - The standard metrics-collect snapshot series for the invariant checks.
+#
+# Parameters (override with -e):
+#   s27_variant          negative | substrate           (default: negative)
+#   s27_skew_seconds     magnitude in seconds           (default: 120, = S4)
+#   s27_skew_sign        -1 | 1, overrides the per-variant default
+#   s27_target_hosts     explicit list of hosts to skew (default: derived)
+#   s27_clock_tolerance  restore-verification tolerance (default: 5 s)
+#   s27_observer_cp_host unskewed CP node used as the true-clock vantage
+#
+# SAFETY — the clock MUST come back.
+#   A node left skewed silently corrupts every later scenario in the sweep,
+#   and certificate validation plus etcd leases across the whole cluster
+#   depend on it. Injection and hold therefore live in a `block:` whose
+#   `always:` restores; the restore does an ABSOLUTE step to the control
+#   machine's epoch (never "subtract the offset back", which re-applies the
+#   arithmetic and keeps whatever drift accumulated during the window),
+#   re-enables NTP discipline, and then VERIFIES against the control
+#   machine's clock with a retry loop. Failure to converge fails the play,
+#   which aborts run-all-scenarios — the correct outcome, because the lab
+#   is no longer fit to measure anything.
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Resolve run configuration and pick targets
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    scenario_name: "Negative and substrate clock skew"
+  tasks:
+    - name: Variant must be one this playbook implements
+      assert:
+        that:
+          - (s27_variant | default('negative')) in ['negative', 'substrate']
+        fail_msg: >-
+          s27_variant must be 'negative' or 'substrate'
+          (got '{{ s27_variant | default('negative') }}')
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Resolve the S27 run configuration
+      # Default sign per variant:
+      #   negative  -> -1. The direction IS the experiment.
+      #   substrate -> +1. Here the novelty is the LAYER, not the direction;
+      #     forward is chosen because a forward-skewed store is the direction
+      #     under which a wall-clock-based TTL would expire early and be
+      #     visible inside a 60 s window, whereas a backward-skewed store
+      #     simply never expires anything and is indistinguishable from "the
+      #     fault did nothing". Override with -e s27_skew_sign=-1 to run the
+      #     backward storage-layer case as a separate run.
+      set_fact:
+        s27_cfg:
+          variant: "{{ s27_variant | default('negative') }}"
+          magnitude: "{{ s27_skew_seconds | default(120) | int }}"
+          sign: "{{ s27_skew_sign | default(-1 if (s27_variant | default('negative')) == 'negative' else 1) | int }}"
+          offset: "{{ (s27_skew_seconds | default(120) | int) * (s27_skew_sign | default(-1 if (s27_variant | default('negative')) == 'negative' else 1) | int) }}"
+          tolerance: "{{ s27_clock_tolerance | default(5) | int }}"
+          observer_cp: "{{ s27_observer_cp_host | default(groups['control_plane'][1]) }}"
+          layer: "{{ 'storage' if (s27_variant | default('negative')) == 'substrate' else 'controller' }}"
+          # Samplers must outlive fault_duration + observation_window so the
+          # lease timeline spans injection, hold, restore and recovery in one
+          # continuous series.
+          sample_seconds: "{{ (fault_duration | int) + (observation_window | int) + 120 }}"
+
+    - name: Discover the current etcd raft leader
+      # Substrate only, and only when the operator has not named the targets.
+      # The leader is the member that actually drives lease expiry, so a
+      # substrate run that skewed only followers would be measuring nothing.
+      shell: |
+        set -o pipefail
+        ETCDCTL_API=3 etcdctl \
+          --endpoints={{ etcd_endpoints }} \
+          --cacert={{ etcd_cert_dir }}/ca.crt \
+          --cert={{ etcd_cert_dir }}/server.crt \
+          --key={{ etcd_cert_dir }}/server.key \
+          endpoint status --write-out=json 2>/dev/null \
+          | jq -r '.[] | select(.Status.header.member_id == .Status.leader) | .Endpoint' \
+          | head -1 \
+          | sed -E 's#^https?://##; s#:[0-9]+$##'
+      register: s27_leader_ep
+      delegate_to: "{{ groups['etcd'][0] }}"
+      changed_when: false
+      ignore_errors: yes
+      when:
+        - s27_cfg.variant == 'substrate'
+        - s27_target_hosts is not defined
+
+    - name: Map the leader endpoint back to an inventory host
+      set_fact:
+        s27_leader_host: >-
+          {{ dict(groups['etcd'] | map('extract', hostvars, 'ansible_host') | list
+                  | zip(groups['etcd']))[(s27_leader_ep.stdout | default('') | trim)]
+             | default('', true) }}
+      when:
+        - s27_cfg.variant == 'substrate'
+        - s27_target_hosts is not defined
+
+    - name: Resolve the target host list
+      # Blast radius for the substrate variant: TWO of the five etcd members
+      # — the current raft leader plus one follower.
+      #
+      #   * Not all five. A fleet-wide skew makes the storage layer agree
+      #     with itself and merely shifts its frame relative to the API
+      #     servers; that is a weaker experiment (nothing inside etcd
+      #     disagrees) and it removes the safety net — with every member
+      #     skewed there is no unskewed member left to compare against, and
+      #     a restore that fails on all five leaves no correct clock in the
+      #     cluster at all.
+      #   * Not one. Skewing a single member cannot be distinguished from
+      #     that member being slow; two gives a skewed pair that agrees with
+      #     each other and disagrees with the rest, which is the shape of a
+      #     real substrate-level clock fault.
+      #   * Exactly two of five keeps the skewed set a strict MINORITY, so
+      #     even if the skew turns out to be consequential (a member evicted
+      #     on certificate validity, say) the three unskewed members retain
+      #     quorum and the cluster keeps serving. The same 2/5 split S19
+      #     uses, so the two results are directly comparable.
+      #   * The leader is included deliberately: it is the member whose
+      #     clock drives lease expiry. An `s27_leader_host` that could not be
+      #     discovered falls back to the first two members, and the run is
+      #     still valid — it just may not contain the leader, which the
+      #     recorded config makes visible rather than silent.
+      set_fact:
+        s27_targets: >-
+          {{ s27_target_hosts | default(
+               [groups['control_plane'][0]] if s27_cfg.variant == 'negative'
+               else ((([s27_leader_host | default('', true)] | select('!=', '') | list)
+                      + groups['etcd']) | unique | list)[0:2]
+             ) }}
+
+    - name: The skewed set must stay a minority of the etcd cluster
+      assert:
+        that:
+          - s27_targets | length > 0
+          - (s27_targets | length) * 2 < (groups['etcd'] | length)
+        fail_msg: >-
+          Refusing to skew {{ s27_targets | length }} of
+          {{ groups['etcd'] | length }} etcd members — the skewed set must be
+          a strict minority so the unskewed members retain quorum.
+      when: s27_cfg.variant == 'substrate'
+
+    - name: Record the resolved configuration alongside the results
+      copy:
+        dest: "{{ results_dir }}/s27_run_config.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "scenario_name": {{ scenario_name | to_json }},
+            "variant": {{ s27_cfg.variant | to_json }},
+            "skew_layer": {{ s27_cfg.layer | to_json }},
+            "skew_seconds_signed": {{ s27_cfg.offset | int }},
+            "skew_magnitude_seconds": {{ s27_cfg.magnitude | int }},
+            "targets": {{ s27_targets | to_json }},
+            "etcd_leader_at_start": {{ (s27_leader_host | default('')) | to_json }},
+            "true_clock_vantage": {{ s27_cfg.observer_cp | to_json }},
+            "restore_tolerance_seconds": {{ s27_cfg.tolerance | int }},
+            "fault_duration": {{ fault_duration | int }},
+            "observation_window": {{ observation_window | int }},
+            "control_machine_epoch_at_start": {{ lookup('pipe', 'date -u +%s') | int }}
+          }
+
+    - name: Declare what this fault must observably do
+      # D6 / fault efficacy. `require` is deliberately EMPTY for both
+      # variants, and that is a considered choice, not an omission:
+      #
+      #   The existing signal vocabulary (node_status_changed,
+      #   lease_holder_changed, etcd_members_dropped, probe_degraded,
+      #   placement_changed, api_view_lost, target_node_status_changed) can
+      #   only express "the cluster reacted". S27-negative predicts that the
+      #   cluster does NOT react: client-go's leader election measures expiry
+      #   from `observedTime` (its own clock at the instant the record last
+      #   changed), so a backward step makes every lease look fresh and
+      #   nothing changes hands. Requiring `lease_holder_changed` — the
+      #   signal S4's forward skew would fire — would therefore mark exactly
+      #   the outcome this scenario exists to demonstrate as INEFFECTIVE and
+      #   drop it from the aggregate. Same for the substrate variant, whose
+      #   expected result is that etcd's monotonic timers absorb the skew.
+      #
+      #   The thing that genuinely CAN silently fail here is the injection
+      #   itself — NTP re-disciplining the clock mid-window and undoing the
+      #   fault without anyone noticing. That is proved directly instead, in
+      #   clock_skew_efficacy.json: the measured node-vs-control-machine
+      #   offset at injection time (fatal if it does not match the request)
+      #   and again mid-window (recorded). A new signal `clock_offset_applied`
+      #   reading that file is what S27 actually wants from check-invariants.sh;
+      #   see the report.
+      #
+      #   `target_node` differs per variant: cp1 for the negative variant, so
+      #   target_node_status_changed is evaluated against the node that was
+      #   actually skewed; EMPTY for the substrate variant, because etcd
+      #   members are not Kubernetes nodes and never appear in the node
+      #   condition map — pointing target_node at one would be a detector
+      #   that can never fire.
+      copy:
+        dest: "{{ results_dir }}/scenario_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "fault_type": "clock_skew",
+            "variant": {{ s27_cfg.variant | to_json }},
+            "skew_layer": {{ s27_cfg.layer | to_json }},
+            "skew_seconds_signed": {{ s27_cfg.offset | int }},
+            "targets": {{ s27_targets | to_json }},
+            "efficacy": {
+              "target_node": {{ (s27_targets[0] if s27_cfg.variant == 'negative' else '') | to_json }},
+              "require": []
+            },
+            "efficacy_note": "require is empty on purpose: both variants predict a NULL cluster response (backward skew makes leases never expire; etcd's timers are monotonic). Injection efficacy is proved separately in clock_skew_efficacy.json.",
+            "injection_proof": "clock_skew_efficacy.json"
+          }
+
+    - name: Add the resolved targets to a dynamic group
+      add_host:
+        name: "{{ item }}"
+        groups: s27_skew_targets
+        ansible_host: "{{ hostvars[item]['ansible_host'] }}"
+      loop: "{{ s27_targets }}"
+      changed_when: false
+
+    - name: Announce the run
+      debug:
+        msg: >-
+          S27 variant={{ s27_cfg.variant }} layer={{ s27_cfg.layer }}
+          offset={{ s27_cfg.offset }}s targets={{ s27_targets | join(',') }}
+          true-clock vantage={{ s27_cfg.observer_cp }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    scenario_name: "Negative and substrate clock skew"
+    snapshot_label: pre_fault
+    s27: "{{ hostvars[groups['observer'][0]]['s27_cfg'] }}"
+  tasks:
+    - name: Record each node's clock offset against the control machine
+      # Baseline for the post-run audit. Measured as node_epoch minus the
+      # control machine's epoch templated into the command immediately
+      # before it runs, so the only error term is SSH transit.
+      shell: |
+        node=$(date +%s)
+        ref={{ lookup('pipe', 'date -u +%s') }}
+        echo "{\"host\": \"{{ inventory_hostname }}\", \"node_epoch\": $node, \"ref_epoch\": $ref, \"offset_seconds\": $((node - ref))}"
+      register: s27_offset_prefault
+      changed_when: false
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Save the pre-fault clock offsets
+      copy:
+        dest: "{{ results_dir }}/clock_offsets_prefault.json"
+        content: |
+          [
+          {% for host in groups['control_plane'] + groups['workers'] + groups['etcd'] %}
+            {{ hostvars[host]['s27_offset_prefault']['stdout'] | default('null', true) }}{% if not loop.last %},{% endif %}
+
+          {% endfor %}
+          ]
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Inject skew, hold, then restore no matter what
+  # One play over the whole cluster, not a target-only play, so that the
+  # cluster-wide metrics-collect snapshots taken during the fault window sit
+  # INSIDE the same block whose `always:` restores the clock. Splitting hold
+  # and restore into separate plays would mean a failure during the hold
+  # aborts the run before the restore play is ever reached, leaving a node
+  # skewed — the one outcome this scenario must never produce.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    s27: "{{ hostvars[groups['observer'][0]]['s27_cfg'] }}"
+    s27_is_target: "{{ inventory_hostname in (groups['s27_skew_targets'] | default([])) }}"
+  tasks:
+    - block:
+
+        # ── Samplers ─────────────────────────────────────────────────────
+        # Started BEFORE injection and left running (async, poll 0) across
+        # injection, hold, restore and recovery, so the lease series is one
+        # continuous trace rather than a set of disconnected point reads.
+
+        - name: Start the lease sampler on the unskewed control-plane vantage
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            SRV="https://{{ hostvars[s27.observer_cp]['ansible_host'] }}:6443"
+            OUT=/tmp/s27_lease_timeline_observer.json
+            : > "$OUT"
+            END=$(( $(date +%s) + {{ s27.sample_seconds | int }} ))
+            while [ "$(date +%s)" -lt "$END" ]; do
+              NOW=$(date +%s)
+              CM=$(kubectl --server="$SRV" --request-timeout=5s get lease -n kube-system \
+                     kube-controller-manager kube-scheduler -o json 2>/dev/null || echo '{"items":[]}')
+              NL=$(kubectl --server="$SRV" --request-timeout=5s get lease -n kube-node-lease \
+                     -o json 2>/dev/null || echo '{"items":[]}')
+              EP=$(kubectl --server="$SRV" --request-timeout=5s get endpoints kubernetes -n default \
+                     -o json 2>/dev/null || echo 'null')
+              jq -cn --argjson nowe "$NOW" --argjson cm "${CM:-null}" \
+                     --argjson nl "${NL:-null}" --argjson ep "${EP:-null}" '
+                def age($t):
+                  (try ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null) as $e
+                  | (if $e == null then null else ($nowe - $e) end);
+                def lease($x):
+                  { name: $x.metadata.name,
+                    namespace: $x.metadata.namespace,
+                    holder: $x.spec.holderIdentity,
+                    acquireTime: $x.spec.acquireTime,
+                    renewTime: $x.spec.renewTime,
+                    leaseDurationSeconds: $x.spec.leaseDurationSeconds,
+                    renew_age_seconds: age($x.spec.renewTime // "") };
+                { vantage: "unskewed_observer",
+                  host: "{{ s27.observer_cp }}",
+                  sampled_at_epoch: $nowe,
+                  sampled_at: ($nowe | todate),
+                  control_leases: [ ($cm.items // [])[] | lease(.) ],
+                  node_leases:    [ ($nl.items // [])[] | lease(.) ],
+                  kubernetes_endpoint_addresses:
+                    (if $ep == null then null
+                     else [ ($ep.subsets // [])[].addresses[]?.ip ] end) }' >> "$OUT"
+              sleep {{ poll_interval | int }}
+            done
+          async: "{{ (s27.sample_seconds | int) + 120 }}"
+          poll: 0
+          delegate_to: "{{ s27.observer_cp }}"
+          run_once: true
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Start the lease sampler on the skewed control-plane node itself
+          # The negative-skew claim is about the SKEWED node's arithmetic:
+          # every other holder's renewTime lands in its future, so
+          # renew_age_seconds goes NEGATIVE here while the observer above
+          # still reports a positive age for the same object at the same
+          # instant. Two vantages, one lease, contradictory expiry — which is
+          # the observer-relative failure the paper is about. Only runs for
+          # the negative variant; etcd hosts have no kubectl or admin.conf.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            SRV="https://{{ ansible_host }}:6443"
+            OUT=/tmp/s27_lease_timeline_target.json
+            : > "$OUT"
+            END=$(( $(date +%s) + {{ s27.sample_seconds | int }} ))
+            while [ "$(date +%s)" -lt "$END" ]; do
+              NOW=$(date +%s)
+              CM=$(kubectl --server="$SRV" --request-timeout=5s get lease -n kube-system \
+                     kube-controller-manager kube-scheduler -o json 2>/dev/null || echo '{"items":[]}')
+              NL=$(kubectl --server="$SRV" --request-timeout=5s get lease -n kube-node-lease \
+                     -o json 2>/dev/null || echo '{"items":[]}')
+              jq -cn --argjson nowe "$NOW" --argjson cm "${CM:-null}" --argjson nl "${NL:-null}" '
+                def age($t):
+                  (try ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null) as $e
+                  | (if $e == null then null else ($nowe - $e) end);
+                def lease($x):
+                  { name: $x.metadata.name,
+                    namespace: $x.metadata.namespace,
+                    holder: $x.spec.holderIdentity,
+                    acquireTime: $x.spec.acquireTime,
+                    renewTime: $x.spec.renewTime,
+                    leaseDurationSeconds: $x.spec.leaseDurationSeconds,
+                    renew_age_seconds: age($x.spec.renewTime // "") };
+                { vantage: "skewed_target",
+                  host: "{{ inventory_hostname }}",
+                  sampled_at_epoch: $nowe,
+                  sampled_at: ($nowe | todate),
+                  control_leases: [ ($cm.items // [])[] | lease(.) ],
+                  node_leases:    [ ($nl.items // [])[] | lease(.) ] }' >> "$OUT"
+              sleep {{ poll_interval | int }}
+            done
+          async: "{{ (s27.sample_seconds | int) + 120 }}"
+          poll: 0
+          changed_when: false
+          ignore_errors: yes
+          when:
+            - s27_is_target | bool
+            - s27.variant == 'negative'
+            - inventory_hostname in groups['control_plane']
+
+        - name: Start the etcd lease-TTL sampler on every etcd member
+          # Substrate variant. Runs on ALL five members, skewed and unskewed
+          # alike, so the same lease's remaining TTL can be diffed across the
+          # skew boundary at the same instant. This is the storage-layer
+          # analogue of the renewTime series above: if etcd's lessor were
+          # wall-clock based, the skewed members' `ttl` would collapse (or
+          # never decrease) while the unskewed members' counts down normally.
+          shell: |
+            set -u
+            E={{ etcd_cert_dir }}
+            EP="https://{{ ansible_host }}:2379"
+            OUT=/tmp/s27_etcd_timeline.json
+            : > "$OUT"
+            ec() { ETCDCTL_API=3 etcdctl --endpoints="$EP" \
+                     --cacert=$E/ca.crt --cert=$E/server.crt --key=$E/server.key "$@"; }
+            END=$(( $(date +%s) + {{ s27.sample_seconds | int }} ))
+            while [ "$(date +%s)" -lt "$END" ]; do
+              NOW=$(date +%s)
+              ST=$(ec endpoint status --write-out=json 2>/dev/null || echo 'null')
+              # Lease IDs are read from the PLAIN etcdctl output, which prints
+              # them in hex, not from --write-out=json: an etcd lease ID is a
+              # random int64 and jq turns JSON numbers into doubles for any
+              # arithmetic, so a JSON-sourced ID can come back with its low
+              # bits rounded off and `lease timetolive` is then asked about a
+              # lease that does not exist.
+              IDS=$(ec lease list 2>/dev/null | sed -n '2,$p' | sed '/^$/d')
+              NLEASE=$(printf '%s\n' "$IDS" | awk 'NF{c++} END{print c+0}')
+              TTLS='[]'
+              for id in $(printf '%s\n' "$IDS" | head -5); do
+                T=$(ec lease timetolive "$id" --write-out=json 2>/dev/null || echo 'null')
+                TTLS=$(jq -cn --argjson a "$TTLS" --argjson t "${T:-null}" --arg id "$id" \
+                         '$a + [ (($t // {}) + {lease_id_hex: $id}) ]')
+              done
+              jq -cn --argjson nowe "$NOW" --argjson st "${ST:-null}" \
+                     --argjson nlease "${NLEASE:-0}" --argjson ttls "$TTLS" '
+                { host: "{{ inventory_hostname }}",
+                  skewed: {{ (s27_is_target | bool) | to_json }},
+                  sampled_at_epoch: $nowe,
+                  sampled_at: ($nowe | todate),
+                  lease_count: $nlease,
+                  lease_ttls: $ttls,
+                  raft_term: (($st // [])[0].Status.raftTerm // null),
+                  revision: (($st // [])[0].Status.header.revision // null),
+                  is_leader: (((($st // [])[0].Status.header.member_id // 0)
+                               == (($st // [])[0].Status.leader // -1))) }' >> "$OUT"
+              sleep {{ poll_interval | int }}
+            done
+          async: "{{ (s27.sample_seconds | int) + 120 }}"
+          poll: 0
+          changed_when: false
+          ignore_errors: yes
+          when:
+            - s27.variant == 'substrate'
+            - inventory_hostname in groups['etcd']
+
+        - name: Let the samplers establish a pre-injection baseline
+          pause:
+            seconds: "{{ (poll_interval | int) * 3 }}"
+          run_once: true
+
+        # ── Injection ────────────────────────────────────────────────────
+
+        - name: Disable NTP discipline on the targets
+          # DEVIATION from roles/fault-inject/tasks/clock-skew.yml, which only
+          # does `systemctl stop chrony/ntp/systemd-timesyncd`. On Ubuntu 24.04
+          # the active time source is systemd-timesyncd, and `timedatectl
+          # set-ntp false` is the documented lever that both stops AND disables
+          # whichever unit is registered in /usr/lib/systemd/ntp-units.d — so it
+          # covers chrony and timesyncd identically and survives anything that
+          # would otherwise re-activate the unit mid-window and silently undo
+          # the fault. The systemctl stops are kept as belt-and-braces. Nothing
+          # is masked: an unmask that failed to run would leave the node unable
+          # to discipline its clock forever, which is a worse failure than the
+          # one it guards against.
+          shell: |
+            timedatectl set-ntp false 2>/dev/null || true
+            for u in systemd-timesyncd chrony chronyd ntp ntpsec; do
+              systemctl stop "$u" 2>/dev/null || true
+            done
+            echo "NTP=$(timedatectl show -p NTP --value 2>/dev/null || echo unknown)"
+          register: s27_ntp_disabled
+          when: s27_is_target | bool
+
+        - name: Step the target clock by the signed offset
+          # Same mechanism as S4 / roles/fault-inject/tasks/clock-skew.yml:
+          # read the epoch, add the offset, `date -s "@<epoch>"`. A negative
+          # offset is valid bash arithmetic ($((t + -120))), so the backward
+          # case needs no new mechanism — only a signed magnitude.
+          shell: |
+            before=$(date +%s)
+            new=$((before + ({{ s27.offset | int }})))
+            date -s "@${new}" >/dev/null
+            after=$(date +%s)
+            echo "{\"host\": \"{{ inventory_hostname }}\", \"before_epoch\": $before, \"after_epoch\": $after, \"applied_seconds\": $((after - before))}"
+          register: s27_step
+          when: s27_is_target | bool
+
+        - name: Verify the requested skew is actually present on the target
+          # The one failure mode that would silently invalidate the whole run:
+          # the clock not moving, or NTP putting it straight back. Fatal — a
+          # run whose fault never landed must not produce invariant verdicts.
+          # The `always:` block below still restores.
+          shell: |
+            node=$(date +%s)
+            ref={{ lookup('pipe', 'date -u +%s') }}
+            echo $((node - ref))
+          register: s27_measured_skew
+          changed_when: false
+          failed_when: >-
+            ((s27_measured_skew.stdout | int) - (s27.offset | int)) | abs
+            > (s27.tolerance | int)
+          when: s27_is_target | bool
+
+        - name: Log the injected fault
+          debug:
+            msg: >-
+              FAULT INJECTED: clock stepped by {{ s27.offset }}s on
+              {{ inventory_hostname }} ({{ s27.layer }} layer);
+              measured offset vs control machine
+              {{ s27_measured_skew.stdout | default('?') }}s
+          when: s27_is_target | bool
+
+        # ── Hold for fault_duration ──────────────────────────────────────
+
+        - name: Hold the fault — first half
+          pause:
+            seconds: "{{ ((fault_duration | int) / 2) | int }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: fault_t_half }
+
+        - name: Re-measure the skew mid-window
+          # Proves the fault HELD rather than being quietly re-disciplined.
+          # Recorded, not fatal: by this point the fault has already had its
+          # effect on the first half of the window and the data is worth
+          # keeping either way. `held` in clock_skew_efficacy.json says which.
+          shell: |
+            node=$(date +%s)
+            ref={{ lookup('pipe', 'date -u +%s') }}
+            echo $((node - ref))
+          register: s27_midwindow_skew
+          changed_when: false
+          failed_when: false
+          when: s27_is_target | bool
+
+        - name: Hold the fault — second half
+          pause:
+            seconds: "{{ ((fault_duration | int) / 2) | int }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: fault_t_end }
+
+      always:
+
+        # ── Restore — runs whatever happened above ───────────────────────
+
+        - name: Save the injection-efficacy proof
+          # Written from `always:`, not from the block: the case where
+          # this record matters most is the one where the injection
+          # verification FAILED, and a task at the end of the block would
+          # never run in that case. Every field defaults, so it is
+          # writable at any point the block aborted.
+          copy:
+            dest: "{{ results_dir }}/clock_skew_efficacy.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "variant": {{ s27.variant | to_json }},
+                "requested_offset_seconds": {{ s27.offset | int }},
+                "tolerance_seconds": {{ s27.tolerance | int }},
+                "targets": [
+                {% for h in (groups['s27_skew_targets'] | default([])) %}
+                  {
+                    "host": {{ h | to_json }},
+                    "step": {{ hostvars[h]['s27_step']['stdout'] | default('null', true) }},
+                    "measured_offset_at_injection": {{ hostvars[h]['s27_measured_skew']['stdout'] | default('null', true) }},
+                    "measured_offset_midwindow": {{ hostvars[h]['s27_midwindow_skew']['stdout'] | default('null', true) }},
+                    "held": {{ ((((hostvars[h]['s27_midwindow_skew']['stdout'] | default(0) | int) - (s27.offset | int)) | abs) <= (s27.tolerance | int)) | to_json }}
+                  }{% if not loop.last %},{% endif %}
+
+                {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Step the target clock back to the control machine's epoch
+          # NOT `date -s "@$((now - offset))"`. Subtracting the offset back
+          # re-applies the same arithmetic to a clock that has been running
+          # free for the whole window, so it inherits every second of drift
+          # the unsynchronised node accumulated — and it compounds if the
+          # scenario is re-run. An ABSOLUTE step to a freshly-read control
+          # machine epoch cannot drift: the only error is SSH transit, which
+          # the tolerance below covers and NTP then removes.
+          #
+          # The step happens BEFORE NTP is re-enabled, so nothing is fighting
+          # it; NTP then disciplines an already-almost-correct clock instead
+          # of having to make a 120 s correction of its own.
+          shell: |
+            date -s "@{{ lookup('pipe', 'date -u +%s') }}" >/dev/null
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          register: s27_hard_step
+          when: s27_is_target | bool
+
+        - name: Re-enable NTP discipline and force a step
+          shell: |
+            timedatectl set-ntp true 2>/dev/null || true
+            systemctl start systemd-timesyncd 2>/dev/null || true
+            systemctl start chrony 2>/dev/null || systemctl start chronyd 2>/dev/null || true
+            # chrony only steps on demand; timesyncd steps on its next poll,
+            # which a restart brings forward to now.
+            chronyc makestep 2>/dev/null || true
+            systemctl restart systemd-timesyncd 2>/dev/null || true
+            echo "NTP=$(timedatectl show -p NTP --value 2>/dev/null || echo unknown)"
+          register: s27_ntp_restored
+          when: s27_is_target | bool
+
+        - name: VERIFY the target clock agrees with the control machine
+          # The safety property. Absolute difference between the node's epoch
+          # and the control machine's epoch, retried while NTP settles. If it
+          # never converges the task fails, the play fails, and
+          # run-all-scenarios aborts — which is correct: a node with a wrong
+          # clock silently corrupts every later scenario, so the sweep must
+          # stop rather than continue producing data nobody can trust.
+          shell: |
+            node=$(date +%s)
+            ref={{ lookup('pipe', 'date -u +%s') }}
+            d=$((node - ref))
+            if [ "$d" -lt 0 ]; then d=$((-d)); fi
+            echo "$d"
+          register: s27_restore_check
+          changed_when: false
+          until: (s27_restore_check.stdout | default('99999') | int) <= (s27.tolerance | int)
+          retries: 6
+          delay: 10
+          # Not fatal HERE. A failing task inside `always:` stops the rest of
+          # the always block for that host, which would skip the task that
+          # writes clock_restore_verification.json — losing the evidence in
+          # exactly the run where it is needed. The measurement is recorded
+          # first and the loud failure is raised at the end of the block.
+          ignore_errors: yes
+          when: s27_is_target | bool
+
+        - name: VERIFY NTP discipline is active again on the target
+          shell: |
+            if [ "$(timedatectl show -p NTP --value 2>/dev/null)" = "yes" ]; then
+              echo yes
+            elif systemctl is-active --quiet systemd-timesyncd \
+              || systemctl is-active --quiet chrony \
+              || systemctl is-active --quiet chronyd; then
+              echo yes
+            else
+              echo no
+            fi
+          register: s27_ntp_state
+          changed_when: false
+          failed_when: false      # recorded here, asserted at the end
+          when: s27_is_target | bool
+
+        - name: Record the restore verification
+          copy:
+            dest: "{{ results_dir }}/clock_restore_verification.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "variant": {{ s27.variant | to_json }},
+                "tolerance_seconds": {{ s27.tolerance | int }},
+                "targets": [
+                {% for h in (groups['s27_skew_targets'] | default([])) %}
+                  {
+                    "host": {{ h | to_json }},
+                    "restored_utc": {{ (hostvars[h]['s27_hard_step']['stdout'] | default('')) | to_json }},
+                    "residual_offset_seconds": {{ hostvars[h]['s27_restore_check']['stdout'] | default('null', true) }},
+                    "within_tolerance": {{ (((hostvars[h]['s27_restore_check']['stdout'] | default(99999) | int)) <= (s27.tolerance | int)) | to_json }},
+                    "ntp_active": {{ ((hostvars[h]['s27_ntp_state']['stdout'] | default('no') | trim) == 'yes') | to_json }}
+                  }{% if not loop.last %},{% endif %}
+
+                {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Log restore outcome
+          debug:
+            msg: >-
+              CLOCK RESTORED on {{ inventory_hostname }}: residual offset
+              {{ s27_restore_check.stdout | default('?') }}s
+              (tolerance {{ s27.tolerance }}s), NTP
+              {{ s27_ntp_state.stdout | default('?') | trim }}
+          when: s27_is_target | bool
+
+        - name: FAIL LOUDLY if the clock did not come back
+          # The safety property, enforced. A node whose clock is still wrong
+          # silently corrupts every later scenario in the sweep, and both
+          # certificate validation and etcd lease arithmetic across the whole
+          # cluster depend on it — so this aborts the play, and with it
+          # run-all-scenarios, rather than letting the sweep continue.
+          assert:
+            that:
+              - (s27_restore_check.stdout | default('99999') | int) <= (s27.tolerance | int)
+              - (s27_ntp_state.stdout | default('no') | trim) == 'yes'
+            fail_msg: >-
+              CLOCK NOT RESTORED on {{ inventory_hostname }}: residual offset
+              {{ s27_restore_check.stdout | default('unknown') }}s against the
+              control machine (tolerance {{ s27.tolerance }}s), NTP discipline
+              '{{ s27_ntp_state.stdout | default('unknown') | trim }}'.
+              Fix this host before running ANY further scenario — re-run
+              `timedatectl set-ntp true` and confirm `timedatectl status`
+              reports "System clock synchronized: yes", or revert the fleet
+              with scripts/revert-baseline.sh --yes. The sampler output is
+              still on the remote hosts at /tmp/s27_lease_timeline_*.json and
+              /tmp/s27_etcd_timeline.json if this run's data is worth keeping.
+            success_msg: >-
+              clock restored on {{ inventory_hostname }} (residual
+              {{ s27_restore_check.stdout | default('?') }}s, NTP active)
+          when: s27_is_target | bool
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Observation window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    s27: "{{ hostvars[groups['observer'][0]]['s27_cfg'] }}"
+  tasks:
+    - name: Observe — first quarter of the observation window
+      pause:
+        seconds: "{{ ((observation_window | int) / 4) | int }}"
+      run_once: true
+
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_restore_t_early }
+
+    - name: Observe — remainder of the observation window
+      pause:
+        seconds: "{{ (observation_window | int) - (((observation_window | int) / 4) | int) }}"
+      run_once: true
+
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_restore_t_end }
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Collect the lease and etcd timelines
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    s27: "{{ hostvars[groups['observer'][0]]['s27_cfg'] }}"
+  tasks:
+    - name: Stop the samplers (their window has elapsed; kill any stragglers)
+      shell: |
+        pkill -f s27_lease_timeline 2>/dev/null || true
+        pkill -f s27_etcd_timeline 2>/dev/null || true
+        exit 0
+      changed_when: false
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Fetch the unskewed-observer lease timeline
+      fetch:
+        src: /tmp/s27_lease_timeline_observer.json
+        dest: "{{ results_dir }}/lease_timeline_observer.jsonl"
+        flat: yes
+      delegate_to: "{{ s27.observer_cp }}"
+      run_once: true
+      ignore_errors: yes
+
+    - name: Fetch the skewed-target lease timeline
+      fetch:
+        src: /tmp/s27_lease_timeline_target.json
+        dest: "{{ results_dir }}/lease_timeline_target_{{ inventory_hostname }}.jsonl"
+        flat: yes
+      when: inventory_hostname in (groups['s27_skew_targets'] | default([]))
+      ignore_errors: yes
+
+    - name: Fetch the per-member etcd lease-TTL timelines
+      fetch:
+        src: /tmp/s27_etcd_timeline.json
+        dest: "{{ results_dir }}/etcd_timeline_{{ inventory_hostname }}.jsonl"
+        flat: yes
+      when:
+        - s27.variant == 'substrate'
+        - inventory_hostname in groups['etcd']
+      ignore_errors: yes
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Fleet-wide clock audit
+  # Independent of the per-target verification in the always: block above.
+  # That one proves the hosts THIS run touched came back; this one proves no
+  # host in the lab is carrying a wrong clock into the next scenario,
+  # including collateral from an earlier aborted run. Fails loudly.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s27
+    s27: "{{ hostvars[groups['observer'][0]]['s27_cfg'] }}"
+  tasks:
+    - name: Measure every node's offset against the control machine
+      shell: |
+        node=$(date +%s)
+        ref={{ lookup('pipe', 'date -u +%s') }}
+        d=$((node - ref))
+        a=$d
+        if [ "$a" -lt 0 ]; then a=$((-a)); fi
+        echo "{\"host\": \"{{ inventory_hostname }}\", \"offset_seconds\": $d, \"abs_offset_seconds\": $a}"
+      register: s27_offset_post
+      changed_when: false
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Save the post-run clock audit
+      copy:
+        dest: "{{ results_dir }}/clock_audit_postrun.json"
+        content: |
+          [
+          {% for host in groups['control_plane'] + groups['workers'] + groups['etcd'] %}
+            {{ hostvars[host]['s27_offset_post']['stdout'] | default('null', true) }}{% if not loop.last %},{% endif %}
+
+          {% endfor %}
+          ]
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Every node's clock must agree with the control machine
+      assert:
+        that:
+          - (s27_offset_post.stdout | default('', true) | length) > 0
+          - ((s27_offset_post.stdout | default('{}', true) | from_json).abs_offset_seconds
+             | default(99999) | int) <= (s27.tolerance | int)
+        fail_msg: >-
+          CLOCK NOT RESTORED on {{ inventory_hostname }}:
+          {{ (s27_offset_post.stdout | default('{}', true) | from_json).abs_offset_seconds | default('unknown') }}s
+          from the control machine (tolerance {{ s27.tolerance }}s). Do NOT run
+          further scenarios until this node is re-synchronised — every later
+          result would inherit the skew.
+        success_msg: "clock OK on {{ inventory_hostname }}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s27
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: r
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ r.stdout }}"
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ r.stdout }}"

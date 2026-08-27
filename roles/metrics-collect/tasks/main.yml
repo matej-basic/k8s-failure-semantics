@@ -245,7 +245,10 @@
 
 - name: Collect kubelet node status from each node
   shell: |
-    curl -sk https://127.0.0.1:10250/stats/summary \
+    # --max-time is load-bearing: a SIGSTOPped kubelet (S22) still completes
+    # the TCP handshake in the kernel and then never answers, so an unbounded
+    # curl blocks for the whole freeze. ignore_errors cannot rescue a hang.
+    curl -sk --max-time 5 https://127.0.0.1:10250/stats/summary \
       --cert /var/lib/kubelet/pki/kubelet-client-current.pem \
       --key /var/lib/kubelet/pki/kubelet-client-current.pem \
       2>/dev/null | jq '{node: .node.nodeName, cpu: .node.cpu, memory: .node.memory}' \

@@ -495,8 +495,19 @@ and is one of the most common real etcd outages.
 Register a validating webhook with `failurePolicy: Fail` pointing at an endpoint
 that black-holes. A completely healthy cluster that cannot act. Then repeat with
 `failurePolicy: Ignore` and compare: same fault, opposite failure semantics,
-selected by one field. That contrast is a strong result on its own and needs no
-network manipulation at all.
+selected by one field. That contrast is a strong result on its own.
+
+*Implementation note:* the original claim here was "needs no network
+manipulation at all". That turned out to be wrong. An unassigned address on a
+directly-connected /24 does not black-hole — ARP fails and `connect()` returns
+EHOSTUNREACH in ~3 s (measured: curl exit 7 after 3071 ms from cp2), so the
+call never reaches the admission timeout path it is supposed to exercise. A
+`blackhole` route does not help either: the kernel maps `RTN_BLACKHOLE` to
+`-EINVAL` for locally-originated packets, which fails even faster. The
+scenario therefore installs one `iptables OUTPUT ... -j DROP` rule, because
+the OUTPUT hook runs before neighbour resolution, so the SYN is discarded
+silently and TCP retransmits until `timeoutSeconds` fires. It is still the
+cheapest scenario in the suite, but it is no longer zero-network-manipulation.
 
 ### S25 — API priority-and-fairness starvation
 Flood the API server with a low-priority client until controllers receive 429s.

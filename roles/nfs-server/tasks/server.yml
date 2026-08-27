@@ -1,0 +1,61 @@
+---
+# roles/nfs-server/tasks/server.yml
+# Runs only on nfs_server_host.
+
+- name: Install the NFS kernel server
+  apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: yes
+  register: nfs_pkg
+  retries: 3
+  delay: 10
+  until: nfs_pkg is succeeded
+
+- name: Reset the export directory
+  # Off by default (see nfs_reset_export in defaults/main.yml).
+  file:
+    path: "{{ nfs_export_path }}"
+    state: absent
+  when: nfs_reset_export | bool
+
+- name: Ensure the exported directory exists
+  file:
+    path: "{{ nfs_export_path }}"
+    state: directory
+    owner: root
+    group: root
+    # World-writable on purpose. Two containers with different uids write here
+    # (postgres runs as uid 999, the divergence writer as root) and there is no
+    # shared group to grant. This is an isolated lab network with no data of
+    # any value on it.
+    mode: '0777'
+
+- name: Declare the export
+  copy:
+    dest: /etc/exports.d/k8s-failure-semantics.exports
+    mode: '0644'
+    content: |
+      # Managed by roles/nfs-server — edits here are overwritten.
+      {{ nfs_export_path }} {{ nfs_export_clients }}({{ nfs_export_options }})
+  notify: reload nfs exports
+
+- name: Enable and start the NFS server
+  systemd:
+    name: nfs-kernel-server
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Apply the export table now
+  # The handler only fires when the export file changed; on a first run the
+  # service may have started before the file existed, so re-export
+  # unconditionally. exportfs -ra is idempotent.
+  command: exportfs -ra
+  changed_when: false
+
+- name: Verify the export is being served
+  command: exportfs -s
+  register: nfs_exportfs
+  changed_when: false
+  failed_when: nfs_export_path not in nfs_exportfs.stdout

@@ -1,0 +1,5 @@
+---
+# roles/nfs-server/handlers/main.yml
+
+- name: reload nfs exports
+  command: exportfs -ra

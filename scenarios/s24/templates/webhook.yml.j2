@@ -1,0 +1,132 @@
+# scenarios/s24/templates/webhook.yml.j2
+# The S24 fault, in one object.
+#
+# The ONLY thing that differs between the two halves of the scenario is
+# `failurePolicy` — rendered from s24_failure_policy, which the playbook
+# loops over as ["Fail", "Ignore"]. Endpoint, timeout, rules, selectors and
+# the object name are byte-identical in both halves, so any difference the
+# run measures is attributable to that single field and nothing else.
+#
+# ── Why this cannot wedge the control plane (or its own removal) ────────────
+# A `failurePolicy: Fail` webhook is a live footgun: if it intercepts a
+# resource the control plane itself must write, every controller that writes
+# that resource stalls, and if it intercepts admissionregistration.k8s.io it
+# can block the very API call that would remove it. Four independent guards
+# keep this one inert outside its probe:
+#
+#   1. operations: ["CREATE"] only. DELETE and UPDATE are never intercepted,
+#      so `kubectl delete validatingwebhookconfiguration` — and the deletion
+#      of every object inside the probe namespace — is untouched by
+#      construction. The removal path can never be admission-blocked.
+#   2. apiGroups: [""] / resources: [configmaps, pods] only. The
+#      admissionregistration.k8s.io group is not in the rule set, so this
+#      webhook cannot intercept the creation or replacement of itself or of
+#      any other webhook configuration. Nor can it touch nodes, leases,
+#      endpointslices or events — the objects kubelet heartbeats, leader
+#      election and endpoint publication depend on.
+#   3. namespaceSelector. Only a namespace carrying the label
+#      `{{ s24_probe_label_key }}: "true"` is in scope, and the scenario puts that
+#      label on exactly one namespace it created ({{ s24_probe_ns }}) and
+#      deletes. kube-system, kube-public and default are all out of scope, so
+#      no system component's CREATE traffic passes through the black hole.
+#   4. objectSelector. Within that namespace, only objects that themselves
+#      carry the same label are intercepted. This matters concretely: the
+#      root-CA publisher controller CREATEs a `kube-root-ca.crt` ConfigMap in
+#      every new namespace, and with `Fail` and no objectSelector that
+#      controller would hot-loop against the black hole for the life of the
+#      fault. It carries no probe label, so it is never intercepted.
+#
+# Guards 1 and 2 alone are sufficient for the removal path; 3 and 4 keep the
+# blast radius down to the objects the scenario deliberately creates.
+#
+# ── Why the endpoint black-holes rather than refuses ────────────────────────
+# clientConfig.url points at {{ s24_blackhole_url }}. Two things make that a
+# black hole, and only the second one actually does the work.
+#
+#   (a) The address is unassigned. It sits on the cluster's pod-network
+#       segment (192.168.200.0/24; terraform/main.tf: "the pod network is
+#       used by this cluster alone", VMs occupy .49-.61 only), so no listener
+#       exists to send an RST and no host will ever claim it. This is defence
+#       in depth: if the DROP below somehow failed to install, the webhook
+#       still cannot reach a real service.
+#
+#   (b) The scenario installs an explicit `iptables -I OUTPUT -d <ip> -p tcp
+#       --dport <port> -j DROP` on every control-plane node before the
+#       webhook is registered, and removes it in the playbook's `always`
+#       block. THIS is what produces a timeout.
+#
+# (a) alone is NOT sufficient, and the first version of this scenario was
+# wrong about that. Measured on the live cluster from cp1 and cp2 — the exact
+# hosts and network namespace the API server dials from, since kube-apiserver
+# is a hostNetwork static pod:
+#
+#     curl exit=7 (CURLE_COULDNT_CONNECT) after 3071 ms   from cp2
+#     curl exit=7 (CURLE_COULDNT_CONNECT) after 3095 ms   from cp1
+#
+# not exit=28 (CURLE_OPERATION_TIMEDOUT). The address is on a directly
+# connected /24 with no router on the segment, so the kernel has to resolve
+# it by ARP; nothing answers, neighbour resolution gives up after ~3 s and
+# connect() returns EHOSTUNREACH. The call fails fast with a *connection
+# error* and `timeoutSeconds` is never reached. That is a different fault
+# from the one this scenario is named for, and it would have made the
+# recorded latencies mean something other than what the header claimed.
+#
+# An `ip route add blackhole <ip>/32` does not fix it either, and is worse:
+# for locally generated traffic the kernel's fib_props table maps
+# RTN_BLACKHOLE to -EINVAL (RTN_UNREACHABLE to -EHOSTUNREACH, RTN_PROHIBIT to
+# -EACCES), so connect() fails *immediately* rather than after the ARP
+# timeout. A blackhole route silently discards packets it is *forwarding*;
+# it errors out packets the host itself originates.
+#
+# A netfilter DROP is different because of where it sits in the transmit
+# path: ip_local_out() runs the OUTPUT hook BEFORE ip_finish_output2() does
+# neighbour resolution. The SYN is discarded before ARP is ever attempted, no
+# error is returned to the socket, and TCP simply retransmits until something
+# above it gives up. The something above it is the API server's own admission
+# deadline — i.e. exactly `timeoutSeconds` below. The playbook asserts this at
+# inject time (curl must exit 28, not 7) so the mechanism can never silently
+# regress to (a) again.
+#
+# This is also why the endpoint is not a Service with no ready backends:
+# kube-proxy installs an explicit REJECT rule for a ClusterIP with no
+# endpoints, which comes back as "connection refused" in milliseconds — the
+# same class of failure as the ARP case, and equally not a timeout.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ s24_webhook_name }}
+  labels:
+    scenario: s24
+    # Teardown deletes by this label as well as by name, so a webhook left by
+    # a partially-failed run is still removed even if the name ever changes.
+    fault-inject: "s24"
+webhooks:
+  - name: blackhole.s24.failure-semantics.local
+    admissionReviewVersions: ["v1"]
+    sideEffects: "None"
+    matchPolicy: Equivalent
+    # ── the one field under test ──
+    failurePolicy: {{ s24_failure_policy }}
+    # Explicit, and short enough that a rejected request returns well inside
+    # kubectl's --request-timeout. Note that BOTH halves pay this latency:
+    # the API server waits the full timeout either way and only then consults
+    # failurePolicy to decide whether to reject or continue. The scenario
+    # records the latency of both so that cost is visible, not assumed.
+    timeoutSeconds: {{ s24_webhook_timeout }}
+    clientConfig:
+      # No caBundle: with a url-based clientConfig the API server falls back
+      # to the host trust roots. Irrelevant here — the TCP connection never
+      # completes, so TLS is never negotiated.
+      url: "{{ s24_blackhole_url }}"
+    namespaceSelector:
+      matchLabels:
+        {{ s24_probe_label_key }}: "true"
+    objectSelector:
+      matchLabels:
+        {{ s24_probe_label_key }}: "true"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["configmaps", "pods"]
+        scope: "Namespaced"

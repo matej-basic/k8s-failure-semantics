@@ -1,0 +1,639 @@
+---
+# scenarios/s24/playbook.yml
+# S24: Admission webhook timeout — a completely healthy cluster that cannot act
+#
+# What it does:
+#   Registers one ValidatingWebhookConfiguration whose clientConfig points at
+#   an address on the pod-network segment that nothing owns, and installs a
+#   single-destination iptables DROP on the control-plane nodes so packets to
+#   that address vanish instead of erroring. The API server's admission call
+#   is therefore swallowed and expires against its own timeoutSeconds.
+#
+#   That one DROP rule is the entire substrate footprint: no tc qdisc, no
+#   clock change, no process killed, no etcd member disturbed, and it matches
+#   a single IP and port that nothing else on the cluster ever addresses. Every
+#   node stays Ready, every etcd member stays healthy, every existing workload
+#   keeps serving. The cluster is, by every health check the suite runs,
+#   fine — and for the objects in scope it cannot perform a write.
+#
+#   (An earlier version of this scenario relied on the address being
+#   unassigned and installed no rule at all. Measured from cp1 and cp2, that
+#   fails in ~3.1 s with EHOSTUNREACH from failed ARP — curl exit 7, not 28 —
+#   so the timeout path was never exercised. templates/webhook.yml.j2 has the
+#   full mechanism, the measurements, and why an `ip route add blackhole`
+#   would have been worse rather than better.)
+#
+#   The scenario then runs that identical fault twice, changing exactly one
+#   field:
+#     half 1  failurePolicy: Fail    — the write is rejected
+#     half 2  failurePolicy: Ignore  — the write succeeds
+#   Same broken endpoint, same timeout, same rules, same selectors, same
+#   object name. One field selects between "the cluster refuses to act" and
+#   "the cluster acts as though the check had passed". That contrast IS the
+#   result; a run that only did Fail would show a failure, not a semantics.
+#
+# What we measure:
+#   - Whether the intercepted CREATE is rejected (Fail) or admitted (Ignore),
+#     recorded from a real kubectl attempt in each half, not inferred.
+#   - The latency of both. The API server dials the black hole, gets nothing
+#     back, and abandons the call at its own timeoutSeconds — and it does that
+#     in BOTH halves, because failurePolicy is only consulted once the call
+#     has already failed. So Ignore does not make the fault cheap, it makes it
+#     non-fatal, and the two latencies should be close to each other and close
+#     to timeoutSeconds. This is a claim about the mechanism, so the scenario
+#     does not take it on trust: at inject time it probes the black hole from
+#     every control-plane node and asserts the probe timed out (curl exit 28)
+#     rather than erroring (exit 7), recording the evidence in
+#     blackhole_verification.json. If that assertion ever fails, the latency
+#     numbers would be measuring ARP giving up rather than admission timing
+#     out, and the run stops instead of reporting them.
+#   - An unintercepted control write in `default`, in each half, to establish
+#     that the cluster is healthy and fast for everything out of scope. This
+#     is what separates "cannot act" from "is broken".
+#   - Whether any node changes Ready status, any lease changes hands, any etcd
+#     member drops, or the service probe degrades — all expected to be NO,
+#     which is the point. The suite's existing invariant checks run over the
+#     snapshots as usual.
+#
+# Relationship to the rest of the suite:
+#   Every other scenario reaches its failure through the substrate — a
+#   partition, a delay, a skewed clock, a lost quorum. This one reaches it
+#   through the API's own extension point, and is the cheapest scenario in the
+#   suite to run: ~5 minutes, and the only substrate change is one DROP rule
+#   for one address that nothing else talks to, so there is nothing here that
+#   can leave a node in a bad state.
+#
+# ── Safety ─────────────────────────────────────────────────────────────────
+# A `failurePolicy: Fail` webhook left registered would break the cluster for
+# every later scenario in the sweep, so teardown is structural rather than
+# best-effort: the whole scenario is one block/always, and the always section
+# removes the webhook configuration, the black-hole rule and the probe
+# namespace from EVERY control-plane node independently, so no single
+# unreachable node can strand
+# the fault. The webhook's own scoping (see templates/webhook.yml.j2) means
+# its removal path — DELETE on admissionregistration.k8s.io — is not in its
+# own rule set and therefore cannot be blocked by it.
+
+- name: S24 — Admission webhook timeout (failurePolicy Fail vs Ignore)
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s24
+    scenario_name: "Admission webhook timeout — failurePolicy Fail vs Ignore"
+
+    # Control-plane node kubectl runs on. cp2 (control_plane[1]) rather than
+    # cp1, matching metrics-collect's default vantage point: cp1 holds the
+    # keepalived VIP, is the busiest node, and its sshd intermittently
+    # rejects bursty connections (see the header of scenarios/s2/playbook.yml).
+    # This scenario injects no network fault, so any control-plane node would
+    # work; consistency with the rest of the suite is the only reason.
+    s24_kubectl_host: "{{ groups['control_plane'][1] }}"
+
+    # The blast-radius fence. This namespace is created by the scenario,
+    # carries the probe label, and is deleted unconditionally in `always`.
+    s24_probe_ns: s24-webhook-probe
+    s24_probe_label_key: s24-admission-probe
+
+    s24_webhook_name: s24-blackhole-webhook
+    s24_webhook_timeout: 10
+
+    # The black hole. Two parts, both required — see the long note in
+    # templates/webhook.yml.j2.
+    #
+    # The address: an unassigned host on the pod-network segment.
+    # terraform/main.tf gives the VMs octets .49–.61 on 192.168.200.0/24 and
+    # states "the pod network is used by this cluster alone", so .250 belongs
+    # to nothing and never will. Deliberately NOT on the shared management
+    # network 10.0.0.0/24, where .50 is already an unrelated host and other
+    # octets may be claimed at any time. On its own this is only defence in
+    # depth: an unassigned address on a directly connected segment fails ARP
+    # and returns EHOSTUNREACH in ~3 s, which is a connection error, not a
+    # timeout.
+    #
+    # The rule: a DROP for exactly this destination and port, installed on the
+    # control-plane nodes at inject time and removed in `always`. Netfilter's
+    # OUTPUT hook runs before neighbour resolution, so the SYN disappears with
+    # no error returned to the socket and the API server's admission call runs
+    # out its own timeoutSeconds. Matching on the port as well as the address
+    # keeps the rule as narrow as it can possibly be.
+    s24_blackhole_ip: "192.168.200.250"
+    s24_blackhole_port: 8443
+    s24_blackhole_url: "https://{{ s24_blackhole_ip }}:{{ s24_blackhole_port }}/validate"
+    # Every rule the scenario installs carries this comment, so teardown can
+    # find and remove residue by string match even if the rule spec drifts.
+    s24_blackhole_comment: "fault-inject-s24-blackhole"
+
+  tasks:
+    - block:
+
+        # ── Pre-flight ─────────────────────────────────────────────────────
+        - name: Create results directory
+          file:
+            path: "{{ results_dir }}"
+            state: directory
+            mode: '0755'
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Verify every node is Ready before the scenario starts
+          # `grep -v " Ready"` with the leading space, not `grep -v Ready`:
+          # "NotReady" contains "Ready" as a substring, so the unanchored
+          # form silently discards exactly the lines it is looking for.
+          shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
+          register: s24_not_ready
+          delegate_to: "{{ s24_kubectl_host }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          failed_when: s24_not_ready.stdout | int > 0
+
+        - name: Remove any S24 webhook left behind by an earlier run
+          # Idempotence at the front as well as the back: if a previous run
+          # was killed between injection and teardown, a Fail webhook could
+          # still be registered, and the baseline snapshot would then be
+          # taken against an already-faulted cluster.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl delete validatingwebhookconfiguration {{ s24_webhook_name }} \
+              --ignore-not-found --timeout=30s
+            kubectl delete validatingwebhookconfiguration -l fault-inject=s24 \
+              --ignore-not-found --timeout=30s
+            kubectl delete namespace {{ s24_probe_ns }} \
+              --ignore-not-found --timeout=120s
+          delegate_to: "{{ s24_kubectl_host }}"
+          run_once: true
+
+        - name: Create the probe namespace and label it into the webhook's scope
+          # The namespace is created BEFORE the webhook is registered, so the
+          # root-CA publisher's kube-root-ca.crt ConfigMap CREATE happens
+          # while nothing is intercepting. (The objectSelector would exclude
+          # it in any case — this is the second of two independent guards.)
+          shell: kubectl apply -f -
+          args:
+            stdin: |
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: {{ s24_probe_ns }}
+                labels:
+                  {{ s24_probe_label_key }}: "true"
+                  scenario: s24
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          delegate_to: "{{ s24_kubectl_host }}"
+          run_once: true
+
+        - name: Wait for the probe namespace to be Active
+          shell: |
+            kubectl get namespace {{ s24_probe_ns }} \
+              -o jsonpath='{.status.phase}' | grep -q Active
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          register: s24_ns_ready
+          until: s24_ns_ready.rc == 0
+          retries: 20
+          delay: 3
+          delegate_to: "{{ s24_kubectl_host }}"
+          run_once: true
+
+        # ── Baseline ───────────────────────────────────────────────────────
+        - name: Baseline snapshot (no webhook registered)
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: pre_fault
+
+        # ── Fault-efficacy declaration (D6) ────────────────────────────────
+        - name: Declare what this fault must observably do
+          # Written directly rather than through roles/fault-inject, because
+          # this scenario injects nothing on any host — there is no fault type
+          # for it in that role's dispatcher, and adding one would mean
+          # editing shared files.
+          #
+          # Choosing a signal is genuinely awkward here, and the awkwardness
+          # is itself a finding. The existing vocabulary
+          # (target_node_status_changed, node_status_changed,
+          # lease_holder_changed, etcd_members_dropped, probe_degraded,
+          # placement_changed, api_view_lost) is built around a substrate that
+          # visibly breaks. S24 breaks nothing in the substrate ON PURPOSE:
+          # no node changes Ready, no lease moves, no etcd member drops, the
+          # in-cluster service probe keeps returning 200, and every API server
+          # keeps answering. A scenario that asserted any of those would
+          # assert its own failure.
+          #
+          # placement_changed is the one signal this fault can legitimately
+          # move, and only because of how the halves are built: the Ignore
+          # half CREATEs a Pod that admission lets through, it starts, and a
+          # new CONTAINER_RUNNING entry appears in the node-local crictl view
+          # that check-invariants.sh diffs against the baseline. So
+          # placement_changed firing means "the run reached the point where a
+          # workload was actually admitted and placed" — i.e. the second half
+          # ran and the comparison exists. It does NOT, on its own, evidence
+          # the Fail half's rejection.
+          #
+          # placement_changed is therefore necessary but not sufficient: it is
+          # a liveness check on the run, not proof of the result. The proof is
+          # this scenario's own artefact, admission_comparison.json, where the
+          # same CREATE is recorded as rejected under Fail and created under
+          # Ignore with the cluster healthy throughout. The suite has no
+          # efficacy signal that can express "an in-scope write was rejected
+          # by admission while every substrate signal stayed nominal"; that
+          # gap is reported for central registration rather than papered over
+          # by weakening this declaration or editing the shared defaults.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "fault_type": "admission_webhook_timeout",
+                "efficacy": {
+                  "target_node": "",
+                  "require": ["placement_changed"]
+                }
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── Install the black hole ─────────────────────────────────────────
+        # Before either half registers a webhook, so the endpoint is already
+        # swallowing packets the moment the first admission call is made, and
+        # once for both halves rather than per-half: the rule is inert on its
+        # own — nothing on this cluster addresses 192.168.200.250:8443 except
+        # the webhook this scenario registers — so leaving it up between the
+        # halves changes nothing and halves the number of things teardown has
+        # to reverse.
+        - name: Install the packet black hole on every API server
+          # On the control-plane nodes only. kube-apiserver is a hostNetwork
+          # static pod, so it dials the webhook from the node's own network
+          # namespace and its packets traverse this OUTPUT chain. No other
+          # component calls admission webhooks, so workers and etcd members
+          # need no rule.
+          #
+          # `action: insert` rather than append: kube-proxy owns rules near
+          # the top of OUTPUT, and while none of them can match a
+          # non-service address, putting ours first means no future chain
+          # rearrangement can short-circuit it.
+          iptables:
+            chain: OUTPUT
+            destination: "{{ s24_blackhole_ip }}"
+            protocol: tcp
+            destination_port: "{{ s24_blackhole_port }}"
+            jump: DROP
+            action: insert
+            comment: "{{ s24_blackhole_comment }}"
+            state: present
+          when: inventory_hostname in groups['control_plane']
+
+        - name: Probe the black hole from every API server
+          # The assertion that the first version of this scenario needed and
+          # did not have. curl runs on the control-plane node itself, in the
+          # same network namespace and through the same OUTPUT chain as
+          # kube-apiserver, so this measures the exact path the admission call
+          # will take — not an approximation of it.
+          #
+          #   exit 28 (CURLE_OPERATION_TIMEDOUT)  packets are being dropped
+          #                                       silently: correct.
+          #   exit 7  (CURLE_COULDNT_CONNECT)     the kernel returned an error
+          #                                       (failed ARP -> EHOSTUNREACH,
+          #                                       or a blackhole route ->
+          #                                       EINVAL). Fails fast, never
+          #                                       reaches timeoutSeconds, and
+          #                                       is NOT the fault this
+          #                                       scenario claims to inject.
+          #
+          # --max-time 8 is comfortably past the ~3.1 s at which the unruled
+          # address gave up on ARP, so the two cases cannot be confused.
+          # ignore_errors here and assert separately below, so the evidence
+          # file is written even when the assertion is going to fail.
+          shell: |
+            set -u
+            START=$(date +%s%3N)
+            curl -sk --max-time 8 -o /dev/null \
+              "https://{{ s24_blackhole_ip }}:{{ s24_blackhole_port }}/validate"
+            RC=$?
+            END=$(date +%s%3N)
+            jq -cn \
+              --arg host "{{ inventory_hostname }}" \
+              --argjson rc "$RC" \
+              --argjson ms "$((END - START))" \
+              '{host: $host, curl_exit: $rc, elapsed_ms: $ms,
+                blackholed: ($rc == 28),
+                interpretation:
+                  (if $rc == 28 then "silently dropped - reaches the webhook timeout path"
+                   elif $rc == 7 then "connection error, not a black hole - the DROP rule is not in effect"
+                   elif $rc == 0 then "something answered - the address is not free"
+                   else "unexpected curl exit" end)}'
+          when: inventory_hostname in groups['control_plane']
+          register: s24_blackhole_probe
+          ignore_errors: yes
+
+        - name: Save the black-hole verification
+          copy:
+            dest: "{{ results_dir }}/blackhole_verification.json"
+            content: |
+              [
+              {% for h in groups['control_plane'] %}
+                {{ hostvars[h].s24_blackhole_probe.stdout | default('{"host": "' ~ h ~ '", "error": "probe_did_not_run"}') }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+              ]
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Assert the black hole drops silently rather than erroring
+          # Hard stop. If this fires, the scenario would still produce a
+          # Fail/Ignore contrast — the webhook call fails either way — but the
+          # recorded latencies would be measuring a connection error instead
+          # of an admission timeout, and S24 would be quietly reporting a
+          # different fault than the one it is named for.
+          assert:
+            that:
+              - "((s24_blackhole_probe.stdout | default('{}') | from_json).curl_exit | default(-1)) == 28"
+            fail_msg: >-
+              S24 black hole is not black-holing on {{ inventory_hostname }}:
+              {{ s24_blackhole_probe.stdout | default('(probe did not run)') }}.
+              Expected curl exit 28 (timed out). Exit 7 means the kernel
+              returned a connection error before the packet left the host, so
+              the webhook would fail fast instead of running out
+              timeoutSeconds. Check that the OUTPUT DROP rule installed.
+            success_msg: >-
+              {{ inventory_hostname }}: packets to {{ s24_blackhole_ip }}:{{ s24_blackhole_port }}
+              are dropped silently — the admission call will reach its timeout.
+          when: inventory_hostname in groups['control_plane']
+
+        # ── The two halves ─────────────────────────────────────────────────
+        - name: Run both halves of the fault — identical except failurePolicy
+          # One include, two iterations. The halves cannot drift apart,
+          # because there is only one copy of the code and only one variable
+          # separating them. Order matters: Fail first, so that the Ignore
+          # half's successful Pod creation is the last state change before the
+          # observation window and is unambiguously attributable.
+          include_tasks: half.yml
+          loop:
+            - Fail
+            - Ignore
+          loop_control:
+            loop_var: s24_failure_policy
+            label: "failurePolicy={{ s24_failure_policy }}"
+
+        # ── Compare the halves ─────────────────────────────────────────────
+        - name: Compose the Fail-vs-Ignore comparison
+          # Runs on the observer, over the two per-half files. Selecting the
+          # halves by their recorded failure_policy rather than by argument
+          # order means the comparison cannot silently invert if the loop
+          # order is ever changed.
+          shell: |
+            set -u
+            jq -s '
+              (map(select(.failure_policy == "Fail"))   | .[0]) as $f
+            | (map(select(.failure_policy == "Ignore")) | .[0]) as $i
+            | {
+                scenario_id: "s24",
+                question: "Same black-holed admission webhook, same timeout, same rules. Only failurePolicy differs.",
+                webhook_endpoint: $f.webhook_endpoint,
+                webhook_timeout_seconds: $f.webhook_timeout_seconds,
+                halves: {fail: $f, ignore: $i},
+                contrast: {
+                  configmap_created:  {fail: $f.intercepted.configmap.created, ignore: $i.intercepted.configmap.created},
+                  pod_created:        {fail: $f.intercepted.pod.created,       ignore: $i.intercepted.pod.created},
+                  intercepted_latency_ms: {
+                    fail:   {configmap: $f.intercepted.configmap.latency_ms, pod: $f.intercepted.pod.latency_ms},
+                    ignore: {configmap: $i.intercepted.configmap.latency_ms, pod: $i.intercepted.pod.latency_ms}
+                  },
+                  control_write_created: {fail: $f.control_unintercepted.configmap.created, ignore: $i.control_unintercepted.configmap.created},
+                  control_write_latency_ms: {fail: $f.control_unintercepted.configmap.latency_ms, ignore: $i.control_unintercepted.configmap.latency_ms},
+                  rejection_message_fail: $f.intercepted.configmap.message
+                },
+                verdict:
+                  (if ($f.intercepted.configmap.created | not)
+                      and ($f.intercepted.pod.created | not)
+                      and $i.intercepted.configmap.created
+                      and $i.intercepted.pod.created
+                   then "SEMANTICS_DIVERGE: identical fault, opposite outcome, selected by failurePolicy alone"
+                   elif ($f.intercepted.configmap.created | not) and ($i.intercepted.configmap.created | not)
+                   then "NO_CONTRAST: both halves rejected — the Ignore half did not admit, check webhook propagation"
+                   elif $f.intercepted.configmap.created and $i.intercepted.configmap.created
+                   then "NO_CONTRAST: both halves admitted — the Fail half did not intercept, check selectors and endpoint reachability"
+                   else "PARTIAL_CONTRAST: configmap and pod outcomes disagree within a half"
+                   end),
+                cluster_stayed_healthy_for_unintercepted_writes:
+                  ($f.control_unintercepted.configmap.created and $i.control_unintercepted.configmap.created)
+              }' \
+              "{{ results_dir }}/admission_attempt_fail.json" \
+              "{{ results_dir }}/admission_attempt_ignore.json" \
+              > "{{ results_dir }}/admission_comparison.json"
+            cat "{{ results_dir }}/admission_comparison.json"
+          register: s24_comparison
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Log the contrast
+          debug:
+            msg: "{{ (s24_comparison.stdout | from_json).verdict }}"
+          run_once: true
+
+        # ── Observation window ─────────────────────────────────────────────
+        # Both webhooks are gone by now (each half removes its own). These
+        # snapshots record the cluster with the fault removed; the Ignore
+        # half's probe pod is still running, which is what keeps
+        # placement_changed true against the baseline.
+        - name: Post-fault snapshot at t+30
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_fault_t30
+
+        - name: Hold for the remainder of observation_window
+          pause:
+            seconds: "{{ (observation_window | int) - 30 }}"
+          run_once: true
+
+        - name: Post-fault snapshot at the end of the observation window
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: post_fault_t{{ observation_window | int }}
+
+      # ── Unconditional teardown ─────────────────────────────────────────────
+      # Runs whatever happened above: a failed assertion, an unreachable node,
+      # a kubectl timeout, a Ctrl-C-induced task failure. A `failurePolicy:
+      # Fail` webhook surviving this scenario would corrupt every scenario
+      # that runs after it in the sweep, so this section assumes nothing about
+      # the state it inherits.
+      always:
+        - name: Remove the S24 webhook configuration
+          # Attempted from EVERY control-plane node rather than run_once on
+          # one of them: if the designated node is unreachable at teardown
+          # time, a run_once delete would leave the webhook registered. Each
+          # attempt is idempotent (--ignore-not-found), so the redundancy
+          # costs nothing and any single node succeeding is enough. Deleting
+          # by label as well as by name catches a webhook whose name differs
+          # from the current value of s24_webhook_name.
+          #
+          # This is a DELETE on admissionregistration.k8s.io. The webhook's
+          # rules cover CREATE on core/v1 configmaps and pods only, so this
+          # call is out of its own scope and cannot be blocked by it even
+          # under failurePolicy: Fail. That is the property that makes the
+          # removal path safe by construction rather than by luck.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl delete validatingwebhookconfiguration {{ s24_webhook_name }} \
+              --ignore-not-found --request-timeout=60s
+            kubectl delete validatingwebhookconfiguration -l fault-inject=s24 \
+              --ignore-not-found --request-timeout=60s
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Remove the S24 probe namespace and everything in it
+          # Deletes the probe ConfigMaps and the Ignore half's probe Pod with
+          # it. Namespace teardown issues DELETEs only; the webhook (already
+          # gone by the task above, and CREATE-scoped in any case) cannot
+          # intercept it. --wait=false so a slow finalizer cannot hang the
+          # teardown; the verification task below reports what is left.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl delete namespace {{ s24_probe_ns }} \
+              --ignore-not-found --wait=false --request-timeout=60s
+            kubectl delete configmap -n default \
+              s24-control-cm-fail s24-control-cm-ignore \
+              --ignore-not-found --request-timeout=60s
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Remove the S24 packet black hole
+          # Surgical: `state: absent` issues an `iptables -D` for exactly the
+          # rule spec that was inserted, leaving every other rule on the node
+          # — kube-proxy's included — untouched. Idempotent, so a node where
+          # the rule never installed is a no-op rather than an error.
+          #
+          # Attempted on every control-plane node independently for the same
+          # reason as the webhook deletion above: no single unreachable node
+          # can strand the fault.
+          iptables:
+            chain: OUTPUT
+            destination: "{{ s24_blackhole_ip }}"
+            protocol: tcp
+            destination_port: "{{ s24_blackhole_port }}"
+            jump: DROP
+            comment: "{{ s24_blackhole_comment }}"
+            state: absent
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Sweep any residual S24 black-hole rule
+          # Backstop for the one case the task above cannot cover: `-D`
+          # deletes a single matching rule, so if a re-run ever inserted the
+          # rule twice (an interrupted run that got as far as injection, then
+          # a second run), one copy would survive. This removes every line
+          # carrying the scenario's comment, whatever its spec.
+          #
+          # The `if` matters: iptables-save | iptables-restore rewrites whole
+          # tables, so it runs only when there is genuinely something left to
+          # remove, rather than on every teardown. This is the same recovery
+          # pattern scenarios/s19 uses for its quorum-split rules.
+          shell: |
+            set -u
+            if iptables-save | grep -q "{{ s24_blackhole_comment }}"; then
+              iptables-save | grep -v "{{ s24_blackhole_comment }}" | iptables-restore
+            fi
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Count residual S24 black-hole rules on this node
+          # grep -c exits 1 when the count is zero, which is not a failure
+          # here — `|| true` keeps the task green so the count itself is what
+          # gets judged, in the final assertion below.
+          shell: iptables-save | grep -c "{{ s24_blackhole_comment }}" || true
+          register: s24_rule_left
+          when: inventory_hostname in groups['control_plane']
+          changed_when: false
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Verify no S24 admission webhook remains registered
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            LEFT=$(kubectl get validatingwebhookconfigurations -o json 2>/dev/null \
+                   | jq -c '[.items[].metadata.name | select(test("s24"))]' 2>/dev/null || echo '[]')
+            NS=$(kubectl get namespace {{ s24_probe_ns }} \
+                   -o jsonpath='{.status.phase}' 2>/dev/null || echo "absent")
+            jq -cn --argjson left "${LEFT:-[]}" --arg ns "${NS:-absent}" \
+              '{webhooks_remaining: $left, probe_namespace_phase: (if ($ns | length) == 0 then "absent" else $ns end),
+                clean: (($left | length) == 0)}'
+          register: s24_teardown_check
+          delegate_to: "{{ s24_kubectl_host }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save teardown verification
+          # Both halves of the fault in one file: the API-side objects, and
+          # the per-node black-hole rule count. A run that cannot be shown to
+          # have cleaned up both is not a clean run.
+          copy:
+            dest: "{{ results_dir }}/teardown_verification.json"
+            content: |
+              {
+                "api_objects": {{ s24_teardown_check.stdout | default('{"error": "verification_did_not_run"}') }},
+                "blackhole_rules_remaining": {
+              {% for h in groups['control_plane'] %}
+                  "{{ h }}": {{ (hostvars[h].s24_rule_left.stdout | default('') | trim) if (hostvars[h].s24_rule_left.stdout | default('') | trim) is match('^[0-9]+$') else '"unknown"' }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                }
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Fail loudly if any part of the S24 fault survived teardown
+          # The one thing in this scenario that must never be silent. A
+          # leftover failurePolicy: Fail webhook would poison every subsequent
+          # scenario in the sweep, and a leftover DROP rule would silently
+          # black-hole an address for the rest of the lab's life. A dirty
+          # teardown is a hard error even when the measurements are perfectly
+          # good.
+          #
+          # Deliberately not run_once: the rule check is per-node, so this
+          # has to be evaluated on each control-plane host. Non-control-plane
+          # hosts still evaluate the API-object clauses, which makes a dirty
+          # webhook loud on every host rather than one.
+          fail:
+            msg: >-
+              S24 teardown INCOMPLETE on {{ inventory_hostname }} —
+              api_objects={{ s24_teardown_check.stdout | default('(verification did not run)') }};
+              blackhole_rules_remaining={{ s24_rule_left.stdout | default('(check did not run)') | trim }}.
+              Do not run another scenario until both are clean:
+              kubectl delete validatingwebhookconfiguration -l fault-inject=s24
+              && iptables-save | grep -v {{ s24_blackhole_comment }} | iptables-restore
+          # Each clause also fails when its check could not run at all. "We
+          # could not confirm it is gone" is operationally identical to "it is
+          # still there" — the next scenario must not start on either. Jinja's
+          # `or` short-circuits, so from_json is never handed an empty string
+          # and the rule clause is only reached on control-plane hosts.
+          when: >-
+            (s24_teardown_check.stdout | default('') | trim | length) == 0
+            or ((s24_teardown_check.stdout | from_json).clean | default(false) | bool) == false
+            or (inventory_hostname in groups['control_plane']
+                and (s24_rule_left.stdout | default('') | trim) != '0')
+
+- name: S24 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s24
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ invariant_report.stdout }}"

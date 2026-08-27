@@ -2,6 +2,11 @@
 # Stateful test workload: a single-replica PostgreSQL StatefulSet with a
 # headless Service. The scenarios use this as the workload with a stable
 # identity (postgres-stateful-0) — the subject of the I1 dual-ownership test.
+#
+# The PersistentVolume and PersistentVolumeClaim this manifest consumes are
+# created by roles/nfs-server (claim name `postgres-shared-nfs`, which must
+# stay in step with `nfs_pvc_name` in roles/nfs-server/defaults/main.yml).
+# That role must have run before this workload can start.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -39,22 +44,120 @@ spec:
         - configMapRef:
             name: postgres-config
         volumeMounts:
-        - name: data
+        # The database's own data directory lives on the shared volume. Two
+        # copies of postgres-stateful-0 therefore do not merely share a name;
+        # they share the bytes of the database.
+        - name: shared
           mountPath: /var/lib/postgresql/data
-      # emptyDir, not a volumeClaimTemplate. The lab has no storage
-      # provisioner, and installing a node-pinned one (e.g.
-      # local-path-provisioner) would actively defeat the I1 scenario:
-      # its PVs carry nodeAffinity, so a force-deleted postgres-stateful-0
-      # would be dragged back to the partitioned node and stay Pending
-      # instead of producing a second running copy elsewhere. emptyDir
-      # keeps the StatefulSet's identity guarantees (stable pod name,
-      # ordinal, network id) — which is exactly what I1 tests — while
-      # letting the replacement schedule on a healthy node so dual
-      # ownership can actually be observed. The cost is no data
-      # persistence, which the identity-focused scenarios do not need.
+          subPath: pgdata
+
+      # ── The divergence writer ───────────────────────────────────────────────
+      # A sidecar that appends one identified, timestamped record per second to
+      # a single append-only ledger at the root of the shared volume, and
+      # last-writer-wins clobbers owner.txt with the same record.
+      #
+      # Why a sidecar and not just postgres: what has to be *measured* is that
+      # two live processes wrote to one volume with nothing fencing them. Left
+      # to postgres alone the observable would be whatever PostgreSQL happens
+      # to do when it finds another host's postmaster.pid on an NFS data
+      # directory — which is either a refusal to start, a stale-lock removal
+      # followed by silent corruption, or a crash loop, depending on timing.
+      # That is a good anecdote and a terrible measurement. The ledger produces
+      # the same finding deterministically: interleaved records carrying two
+      # different pod UIDs under one pod name, with an overlapping time window.
+      #
+      # Reusing the postgres:15 image rather than pulling a second one is
+      # deliberate — during a partition the replacement pod has to start on a
+      # healthy node, and every additional image is another pull that can fail
+      # and turn a measurement into a flake.
+      - name: divergence-writer
+        image: postgres:15
+        env:
+        # Downward API. POD_UID is the field that carries the whole finding:
+        # both copies report pod=postgres-stateful-0 — the same StatefulSet
+        # identity — with two different UIDs, from two different nodes, inside
+        # the same second.
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -u
+          seq_no=0
+          while true; do
+            seq_no=$((seq_no + 1))
+            rec="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) pod=${POD_NAME} uid=${POD_UID} node=${NODE_NAME} ip=${POD_IP} seq=${seq_no}"
+            # Plain O_APPEND from two NFS clients. Append is not atomic over
+            # NFS, so torn records are themselves evidence rather than a bug in
+            # the harness — the collector counts them.
+            echo "$rec" >> /shared/divergence.log
+            # Last-writer-wins on a single shared object: with one writer this
+            # file is stable, with two it flips identity every second.
+            echo "$rec" > /shared/owner.txt
+            sleep 1
+          done
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+
       volumes:
-      - name: data
-        emptyDir: {}
+      # Was emptyDir, until the NFS-backed PV existed. The original rationale
+      # is preserved here because half of it still governs this manifest:
+      #
+      #   The lab has no storage provisioner, and installing a node-pinned one
+      #   (e.g. local-path-provisioner) would actively defeat the I1 scenario:
+      #   its PVs carry nodeAffinity, so a force-deleted postgres-stateful-0
+      #   would be dragged back to the partitioned node and stay Pending
+      #   instead of producing a second running copy elsewhere.
+      #
+      # That is still true, and it is still the reason there is no local
+      # provisioner here. What emptyDir bought was scheduling freedom: the
+      # StatefulSet's identity guarantees (stable pod name, ordinal, network
+      # id) were preserved while the replacement could still land on a healthy
+      # node. What it cost was the finding. With a per-copy scratch disk the
+      # two copies never touch the same byte, so the result S2 could report was
+      # "the same pod name existed twice" — a naming collision, which a
+      # reviewer is entitled to say is not a correctness violation.
+      #
+      # An NFS-backed PV keeps everything emptyDir bought and removes the cost.
+      # It does NOT reintroduce node affinity, and not by accident:
+      #   * `spec.nodeAffinity` is never defaulted onto a PV by any controller,
+      #     so a PV that does not declare it has none;
+      #   * the volume source is an address on the network (`nfs:`), not a path
+      #     on a disk (`local:`/`hostPath:`) — there is no node for it to be
+      #     affine to. `local:` PVs are rejected outright without nodeAffinity;
+      #     that asymmetry is exactly why NFS is the right substrate here;
+      #   * the claim names a storageClassName with no StorageClass object
+      #     behind it, so no dynamic provisioner can quietly substitute a
+      #     node-pinned volume;
+      #   * roles/nfs-server reads .spec.nodeAffinity back off the live PV and
+      #     fails the run if it is ever non-empty.
+      # The scheduler therefore applies no volume-derived constraint, the
+      # replacement pod still schedules on any healthy worker — and now both
+      # copies mount the same bytes, so the divergent writes are measurable.
+      #
+      # The export host is chosen so that it is NOT on the far side of any
+      # scenario's partition (see roles/nfs-server/defaults/main.yml): if the
+      # isolated copy lost the volume when the fault landed, the ledger would
+      # record one writer and the scenario would prove nothing.
+      - name: shared
+        persistentVolumeClaim:
+          claimName: postgres-shared-nfs
 ---
 apiVersion: v1
 kind: Service

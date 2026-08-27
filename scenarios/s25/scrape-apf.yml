@@ -1,0 +1,50 @@
+---
+# scenarios/s25/scrape-apf.yml
+# Scrapes APF and 429 metrics from EACH API server (addressed by its own IP,
+# not the VIP, so we can see which server actually served the flood) and saves
+# the filtered lines to the observer's results_dir. Called with:
+#   apf_label   snapshot label (baseline / flood_mid / flood_end / post_flood)
+#
+# The captured lines are the primary 429 evidence and the raw material for the
+# "cannot observe vs. observed and did not act" split:
+#   apiserver_flowcontrol_rejected_requests_total   — rejections BY priority
+#                                                     level and flow schema
+#                                                     (s25-flood vs workload-*)
+#   apiserver_flowcontrol_current_inqueue_requests  — queue depth per level
+#                                                     (how starved each class is)
+#   apiserver_flowcontrol_request_wait_duration_*   — how long each level waited
+#   apiserver_request_terminations_total{code=429}  — terminations with 429
+#   apiserver_request_total{...code="429"...}       — 429s split by verb, so
+#                                                     read (get/list/watch) vs
+#                                                     write (create/update/
+#                                                     patch/delete) rejection is
+#                                                     recoverable from the data
+# The scrape is done with the APF-exempt admin identity, so the measurement
+# itself is never starved.
+
+- name: "APF scrape ({{ apf_label }}) — pull filtered metrics from each API server"
+  shell: |
+    set -o pipefail
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl get --raw /metrics \
+      --server=https://{{ hostvars[item].ansible_host }}:6443 2>/dev/null \
+      | grep -E 'apiserver_flowcontrol_(rejected|current_inqueue|dispatched)_requests_total|apiserver_flowcontrol_request_wait_duration_seconds|apiserver_request_terminations_total\{.*code="429"|apiserver_request_total\{.*code="429"' \
+      || true
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ apf_cp }}"
+  run_once: true
+  loop: "{{ groups['control_plane'] }}"
+  register: apf_scrape
+  changed_when: false
+  ignore_errors: yes
+
+- name: "APF scrape ({{ apf_label }}) — save filtered metrics per API server"
+  copy:
+    dest: "{{ results_dir }}/apf_{{ apf_label }}_{{ item.item }}.txt"
+    content: "{{ item.stdout | default('', true) }}"
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+  loop: "{{ apf_scrape.results }}"
+  loop_control:
+    label: "{{ item.item }}"

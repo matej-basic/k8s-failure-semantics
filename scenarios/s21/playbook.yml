@@ -1,0 +1,979 @@
+---
+# scenarios/s21/playbook.yml
+# S21: Keepalived VIP split-brain
+#
+# What it does:
+#   Blocks VRRP between the control-plane nodes so that two of them hold the
+#   API VIP (10.0.0.59) at the same time. keepalived (installed by
+#   roles/k8s-install/tasks/keepalived.yml) runs one VRRP instance, VI_API,
+#   on every control-plane node: cp1 is MASTER at priority 103, cp2 and cp3
+#   are BACKUP at 102 and 101, adverts go to the multicast group 224.0.0.18
+#   over IP protocol 112 once a second, and there is no `unicast_peer`
+#   stanza — so multicast VRRP is the *only* thing preventing two nodes from
+#   configuring the same address.
+#
+#   Dropping protocol 112 to 224.0.0.18 between one control-plane node and
+#   the rest makes each side of the cut believe the other is dead. The
+#   isolated node keeps the VIP because it never hears a higher priority;
+#   the surviving group promotes its own highest-priority member after
+#   ~3 * advert_int and *also* configures the VIP. Two hosts, one address,
+#   no arbitration — dual authority at layer 2/3 rather than at the pod or
+#   lease layer, which is what distinguishes this scenario from S1/S12.
+#
+# What we measure (this is the point of the scenario, not the injection):
+#   1. VIP ownership on EVERY control-plane node, at four points in time
+#      (`ip -4 addr show ens192` + keepalived state). Two nodes reporting
+#      holds_vip:true in the same measurement is the observable this
+#      scenario exists to record; it is written as an explicit
+#      `split_observed` boolean per phase.
+#   2. Which backend each client actually reaches, from six independent
+#      vantage points (3 workers + 3 control-plane nodes):
+#        - L2: the neighbour table entry is flushed and re-learned, while
+#          tcpdump captures every `is-at` ARP reply for the VIP. Two
+#          distinct source MACs answering one ARP request is literal
+#          duplicate-address detection.
+#        - L7: the SHA-256 fingerprint of the serving certificate the VIP
+#          hands back, matched against the per-node fingerprint map
+#          captured at baseline. The kubeadm certSANs list in
+#          templates/kubeadm-init.yml.j2 puts the VIP *and all three
+#          control-plane IPs* in every API server certificate, so IP SANs
+#          cannot tell the servers apart — the fingerprint (and the node's
+#          own DNS SAN) can. This is the direct answer to "which API server
+#          did this client reach".
+#   3. Whether two clients disagree about the same object at the same
+#      instant: one off-VIP client writes an annotation to a probe
+#      ConfigMap *through the VIP*, and every vantage point immediately
+#      reads the same object *through the VIP*, recording resourceVersion,
+#      the annotation value, and the fingerprint of the server that
+#      answered. Clients that resolve the VIP to different backends and
+#      report different resourceVersions or a missing annotation are
+#      disagreeing about one object at one instant.
+#
+#      Note the expected asymmetry, which is itself part of the result:
+#      cp1 and cp2 both have the address configured locally, so their own
+#      requests to the VIP never leave the box and each necessarily reaches
+#      itself. cp3 and the three workers are the genuine off-box clients
+#      whose answer is decided by whichever node wins ARP for them.
+#
+# Teardown:
+#   Everything between injection and restoration lives in a single
+#   block/always. `always` removes the VRRP rules on every control-plane
+#   node, restarts keepalived on the non-preferred members so the group
+#   re-converges deterministically instead of on whatever the preemption
+#   race decides, waits for the VIP to answer on 6443 again, and asserts
+#   that exactly one node holds it. A VRRP block left in place would take
+#   the cluster's API endpoint down for every scenario that runs after this
+#   one, so the restoration must not depend on the measurement succeeding.
+#
+# Parameters:
+#   s21_isolated  — control-plane nodes cut off from the rest of the VRRP
+#                   group. Default [cp1] (the current MASTER), which yields
+#                   the cp1 + cp2 dual claim. Set to e.g. ['cp3'] to cut a
+#                   BACKUP off instead (no split: cp3 stays BACKUP because
+#                   it hears nothing and cp1 still owns the address), or to
+#                   ['cp1','cp2'] to split the group 2/1.
+
+- name: S21 — Pre-flight baseline, node identity map and probe object
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars: &s21_vars
+    scenario_id: s21
+    scenario_name: "Keepalived VIP split-brain"
+
+    # Management NIC. ens192 carries 10.0.0.0/24 and is what keepalived
+    # binds VI_API to (ansible_default_ipv4.interface on these VMs); ens224
+    # is the pod network and is irrelevant here. Hard-coded because every
+    # play in this scenario runs with gather_facts: no, so
+    # ansible_default_ipv4 is not populated.
+    s21_vip_iface: ens192
+    s21_client_iface: ens192
+
+    # VRRP transport. protocol 112 is IPPROTO_VRRP; 224.0.0.18 is the
+    # assigned VRRP multicast group. Constraining the rule to that group
+    # means only keepalived's adverts are dropped — no other traffic
+    # between control-plane nodes is affected, so this is a VRRP partition
+    # and not a control-plane partition (that is S1).
+    s21_vrrp_proto: "112"
+    s21_vrrp_group: "224.0.0.18"
+    s21_rule_comment: "fault-inject-vrrp-split-s21"
+
+    # Which nodes are cut off from the rest of the VRRP group.
+    s21_isolated: ["cp1"]
+
+    # Every host we probe the VIP from.
+    s21_vantage_points: "{{ groups['workers'] + groups['control_plane'] }}"
+
+    # The object two clients are asked about at the same instant, and the
+    # client that writes to it. The writer is deliberately a control-plane
+    # node that is NOT expected to hold the VIP, so its write travels over
+    # the wire to whichever backend wins ARP for it rather than being
+    # delivered locally.
+    s21_probe_ns: default
+    s21_probe_cm: s21-split-probe
+    s21_writer: "{{ groups['control_plane'] | difference(s21_isolated) | last }}"
+
+    # Substring test used to count VIP holders out of the per-node JSON
+    # below (jq -c emits no spaces). Kept as a var so the Jinja that uses
+    # it does not have to nest quotes.
+    s21_holds_marker: '"holds_vip":true'
+
+    # Remainder of fault_duration after the two mid-fault measurement
+    # rounds (~35 s of pauses), floored so a short fault_duration still
+    # leaves a tail.
+    s21_tail_pause: "{{ [((fault_duration | int) - 35), 10] | max }}"
+
+    # ── Measurement commands ────────────────────────────────────────────
+    # Held as vars so the identical probe can be replayed at every phase
+    # without duplicating the script four times.
+
+    # Who has the VIP configured, right now, on this node.
+    s21_vip_state_cmd: |
+      set -u
+      IFACE="{{ s21_vip_iface }}"
+      VIP="{{ api_vip }}"
+      ADDRS=$(ip -4 -o addr show dev "$IFACE" 2>/dev/null \
+              | awk '{print $4}' | cut -d/ -f1 | sort -u | paste -sd, -)
+      HOLDS=no
+      for a in $(echo "${ADDRS:-}" | tr ',' ' '); do
+        if [ "$a" = "$VIP" ]; then HOLDS=yes; fi
+      done
+      KA=$(systemctl is-active keepalived 2>/dev/null || true)
+      KAST=$(journalctl -u keepalived -n 200 --no-pager 2>/dev/null \
+             | grep -Eo 'Entering (MASTER|BACKUP|FAULT) STATE' | tail -1 || true)
+      MAC=$(cat /sys/class/net/"$IFACE"/address 2>/dev/null || true)
+      jq -cn \
+        --arg host "{{ inventory_hostname }}" \
+        --arg ip "{{ ansible_host }}" \
+        --arg iface "$IFACE" \
+        --arg holds "$HOLDS" \
+        --arg addrs "${ADDRS:-}" \
+        --arg ka "${KA:-unknown}" \
+        --arg kast "${KAST:-}" \
+        --arg mac "${MAC:-}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{host:$host,node_ip:$ip,iface:$iface,
+          holds_vip:($holds=="yes"),
+          addresses:(if ($addrs|length)>0 then ($addrs|split(",")) else [] end),
+          keepalived:$ka,last_vrrp_transition:$kast,mac:$mac,ts:$ts}'
+
+    # Layer-2 view of the VIP from one client: flush the neighbour entry,
+    # capture ARP for the VIP, provoke a resolution, then report every MAC
+    # that claimed the address and the one this client settled on. On a
+    # node that has the VIP configured locally no ARP happens at all —
+    # that absence is recorded rather than hidden.
+    s21_client_l2_cmd: |
+      set -u
+      IFACE="{{ s21_client_iface }}"
+      VIP="{{ api_vip }}"
+      CAP=/tmp/s21-arp-capture.txt
+      : > "$CAP"
+      ip neigh del "$VIP" dev "$IFACE" >/dev/null 2>&1 || true
+      timeout 6 tcpdump -l -n -e -i "$IFACE" "arp and host $VIP" > "$CAP" 2>/dev/null &
+      TCPD=$!
+      sleep 1
+      ping -c 3 -W 1 "$VIP" >/dev/null 2>&1 || true
+      wait "$TCPD" 2>/dev/null || true
+      NEIGH=$(ip -o -4 neigh show "$VIP" dev "$IFACE" 2>/dev/null \
+              | sed -n 's/.*lladdr \([0-9a-f:]*\).*/\1/p' | head -1)
+      ARP=$(sed -n 's/.*is-at \([0-9a-f:]*\).*/\1/p' "$CAP" 2>/dev/null \
+            | sort -u | paste -sd, -)
+      LOCAL=no
+      if ip -4 -o addr show dev "$IFACE" 2>/dev/null \
+         | awk '{print $4}' | cut -d/ -f1 | grep -qx "$VIP"; then LOCAL=yes; fi
+      jq -cn \
+        --arg client "{{ inventory_hostname }}" \
+        --arg client_ip "{{ ansible_host }}" \
+        --arg neigh "${NEIGH:-}" \
+        --arg arp "${ARP:-}" \
+        --arg local "$LOCAL" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '($arp | if length>0 then split(",") else [] end) as $macs
+         | {client:$client,client_ip:$client_ip,ts:$ts,
+            vip_configured_locally:($local=="yes"),
+            vip_neighbour_mac:(if ($neigh|length)>0 then $neigh else null end),
+            arp_responders:$macs,
+            duplicate_arp_responders:(($macs|length)>1)}'
+
+    # Which API server this client reaches through the VIP, and what that
+    # server says about the probe object at this instant. The certificate
+    # fingerprint is the identifier: certSANs are identical across the
+    # three servers except for the node's own DNS name, so the fingerprint
+    # is the only unambiguous discriminator available to a plain client.
+    # Workers have no admin.conf, so they fall back to kubelet.conf and the
+    # one object the Node authorizer lets them read — their own Node. That
+    # still answers "which server did this client reach" and "what
+    # resourceVersion did it see".
+    s21_client_api_cmd: |
+      set -u
+      VIP="{{ api_vip }}"
+      FP=$(echo | timeout 5 openssl s_client -connect "$VIP:6443" 2>/dev/null \
+           | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')
+      SAN=$(echo | timeout 5 openssl s_client -connect "$VIP:6443" 2>/dev/null \
+            | openssl x509 -noout -text 2>/dev/null \
+            | grep -A1 'Subject Alternative Name' | tail -1 | tr -d ' ')
+      if [ -r /etc/kubernetes/admin.conf ]; then
+        KCFG=/etc/kubernetes/admin.conf
+        KIND=configmap
+        NAME="{{ s21_probe_cm }}"
+        NS="{{ s21_probe_ns }}"
+      else
+        KCFG=/etc/kubernetes/kubelet.conf
+        KIND=node
+        NAME="{{ inventory_hostname }}"
+        NS="{{ s21_probe_ns }}"
+      fi
+      READ=$(kubectl --kubeconfig "$KCFG" --server="https://$VIP:6443" \
+               --request-timeout=5s get "$KIND" "$NAME" -n "$NS" -o json 2>/dev/null \
+             | jq -c '{kind:.kind,name:.metadata.name,
+                       resourceVersion:.metadata.resourceVersion,
+                       annotations:(.metadata.annotations // {})}' 2>/dev/null)
+      echo "${READ:-}" | jq -e . >/dev/null 2>&1 || READ=null
+      jq -cn \
+        --arg client "{{ inventory_hostname }}" \
+        --arg client_ip "{{ ansible_host }}" \
+        --arg fp "${FP:-}" \
+        --arg san "${SAN:-}" \
+        --arg kcfg "$KCFG" \
+        --argjson read "${READ:-null}" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+        '{client:$client,client_ip:$client_ip,ts:$ts,credential:$kcfg,
+          served_by_cert_fingerprint:(if ($fp|length)>0 then $fp else null end),
+          served_by_cert_sans:(if ($san|length)>0 then $san else null end),
+          object_view:$read}'
+
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Verify cluster is healthy before starting
+      shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
+      register: s21_not_ready
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: s21_not_ready.stdout | int > 0
+      ignore_unreachable: yes
+      retries: 3
+      delay: 5
+      until: s21_not_ready is succeeded
+
+    - name: Capture the per-node identity map (MAC + API server certificate)
+      # Without this map the client-side measurements are unattributable:
+      # a fingerprint or a MAC observed from a worker means nothing unless
+      # we know which control-plane node it belongs to. Collected before
+      # the fault so it is a clean reference.
+      shell: |
+        set -u
+        IFACE="{{ s21_vip_iface }}"
+        MAC=$(cat /sys/class/net/"$IFACE"/address 2>/dev/null || true)
+        FP=$(openssl x509 -noout -fingerprint -sha256 \
+               -in /etc/kubernetes/pki/apiserver.crt 2>/dev/null | sed 's/.*=//')
+        PRIO=$(grep -E '^\s*priority' /etc/keepalived/keepalived.conf 2>/dev/null \
+               | awk '{print $2}' | head -1)
+        STATE=$(grep -E '^\s*state' /etc/keepalived/keepalived.conf 2>/dev/null \
+                | awk '{print $2}' | head -1)
+        jq -cn \
+          --arg host "{{ inventory_hostname }}" \
+          --arg ip "{{ ansible_host }}" \
+          --arg mac "${MAC:-}" \
+          --arg fp "${FP:-}" \
+          --arg prio "${PRIO:-}" \
+          --arg state "${STATE:-}" \
+          '{host:$host,node_ip:$ip,mac:$mac,
+            apiserver_cert_fingerprint:$fp,
+            vrrp_configured_state:$state,vrrp_priority:$prio}'
+      register: s21_identity
+      when: inventory_hostname in groups['control_plane']
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Save the identity map
+      copy:
+        dest: "{{ results_dir }}/vip_identity_map.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "api_vip": "{{ api_vip }}",
+            "vrrp_group": "{{ s21_vrrp_group }}",
+            "vrrp_protocol": "{{ s21_vrrp_proto }}",
+            "isolated_nodes": {{ s21_isolated | to_json }},
+            "vantage_points": {{ s21_vantage_points | to_json }},
+            "control_plane": [
+          {% for h in groups['control_plane'] %}
+              {{ (hostvars[h]['s21_identity'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+          {% endfor %}
+            ]
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Create the probe object two clients will be asked about
+      shell: |
+        set -u
+        kubectl create configmap {{ s21_probe_cm }} -n {{ s21_probe_ns }} \
+          --from-literal=scenario=s21 --dry-run=client -o yaml \
+          | kubectl apply -f -
+        kubectl annotate configmap {{ s21_probe_cm }} -n {{ s21_probe_ns }} \
+          s21-writer- s21-token- --overwrite >/dev/null 2>&1 || true
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Baseline VIP ownership on every control-plane node
+      shell: "{{ s21_vip_state_cmd }}"
+      register: s21_vip_state
+      when: inventory_hostname in groups['control_plane']
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Baseline layer-2 view of the VIP from every vantage point
+      shell: "{{ s21_client_l2_cmd }}"
+      register: s21_client_l2
+      when: inventory_hostname in s21_vantage_points
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Baseline API-server identity seen through the VIP
+      shell: "{{ s21_client_api_cmd }}"
+      register: s21_client_api
+      when: inventory_hostname in s21_vantage_points
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Save the baseline VIP measurement
+      copy:
+        dest: "{{ results_dir }}/vip_split_pre_fault.json"
+        content: |
+          {% set holders = [] %}
+          {% for h in groups['control_plane'] %}
+          {% if s21_holds_marker in ((hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)) %}
+          {% set _ = holders.append(h) %}
+          {% endif %}
+          {% endfor %}
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "phase": "pre_fault",
+            "timestamp": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "api_vip": "{{ api_vip }}",
+            "vip_holders": {{ holders | to_json }},
+            "vip_holder_count": {{ holders | length }},
+            "split_observed": {{ (holders | length > 1) | to_json }},
+            "control_plane_vip_state": [
+          {% for h in groups['control_plane'] %}
+              {{ (hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+          {% endfor %}
+            ],
+            "client_l2_view": [
+          {% for h in s21_vantage_points %}
+              {{ (hostvars[h]['s21_client_l2'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+          {% endfor %}
+            ],
+            "client_api_view": [
+          {% for h in s21_vantage_points %}
+              {{ (hostvars[h]['s21_client_api'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+          {% endfor %}
+            ]
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Reset the per-round VIP holder tally (pre_fault)
+      set_fact:
+        s21_round_holders: []
+      run_once: true
+
+    - name: Tally the VIP holders for this round (pre_fault)
+      set_fact:
+        s21_round_holders: >-
+          {{ s21_round_holders +
+             ([item] if (s21_holds_marker in
+                         ((hostvars[item]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)))
+                    else []) }}
+      loop: "{{ groups['control_plane'] }}"
+      run_once: true
+
+    - name: Carry the holder tally forward (pre_fault)
+      # set_fact facts are host-scoped and persist for the whole run, and
+      # run_once propagates them to every host in the play, so the tally
+      # survives into the later plays — the same mechanism metrics-collect
+      # uses for snapshot_index. The post-teardown summary reads these to
+      # state whether the split was ever actually observed, independently
+      # of the snapshot schema check-invariants.sh reads.
+      set_fact:
+        s21_max_holders: "{{ [ (s21_max_holders | default(0) | int), (s21_round_holders | length) ] | max }}"
+        s21_holder_history: >-
+          {{ (s21_holder_history | default([]))
+             + [ {'phase': 'pre_fault', 'holders': s21_round_holders} ] }}
+      run_once: true
+
+    - name: Baseline observer snapshot
+      include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: pre_fault
+
+- name: S21 — Inject the VRRP split, measure it, and restore unconditionally
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars: *s21_vars
+  tasks:
+    - block:
+        # ── Injection ───────────────────────────────────────────────────
+        # Rules are INSERTed, not appended. Calico installs a `cali-INPUT`
+        # jump at the head of the INPUT chain and it may ACCEPT host
+        # traffic before an appended rule is ever reached — the documented
+        # failure mode of S11, where the injection missed and the run
+        # produced verdicts about an undisturbed cluster. Position 1
+        # guarantees the drop is evaluated first.
+        #
+        # The cut is symmetric and made on the receiving side of each half,
+        # matching only protocol 112 destined for the VRRP group, so the
+        # two halves stop hearing each other's adverts while every other
+        # protocol between the control-plane nodes keeps working.
+        - name: Drop VRRP adverts from the surviving group on the isolated nodes
+          iptables:
+            action: insert
+            chain: INPUT
+            protocol: "{{ s21_vrrp_proto }}"
+            source: "{{ hostvars[item]['ansible_host'] }}"
+            destination: "{{ s21_vrrp_group }}"
+            jump: DROP
+            comment: "{{ s21_rule_comment }}"
+          loop: "{{ groups['control_plane'] | difference(s21_isolated) }}"
+          when: inventory_hostname in s21_isolated
+
+        - name: Drop VRRP adverts from the isolated nodes on the surviving group
+          iptables:
+            action: insert
+            chain: INPUT
+            protocol: "{{ s21_vrrp_proto }}"
+            source: "{{ hostvars[item]['ansible_host'] }}"
+            destination: "{{ s21_vrrp_group }}"
+            jump: DROP
+            comment: "{{ s21_rule_comment }}"
+          loop: "{{ s21_isolated }}"
+          when:
+            - inventory_hostname in groups['control_plane']
+            - inventory_hostname not in s21_isolated
+
+        - name: Declare what this fault must observably do
+          # D6 / fault efficacy. Written directly rather than through the
+          # fault-inject role because this fault type has no entry in
+          # roles/fault-inject/defaults/main.yml and adding one would mean
+          # editing a shared file.
+          #
+          # `target_node_status_changed` — the assertion S1-style partitions
+          # use — is the WRONG signal here. Nothing is done to any kubelet:
+          # the VIP stays answerable throughout (that is the whole point of
+          # a split — both claimants serve), the API servers keep their
+          # etcd quorum, and node leases keep renewing through whichever
+          # backend a kubelet lands on. Every node stays Ready, so requiring
+          # a Ready transition would label a perfectly executed split
+          # FAULT_INEFFECTIVE.
+          #
+          # None of the seven signals check-invariants.sh computes
+          # (node_status_changed, target_node_status_changed,
+          # lease_holder_changed, etcd_members_dropped, probe_degraded,
+          # placement_changed, api_view_lost) is a positive test for two
+          # nodes owning one address — the snapshot schema has no field for
+          # VIP ownership at all. Rather than name a signal that cannot
+          # fire (an unknown name in `require` is treated as unfired and
+          # would force INEFFECTIVE on every run) or invent one in a shared
+          # defaults file, `require` is left empty: the run is EFFECTIVE if
+          # anything changed at all, and the authoritative evidence for
+          # this scenario is the dual-ownership measurement in
+          # vip_split_*.json / vip_split_summary.json, whose
+          # `split_observed` boolean is the assertion that actually matters.
+          #
+          # The plausible-but-unreliable secondary signal is
+          # lease_holder_changed: when a second node claims the address,
+          # established TCP connections through the VIP are stolen at layer
+          # 2 and reset, and a controller-manager or scheduler whose leader
+          # sits on the off-VIP node can lose its lease during the
+          # reconnect. It fires only if the leader happens to be there and
+          # its reconnect exceeds the 15 s lease duration, so it is
+          # documented here rather than required.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "scenario_name": "{{ scenario_name }}",
+                "fault_type": "vrrp_vip_split",
+                "efficacy": {
+                  "target_node": "",
+                  "require": []
+                },
+                "efficacy_rationale": "No signal in check-invariants.sh is a positive test for two nodes holding one VIP; node Ready status does not change under a VIP split, so target_node_status_changed would be a false negative. The scenario-local assertion is split_observed in vip_split_summary.json.",
+                "local_efficacy_evidence": [
+                  "vip_identity_map.json",
+                  "vip_split_pre_fault.json",
+                  "vip_split_t10.json",
+                  "vip_split_t60.json",
+                  "vip_split_summary.json",
+                  "object_divergence_during_split.json"
+                ],
+                "isolated_nodes": {{ s21_isolated | to_json }},
+                "vrrp_block": "proto {{ s21_vrrp_proto }} to {{ s21_vrrp_group }}"
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Log the VRRP cut
+          debug:
+            msg: >-
+              FAULT INJECTED: VRRP (proto {{ s21_vrrp_proto }} ->
+              {{ s21_vrrp_group }}) blocked between
+              {{ s21_isolated | join('+') }} and
+              {{ groups['control_plane'] | difference(s21_isolated) | join('+') }}
+              — both halves should now claim {{ api_vip }}
+          run_once: true
+
+        # ── Measurement round 1: t+10s ──────────────────────────────────
+        # A BACKUP declares the master down after ~3 * advert_int (3 s) plus
+        # skew, so 10 s is comfortably past the promotion.
+        - name: Wait for the surviving group to promote its own master
+          pause:
+            seconds: 10
+          run_once: true
+
+        - name: VIP ownership on every control-plane node (t+10)
+          shell: "{{ s21_vip_state_cmd }}"
+          register: s21_vip_state
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Layer-2 view of the VIP from every vantage point (t+10)
+          shell: "{{ s21_client_l2_cmd }}"
+          register: s21_client_l2
+          when: inventory_hostname in s21_vantage_points
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: API-server identity seen through the VIP (t+10)
+          shell: "{{ s21_client_api_cmd }}"
+          register: s21_client_api
+          when: inventory_hostname in s21_vantage_points
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the t+10 VIP measurement
+          copy:
+            dest: "{{ results_dir }}/vip_split_t10.json"
+            content: |
+              {% set holders = [] %}
+              {% for h in groups['control_plane'] %}
+              {% if s21_holds_marker in ((hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)) %}
+              {% set _ = holders.append(h) %}
+              {% endif %}
+              {% endfor %}
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "phase": "t10",
+                "timestamp": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+                "api_vip": "{{ api_vip }}",
+                "vip_holders": {{ holders | to_json }},
+                "vip_holder_count": {{ holders | length }},
+                "split_observed": {{ (holders | length > 1) | to_json }},
+                "control_plane_vip_state": [
+              {% for h in groups['control_plane'] %}
+                  {{ (hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ],
+                "client_l2_view": [
+              {% for h in s21_vantage_points %}
+                  {{ (hostvars[h]['s21_client_l2'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ],
+                "client_api_view": [
+              {% for h in s21_vantage_points %}
+                  {{ (hostvars[h]['s21_client_api'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Reset the per-round VIP holder tally (t+10)
+          set_fact:
+            s21_round_holders: []
+          run_once: true
+
+        - name: Tally the VIP holders for this round (t+10)
+          set_fact:
+            s21_round_holders: >-
+              {{ s21_round_holders +
+                 ([item] if (s21_holds_marker in
+                             ((hostvars[item]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)))
+                        else []) }}
+          loop: "{{ groups['control_plane'] }}"
+          run_once: true
+
+        - name: Carry the holder tally forward (t+10)
+          set_fact:
+            s21_max_holders: "{{ [ (s21_max_holders | default(0) | int), (s21_round_holders | length) ] | max }}"
+            s21_holder_history: >-
+              {{ (s21_holder_history | default([]))
+                 + [ {'phase': 't10', 'holders': s21_round_holders} ] }}
+          run_once: true
+
+        - name: Observer snapshot during the split (t+10)
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: split_t10
+
+        # ── Measurement round 2: do two clients disagree about one object
+        #    at the same instant? ─────────────────────────────────────────
+        - name: Write a token to the probe object through the VIP from an off-VIP client
+          # s21_writer is a control-plane node outside the isolated set and
+          # (by priority) not the promoted master, so its request to the
+          # VIP really leaves the box and lands on whichever backend won
+          # ARP for it. The token records who wrote, when, and which server
+          # accepted the write.
+          shell: |
+            set -u
+            VIP="{{ api_vip }}"
+            TOKEN="{{ s21_writer }}-$(date -u +%Y%m%dT%H%M%S.%3N)"
+            FP=$(echo | timeout 5 openssl s_client -connect "$VIP:6443" 2>/dev/null \
+                 | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')
+            OUT=$(kubectl --kubeconfig /etc/kubernetes/admin.conf \
+                    --server="https://$VIP:6443" --request-timeout=10s \
+                    annotate configmap {{ s21_probe_cm }} -n {{ s21_probe_ns }} \
+                    "s21-writer={{ s21_writer }}" "s21-token=$TOKEN" --overwrite 2>&1) || true
+            RV=$(kubectl --kubeconfig /etc/kubernetes/admin.conf \
+                   --server="https://$VIP:6443" --request-timeout=10s \
+                   get configmap {{ s21_probe_cm }} -n {{ s21_probe_ns }} \
+                   -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)
+            jq -cn \
+              --arg writer "{{ s21_writer }}" \
+              --arg token "$TOKEN" \
+              --arg fp "${FP:-}" \
+              --arg rv "${RV:-}" \
+              --arg out "$OUT" \
+              --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+              '{writer:$writer,token:$token,ts:$ts,
+                accepted_by_cert_fingerprint:(if ($fp|length)>0 then $fp else null end),
+                resourceVersion_after_write:(if ($rv|length)>0 then $rv else null end),
+                kubectl_output:$out}'
+          register: s21_write
+          delegate_to: "{{ s21_writer }}"
+          run_once: true
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Read the same object through the VIP from every vantage point at once
+          # Deliberately a separate, fast task: it fans out across hosts so
+          # the reads are as close to simultaneous as the fork limit allows,
+          # and each client stamps its own timestamp so the analysis can see
+          # exactly how far apart they really were.
+          shell: "{{ s21_client_api_cmd }}"
+          register: s21_client_api_after_write
+          when: inventory_hostname in s21_vantage_points
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the object-divergence measurement
+          copy:
+            dest: "{{ results_dir }}/object_divergence_during_split.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "timestamp": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+                "probe_object": "{{ s21_probe_ns }}/{{ s21_probe_cm }}",
+                "note": "Each client read the same object through the VIP immediately after one off-VIP client wrote a token to it. served_by_cert_fingerprint identifies which API server answered each read; compare object_view.resourceVersion and object_view.annotations['s21-token'] across clients to see whether two clients disagreed about one object at one instant. Workers hold only kubelet credentials, so their object_view is their own Node — the fingerprint is still the answer to 'which server did this client reach'.",
+                "write": {{ s21_write.stdout | default('null', true) }},
+                "reads": [
+              {% for h in s21_vantage_points %}
+                  {{ (hostvars[h]['s21_client_api_after_write'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── Measurement round 3: late in the fault window ───────────────
+        - name: Hold the split for the remainder of fault_duration
+          pause:
+            seconds: "{{ s21_tail_pause }}"
+          run_once: true
+
+        - name: VIP ownership on every control-plane node (late)
+          shell: "{{ s21_vip_state_cmd }}"
+          register: s21_vip_state
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Layer-2 view of the VIP from every vantage point (late)
+          shell: "{{ s21_client_l2_cmd }}"
+          register: s21_client_l2
+          when: inventory_hostname in s21_vantage_points
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: API-server identity seen through the VIP (late)
+          shell: "{{ s21_client_api_cmd }}"
+          register: s21_client_api
+          when: inventory_hostname in s21_vantage_points
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Save the late-fault VIP measurement
+          copy:
+            dest: "{{ results_dir }}/vip_split_t60.json"
+            content: |
+              {% set holders = [] %}
+              {% for h in groups['control_plane'] %}
+              {% if s21_holds_marker in ((hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)) %}
+              {% set _ = holders.append(h) %}
+              {% endif %}
+              {% endfor %}
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "phase": "late_fault",
+                "timestamp": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+                "api_vip": "{{ api_vip }}",
+                "vip_holders": {{ holders | to_json }},
+                "vip_holder_count": {{ holders | length }},
+                "split_observed": {{ (holders | length > 1) | to_json }},
+                "control_plane_vip_state": [
+              {% for h in groups['control_plane'] %}
+                  {{ (hostvars[h]['s21_vip_state'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ],
+                "client_l2_view": [
+              {% for h in s21_vantage_points %}
+                  {{ (hostvars[h]['s21_client_l2'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ],
+                "client_api_view": [
+              {% for h in s21_vantage_points %}
+                  {{ (hostvars[h]['s21_client_api'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Reset the per-round VIP holder tally (late)
+          set_fact:
+            s21_round_holders: []
+          run_once: true
+
+        - name: Tally the VIP holders for this round (late)
+          set_fact:
+            s21_round_holders: >-
+              {{ s21_round_holders +
+                 ([item] if (s21_holds_marker in
+                             ((hostvars[item]['s21_vip_state'] | default({}, true))['stdout'] | default('', true)))
+                        else []) }}
+          loop: "{{ groups['control_plane'] }}"
+          run_once: true
+
+        - name: Carry the holder tally forward (late)
+          set_fact:
+            s21_max_holders: "{{ [ (s21_max_holders | default(0) | int), (s21_round_holders | length) ] | max }}"
+            s21_holder_history: >-
+              {{ (s21_holder_history | default([]))
+                 + [ {'phase': 'late_fault', 'holders': s21_round_holders} ] }}
+          run_once: true
+
+        - name: Observer snapshot during the split (late)
+          include_role:
+            name: metrics-collect
+          vars:
+            snapshot_label: split_late
+
+      # ── Unconditional restoration ─────────────────────────────────────
+      # Runs whether or not anything above succeeded. A VRRP block left in
+      # place leaves two nodes fighting over 10.0.0.59 and breaks the API
+      # endpoint for every scenario that runs after this one, so none of
+      # this may be conditional on the measurement having worked.
+      always:
+        - name: Remove the VRRP block rules
+          shell: |
+            iptables-save | grep -v "{{ s21_rule_comment }}" | iptables-restore
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Let VRRP re-converge on its own
+          pause:
+            seconds: 10
+          run_once: true
+
+        - name: Restart keepalived on the non-preferred members
+          # With the rules gone, preemption alone would eventually restore a
+          # single owner, but the outcome depends on which side sends the
+          # next advert first. Restarting the BACKUP members one at a time
+          # makes it deterministic: each comes up in its configured BACKUP
+          # state, releases the address if it was holding it, hears the
+          # highest-priority member and stays down. The preferred master
+          # (control_plane[0]) is never restarted, so the VIP is not
+          # withdrawn from the cluster during the restore.
+          systemd:
+            name: keepalived
+            state: restarted
+          throttle: 1
+          when:
+            - inventory_hostname in groups['control_plane']
+            - inventory_hostname != groups['control_plane'][0]
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Let the VRRP group settle after the restarts
+          pause:
+            seconds: 15
+          run_once: true
+
+        - name: VIP ownership after restoration
+          shell: "{{ s21_vip_state_cmd }}"
+          register: s21_vip_state_post
+          when: inventory_hostname in groups['control_plane']
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Reset the post-restoration holder list
+          set_fact:
+            s21_post_holders: []
+          run_once: true
+
+        - name: Collect the post-restoration holder list
+          set_fact:
+            s21_post_holders: >-
+              {{ s21_post_holders +
+                 ([item] if (s21_holds_marker in
+                             ((hostvars[item]['s21_vip_state_post'] | default({}, true))['stdout'] | default('', true)))
+                        else []) }}
+          loop: "{{ groups['control_plane'] }}"
+          run_once: true
+
+        - name: Wait for the API VIP to answer again
+          wait_for:
+            host: "{{ api_vip }}"
+            port: 6443
+            delay: 2
+            timeout: 120
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Remove the probe object
+          shell: |
+            kubectl delete configmap {{ s21_probe_cm }} -n {{ s21_probe_ns }} \
+              --ignore-not-found=true
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          ignore_errors: yes
+          ignore_unreachable: yes
+
+        - name: Write the split summary
+          # The scenario-local efficacy verdict. check-invariants.sh cannot
+          # express "two nodes held one address", so this file carries the
+          # assertion that decides whether the run measured anything.
+          copy:
+            dest: "{{ results_dir }}/vip_split_summary.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "scenario_name": "{{ scenario_name }}",
+                "api_vip": "{{ api_vip }}",
+                "isolated_nodes": {{ s21_isolated | to_json }},
+                "max_simultaneous_vip_holders": {{ s21_max_holders | default(0) | int }},
+                "split_observed": {{ ((s21_max_holders | default(0) | int) > 1) | to_json }},
+                "holder_history": {{ s21_holder_history | default([]) | to_json }},
+                "vip_holders_after_restore": {{ s21_post_holders | default([]) | to_json }},
+                "restored_to_single_holder": {{ ((s21_post_holders | default([]) | length) == 1) | to_json }},
+                "expected_holder_after_restore": "{{ groups['control_plane'][0] }}",
+                "control_plane_vip_state_after_restore": [
+              {% for h in groups['control_plane'] %}
+                  {{ (hostvars[h]['s21_vip_state_post'] | default({}, true))['stdout'] | default('null', true) }}{{ "," if not loop.last else "" }}
+              {% endfor %}
+                ],
+                "note": "split_observed is this scenario's own fault-efficacy assertion: max_simultaneous_vip_holders > 1 means two control-plane nodes held the API VIP at the same instant. It is computed here because no signal in check-invariants.sh tests VIP ownership."
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Log the restoration result
+          debug:
+            msg: >-
+              TEARDOWN COMPLETE: VRRP restored;
+              {{ api_vip }} held by
+              {{ s21_post_holders | default([]) | join(', ') | default('nobody', true) }}
+              (max simultaneous holders during the fault:
+              {{ s21_max_holders | default(0) }})
+          run_once: true
+
+        - name: Fail loudly if the VIP is still split or unowned
+          # Deliberately after the summary is written, so the evidence
+          # survives. If this trips, the cluster's API endpoint is broken
+          # and no later scenario should be allowed to run against it.
+          assert:
+            that:
+              - (s21_post_holders | default([]) | length) == 1
+            fail_msg: >-
+              S21 DID NOT RESTORE THE VIP: {{ api_vip }} is held by
+              {{ s21_post_holders | default([]) | join(', ') | default('nobody', true) }}
+              (expected exactly one holder,
+              {{ groups['control_plane'][0] }}). Fix keepalived on the
+              control-plane nodes before running any further scenario.
+            success_msg: >-
+              {{ api_vip }} restored to a single holder:
+              {{ s21_post_holders | default([]) | join(', ') }}
+          run_once: true
+
+- name: S21 — Post-restoration observation window
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars: *s21_vars
+  tasks:
+    - name: Settle before the first post-restoration snapshot
+      pause:
+        seconds: 30
+      run_once: true
+
+    - include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: post_restore_t30
+
+    - name: Observe for the remainder of observation_window
+      pause:
+        seconds: "{{ [((observation_window | int) - 30), 30] | max }}"
+      run_once: true
+
+    - include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: post_restore_end
+
+- name: S21 — Invariant evaluation report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars: *s21_vars
+  tasks:
+    - name: Run invariant checker script
+      script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: s21_invariant_report
+
+    - name: Write invariant report (text)
+      copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ s21_invariant_report.stdout }}"
+
+    - name: Write invariant report (json)
+      copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ s21_invariant_report.stdout }}"

@@ -14,11 +14,53 @@
 #   - Whether pods are rescheduled to other nodes while originals still run (I1)
 #   - Whether endpoints still include worker1's pods after eviction (I2, I3)
 #   - Divergence between kubelet local belief and control-plane belief
+#   - Whether the two copies of postgres-stateful-0 write to the SAME volume
+#     concurrently, with nothing fencing either of them
+#
+# Why the last one exists:
+#   Dual ownership on its own is a weak result. Two pods with the same name and
+#   two private scratch disks is a naming collision, and a reviewer is right to
+#   say that is not a correctness violation. The workload therefore mounts an
+#   NFS-backed PersistentVolume (roles/nfs-server) instead of an emptyDir. NFS
+#   carries no node affinity, so the replacement pod still schedules on a
+#   healthy worker — but it now mounts the same bytes the isolated original is
+#   still writing. Both copies append identified, timestamped records to one
+#   append-only ledger on that volume; this scenario collects the ledger and
+#   the overlap between the two writers' intervals as evidence. The result S2
+#   reports becomes "two live processes wrote to the same volume with no
+#   fencing", which is a correctness violation by any definition.
 #
 # Control-plane operations run on cp2 (control_plane[1]), not cp1
 # (control_plane[0]). cp1 holds the keepalived VIP and is the busiest node;
 # its sshd intermittently rejects bursty connections, which derails plays
 # that delegate to it. cp2 has the same admin.conf and kubectl.
+
+- name: S2 — Ensure the shared NFS volume exists
+  # Applied, not assumed. The fleet is destroyed and recreated constantly, so
+  # the export has to be reconstructible by playbook and can never be a
+  # hand-made artefact on one VM. roles/nfs-server installs the server on the
+  # export host, installs nfs-common on every node that might mount it (the
+  # kubelet mounts with the host's mount.nfs, not with anything in the
+  # container), and publishes a PersistentVolume with no node affinity. The
+  # role is idempotent end to end, so on a cluster that already has it this
+  # play is a no-op beyond the package and exportfs checks.
+  #
+  # The export host is worker3 — chosen, not defaulted. It cannot be worker1,
+  # which is the node this scenario partitions. It cannot be any control-plane
+  # or etcd host either, because the injection below blocks worker1's outbound
+  # traffic to cp1, cp2, cp3, etcd1-5 and the API VIP: an export behind any of
+  # those is severed from the isolated copy the instant the fault lands, the
+  # ledger records one writer instead of two, and the scenario proves nothing.
+  # That leaves worker2 and worker3; worker3 is the only host in the fleet no
+  # scenario in the suite network-partitions. Full reasoning lives in
+  # roles/nfs-server/defaults/main.yml.
+  hosts: k8s_cluster
+  gather_facts: no
+  vars:
+    scenario_id: s2
+    nfs_server_host: worker3
+  roles:
+    - role: nfs-server
 
 - name: S2 — Pin postgres-stateful-0 onto worker1
   # I1 (dual ownership) is a StatefulSet-identity property, so the partition
@@ -31,6 +73,13 @@
   gather_facts: no
   vars:
     scenario_id: s2
+    # Kept in step with roles/nfs-server/defaults/main.yml. Repeated here
+    # rather than inherited because role defaults are not in scope for a play
+    # that does not apply the role.
+    nfs_server_host: worker3
+    nfs_export_path: /srv/nfs/k8s
+    nfs_divergence_log: divergence.log
+    nfs_owner_file: owner.txt
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   tasks:
@@ -54,6 +103,22 @@
     - name: Uncordon worker2 and worker3
       shell: kubectl uncordon worker2 worker3
 
+    - name: Reset the divergence ledger on the shared volume
+      # Truncated AFTER the pod is pinned, so the ledger opens with exactly one
+      # writer. Records written by the pre-pin copy of postgres-stateful-0
+      # carry a different pod UID and would otherwise read as a second writer.
+      # They would not survive the overlap test — those two intervals are
+      # sequential, not concurrent — but scoping the artefact to this run keeps
+      # it readable as evidence.
+      #
+      # Truncating rather than deleting: the sidecars hold the file open in
+      # append mode, and a delete would leave both of them writing to an
+      # unlinked inode nobody can collect.
+      shell: |
+        : > {{ nfs_export_path }}/{{ nfs_divergence_log }}
+        : > {{ nfs_export_path }}/{{ nfs_owner_file }}
+      delegate_to: "{{ nfs_server_host }}"
+
 - name: S2 — Pre-flight baseline
   hosts: k8s_cluster:etcd
   gather_facts: no
@@ -63,7 +128,7 @@
     snapshot_label: pre_fault
   tasks:
     - name: Verify cluster is healthy
-      shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+      shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
       register: not_ready_count
       delegate_to: "{{ groups['control_plane'][1] }}"
       run_once: true
@@ -115,6 +180,26 @@
     # keeps heartbeating and never goes NotReady.
     extra_peer_ips:
       - "{{ api_vip }}"
+    # What this fault must observably do for the run to count as a measurement.
+    # The default for network_asymmetric is target_node_status_changed alone;
+    # S2 now asserts more than "worker1 went NotReady", so it declares more.
+    #
+    # placement_changed is the added one. The enriched claim is that a SECOND
+    # copy of postgres-stateful-0 ran on a healthy node while the original kept
+    # running on the partitioned one, and wrote to the same volume. If the set
+    # of running containers per node never changed against the baseline, the
+    # replacement never started — and then the divergence ledger contains one
+    # writer, the concurrent window is empty, and every invariant verdict in
+    # the run describes an undisturbed cluster. Declaring it here is what makes
+    # check-invariants.sh label such a run FAULT_INEFFECTIVE instead of quietly
+    # contributing a PRESERVED I1 to the aggregate.
+    #
+    # Both signal names are ones scripts/check-invariants.sh already computes
+    # (see fault_efficacy there).
+    efficacy_target_node: worker1
+    efficacy_require:
+      - target_node_status_changed
+      - placement_changed
   roles:
     - role: fault-inject
 
@@ -188,6 +273,176 @@
         dest: "{{ results_dir }}/worker1_actual_containers_during_fault.json"
         content: "{{ worker1_actual_containers.stdout }}"
       delegate_to: "{{ groups['observer'][0] }}"
+
+- name: S2 — Collect the divergent-write evidence from the shared volume
+  # Runs while the partition is still up, so the ledger is read at the moment
+  # of maximum evidentiary value: the original copy of postgres-stateful-0 is
+  # still running on isolated worker1 and the replacement is still running on a
+  # healthy worker, both appending to one file on one volume.
+  #
+  # Read from the NFS server's own filesystem rather than from inside a pod.
+  # The export directory IS the volume, so this sees exactly the bytes both
+  # kubelets wrote, needs no exec into a container the API may not be able to
+  # reach, and cannot itself perturb the workload. The observer is a macOS
+  # controller and cannot mount NFS, which is the other reason not to try.
+  hosts: workers
+  gather_facts: no
+  vars:
+    scenario_id: s2
+    # Kept in step with roles/nfs-server/defaults/main.yml.
+    nfs_server_host: worker3
+    nfs_export_path: /srv/nfs/k8s
+    nfs_divergence_log: divergence.log
+    nfs_owner_file: owner.txt
+  tasks:
+    - name: Collect and analyse the shared-volume write ledger
+      when: inventory_hostname == nfs_server_host
+      # block/always, and every read marked non-fatal, for one reason: the
+      # teardown play is the next thing that runs and it must not be skipped.
+      # An aborted play here would leave worker1's iptables DROP rules in
+      # place and poison every scenario that follows. Evidence collection is
+      # allowed to come back empty; it is never allowed to abort the run.
+      block:
+        - name: Read the append-only ledger both copies wrote to
+          shell: cat {{ nfs_export_path }}/{{ nfs_divergence_log }}
+          register: s2_ledger
+          changed_when: false
+          failed_when: false
+
+        - name: Read the last-writer-wins ownership file
+          # A single shared object each copy clobbers once a second. With one
+          # writer it is stable; with two it names whichever copy wrote most
+          # recently — a conflicting write, captured as a value rather than as
+          # an interleaving.
+          shell: cat {{ nfs_export_path }}/{{ nfs_owner_file }}
+          register: s2_owner
+          changed_when: false
+          failed_when: false
+
+        - name: Summarise the ledger into divergent-write evidence
+          # awk splits the ledger into per-writer intervals keyed by pod UID
+          # (both copies carry the SAME pod name — that is the finding — so the
+          # UID is what separates them), jq assembles the JSON.
+          #
+          # The observables:
+          #   distinct_pod_uids   > 1 with distinct_pod_names == 1: two
+          #                       processes claimed one StatefulSet identity
+          #   distinct_nodes      > 1: they ran on different nodes
+          #   concurrent_window   the intersection of the writers' intervals.
+          #                       Non-empty means they were writing to the same
+          #                       file at the same time — nothing fenced either
+          #   writer_alternations how many times consecutive records switch
+          #                       writer: direct interleaving in one file
+          #   torn_records        lines that do not parse. O_APPEND is not
+          #                       atomic over NFS, so shredded records are
+          #                       themselves evidence of unserialised writers
+          shell: |
+            set -o pipefail
+            LEDGER={{ nfs_export_path }}/{{ nfs_divergence_log }}
+            awk '
+              {
+                ts = $1; uid = ""; node = ""; pod = "";
+                for (i = 2; i <= NF; i++) {
+                  p = index($i, "=");
+                  if (p > 0) {
+                    k = substr($i, 1, p - 1); v = substr($i, p + 1);
+                    if (k == "uid") uid = v;
+                    else if (k == "node") node = v;
+                    else if (k == "pod") pod = v;
+                  }
+                }
+                total++;
+                if (uid == "" || node == "" || pod == "" || ts !~ /^[0-9][0-9][0-9][0-9]-/) {
+                  malformed++;
+                  next;
+                }
+                key = uid "|" node "|" pod;
+                if (!(key in cnt)) {
+                  nw++; wkey[nw] = key;
+                  uidof[key] = uid; nodeof[key] = node; podof[key] = pod;
+                  first[key] = ts;
+                }
+                cnt[key]++;
+                last[key] = ts;
+                if (prev != "" && prev != key) alt++;
+                prev = key;
+                valid++;
+              }
+              END {
+                for (j = 1; j <= nw; j++) {
+                  k = wkey[j];
+                  printf "W\t%s\t%s\t%s\t%d\t%s\t%s\n", uidof[k], nodeof[k], podof[k], cnt[k], first[k], last[k];
+                }
+                printf "T\t%d\t%d\t%d\t%d\n", total + 0, valid + 0, malformed + 0, alt + 0;
+              }
+            ' "$LEDGER" \
+            | jq -R -s --arg ledger "$LEDGER" '
+                (split("\n") | map(select(length > 0) | split("\t"))) as $rows
+                | ($rows | map(select(.[0] == "W"))
+                         | map({ uid: .[1], node: .[2], pod: .[3],
+                                 records: (.[4] | tonumber),
+                                 first_ts: .[5], last_ts: .[6] })) as $w
+                | ($rows | map(select(.[0] == "T")) | .[0]) as $t
+                | ($w | map(.first_ts) | max) as $ws
+                | ($w | map(.last_ts)  | min) as $we
+                | ($w | map(.uid)  | unique | length) as $nuid
+                | ($w | map(.node) | unique | length) as $nnode
+                | ($w | map(.pod)  | unique | length) as $npod
+                | ($nuid > 1 and $nnode > 1 and $npod == 1 and $ws <= $we) as $unfenced
+                | {
+                    ledger: $ledger,
+                    total_records:       (if $t then ($t[1] | tonumber) else 0 end),
+                    parsed_records:      (if $t then ($t[2] | tonumber) else 0 end),
+                    torn_records:        (if $t then ($t[3] | tonumber) else 0 end),
+                    writer_alternations: (if $t then ($t[4] | tonumber) else 0 end),
+                    distinct_pod_uids:  $nuid,
+                    distinct_nodes:     $nnode,
+                    distinct_pod_names: $npod,
+                    writers: $w,
+                    concurrent_window: {
+                      start: (if $unfenced then $ws else null end),
+                      end:   (if $unfenced then $we else null end),
+                      overlapping: $unfenced
+                    },
+                    verdict: (if $unfenced then "UNFENCED_CONCURRENT_WRITES" else "SINGLE_WRITER" end),
+                    note: "UNFENCED_CONCURRENT_WRITES = one StatefulSet identity, two pod UIDs on two nodes, with overlapping write intervals on one shared volume. SINGLE_WRITER = only one copy ever wrote, so the run carries no dual-ownership harm."
+                  }
+              '
+          register: s2_divergence
+          changed_when: false
+          failed_when: false
+
+      always:
+        - name: Save the raw shared-volume ledger
+          copy:
+            dest: "{{ results_dir }}/nfs_divergence_ledger.txt"
+            content: "{{ s2_ledger.stdout | default('') }}\n"
+          delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Save the divergent-write evidence
+          copy:
+            dest: "{{ results_dir }}/divergent_writes.json"
+            # `, true` on every default here: a task that ran but produced
+            # nothing registers an EMPTY stdout, not an undefined one, and a
+            # plain default() would let the empty string through.
+            content: "{{ s2_divergence.stdout | default('{\"verdict\": \"NO_DATA\", \"note\": \"the ledger could not be read from the NFS export\"}', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Save the last-writer-wins ownership file
+          copy:
+            dest: "{{ results_dir }}/nfs_owner_last_writer.txt"
+            content: "{{ s2_owner.stdout | default('') }}\n"
+          delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Report the divergent-write verdict
+          debug:
+            msg: >-
+              S2 divergent writes:
+              {{ (s2_divergence.stdout | default('{}', true) | from_json).verdict | default('NO_DATA', true) }}
+          # from_json on unparseable output would raise inside always:, which
+          # is the one place a failure must never happen — this whole block
+          # exists to keep the teardown play reachable.
+          ignore_errors: true
 
 - name: S2 — Tear down asymmetric block
   hosts: worker1

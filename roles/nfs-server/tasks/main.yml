@@ -1,0 +1,40 @@
+---
+# roles/nfs-server/tasks/main.yml
+#
+# Provides the one thing this lab was missing: a PersistentVolume with no node
+# affinity. Every alternative available on bare vSphere VMs (hostPath,
+# local-path-provisioner, a `local` PV) pins the volume to a node, and a
+# node-pinned volume is fatal to the dual-ownership scenarios — the replacement
+# pod is dragged back to the partitioned node and stays Pending instead of
+# running as a second live copy elsewhere. NFS is the cheapest volume type that
+# is genuinely node-agnostic.
+#
+# Run this over `k8s_cluster` (it needs the export host, every node that might
+# mount it, and a control-plane host to apply the manifests):
+#
+#   - hosts: k8s_cluster
+#     roles: [nfs-server]
+#
+# The whole role is idempotent end to end, which is a requirement and not a
+# nicety: the fleet is destroyed and recreated constantly, so the export has to
+# be reconstructed by a playbook every time and can never be a hand-made
+# artefact on one VM.
+
+- name: Configure the NFS export
+  include_tasks: server.yml
+  when: inventory_hostname == nfs_server_host
+
+- name: Install the NFS client on every node that might mount the volume
+  # The kubelet mounts NFS with the *host's* mount.nfs binary, not with
+  # anything inside the container. Without nfs-common the pod fails to start
+  # with "bad option; for several filesystems you might need a /sbin/mount.<type>
+  # helper program", which reads like a manifest error and is not one.
+  include_tasks: client.yml
+  when: inventory_hostname in groups['k8s_cluster']
+
+- name: Publish the shared PersistentVolume and PersistentVolumeClaim
+  # Gated to a single host so the manifests are applied once per play. The
+  # tasks inside delegate to nfs_kubectl_host, so this works even when that
+  # host is not itself in the play.
+  include_tasks: k8s-objects.yml
+  when: inventory_hostname == ansible_play_hosts_all[0]

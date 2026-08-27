@@ -1,0 +1,65 @@
+---
+# scenarios/s25/scrape-controllers.yml
+# Scrapes kube-controller-manager (:10257) and kube-scheduler (:10259) /metrics
+# from each control-plane node's own local endpoint, and saves the filtered
+# lines to the observer's results_dir. Called with:
+#   ctl_label   snapshot label (baseline / flood_mid / flood_end / post_flood)
+#
+# This is the "what the control plane SAW / DID" instrumentation — the other
+# half of the cannot-observe vs. did-not-act distinction:
+#   workqueue_adds_total              — events entering a controller's queue.
+#                                       Still climbing = the controller is
+#                                       OBSERVING (its watch delivered events);
+#                                       flatlined = it cannot even observe.
+#   workqueue_depth                   — queued work not yet processed. Rising
+#                                       without draining = observed but not
+#                                       acting.
+#   workqueue_unfinished_work_seconds — how long the oldest queued item has sat.
+#   workqueue_retries_total           — reconcile attempts that had to requeue
+#                                       (e.g. because their write was 429'd).
+#   rest_client_requests_total{429}   — the controller's OWN client seeing 429
+#                                       from the API server, split by method:
+#                                       GET vs POST/PUT/PATCH/DELETE == the
+#                                       read/write (observe/act) split at the
+#                                       controller itself.
+#   leader_election_master_status     — 1 while this instance holds leadership;
+#                                       pairs with the lease renew times in the
+#                                       metrics-collect snapshots to show the
+#                                       leases stayed healthy (protected level).
+#
+# The admin.conf client cert (group system:masters -> cluster-admin) authorises
+# /metrics on both components. We extract it to a tmp file per scrape rather
+# than relying on any pre-provisioned monitoring token. Best-effort: a control
+# plane node whose component is momentarily unreachable records nothing for that
+# snapshot rather than failing the run.
+
+- name: "Controller scrape ({{ ctl_label }}) — pull workqueue/leader metrics locally"
+  shell: |
+    set -u
+    KCFG=/etc/kubernetes/admin.conf
+    CRT=$(mktemp); KEY=$(mktemp)
+    grep 'client-certificate-data' "$KCFG" | awk '{print $2}' | base64 -d > "$CRT" 2>/dev/null || true
+    grep 'client-key-data'         "$KCFG" | awk '{print $2}' | base64 -d > "$KEY" 2>/dev/null || true
+    for port in 10257 10259; do
+      echo "# ---- component on 127.0.0.1:${port} ----"
+      curl -sk --cert "$CRT" --key "$KEY" --max-time 5 \
+        "https://127.0.0.1:${port}/metrics" 2>/dev/null \
+        | grep -E 'workqueue_depth|workqueue_adds_total|workqueue_unfinished_work_seconds|workqueue_retries_total|workqueue_longest_running_processor_seconds|rest_client_requests_total\{.*code="429"|leader_election_master_status' \
+        || true
+    done
+    rm -f "$CRT" "$KEY"
+  args:
+    executable: /bin/bash
+  register: ctl_metrics
+  when: inventory_hostname in groups['control_plane']
+  changed_when: false
+  ignore_errors: yes
+  ignore_unreachable: yes
+
+- name: "Controller scrape ({{ ctl_label }}) — save filtered metrics per control-plane node"
+  copy:
+    dest: "{{ results_dir }}/controllers_{{ ctl_label }}_{{ item }}.txt"
+    content: "{{ hostvars[item].ctl_metrics.stdout | default('', true) }}"
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+  loop: "{{ groups['control_plane'] }}"

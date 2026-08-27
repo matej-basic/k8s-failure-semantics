@@ -139,6 +139,94 @@
   import_playbook: _health-check.yml
   tags: s19
 
+# ── Gray-failure scenarios (S20-S28) ─────────────────────────────────────────
+# Added from REVIEW.md section 3. The existing library covers clean crash-stop
+# and timing failures; these sample the region where the node stays Ready and
+# nothing works, which is where production clusters actually fail.
+#
+# S22 and S27 each have a second variant that is NOT run here. The variant is
+# selected by a play var the scenario defines itself, so it cannot be overridden
+# from an import_playbook; run those passes explicitly instead:
+#     ansible-playbook ... scenarios/s22/playbook.yml -e s22_variant=kubelet
+#     ansible-playbook ... scenarios/s27/playbook.yml -e s27_variant=substrate
+# Both write to their scenario's results dir, so run them with a distinct run_id
+# if you want to keep both passes from one sweep.
+
+- name: S20 — Pod-network partition, management network intact
+  import_playbook: ../scenarios/s20/playbook.yml
+  tags: s20
+
+- name: Post-S20 health check
+  import_playbook: _health-check.yml
+  tags: s20
+
+- name: S21 — Keepalived VIP split-brain
+  import_playbook: ../scenarios/s21/playbook.yml
+  tags: s21
+
+- name: Post-S21 health check
+  import_playbook: _health-check.yml
+  tags: s21
+
+- name: S22 — Container runtime freeze (omission failure)
+  import_playbook: ../scenarios/s22/playbook.yml
+  tags: s22
+
+- name: Post-S22 health check
+  import_playbook: _health-check.yml
+  tags: s22
+
+- name: S23 — etcd NOSPACE (cluster read-only, every health check green)
+  import_playbook: ../scenarios/s23/playbook.yml
+  tags: s23
+
+- name: Post-S23 health check
+  import_playbook: _health-check.yml
+  tags: s23
+
+- name: S24 — Admission webhook timeout (Fail vs Ignore)
+  import_playbook: ../scenarios/s24/playbook.yml
+  tags: s24
+
+- name: Post-S24 health check
+  import_playbook: _health-check.yml
+  tags: s24
+
+- name: S25 — API priority-and-fairness starvation
+  import_playbook: ../scenarios/s25/playbook.yml
+  tags: s25
+
+- name: Post-S25 health check
+  import_playbook: _health-check.yml
+  tags: s25
+
+- name: S26 — Node object deleted while the kubelet lives
+  import_playbook: ../scenarios/s26/playbook.yml
+  tags: s26
+
+- name: Post-S26 health check
+  import_playbook: _health-check.yml
+  tags: s26
+
+- name: S27 — Negative clock skew
+  import_playbook: ../scenarios/s27/playbook.yml
+  tags: s27
+
+- name: Post-S27 health check
+  import_playbook: _health-check.yml
+  tags: s27
+
+# S28 runs LAST on purpose: it is the only scenario that mutates etcd
+# membership (remove, wipe, re-add as a learner). Take a baseline snapshot
+# before it and revert after — see scripts/snapshot-baseline.sh.
+- name: S28 — Stale etcd member rejoining after compaction
+  import_playbook: ../scenarios/s28/playbook.yml
+  tags: s28
+
+- name: Post-S28 health check
+  import_playbook: _health-check.yml
+  tags: s28
+
 - name: Generate combined results report
   hosts: "{{ groups['observer'][0] }}"
   gather_facts: no

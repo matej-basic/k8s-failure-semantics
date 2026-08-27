@@ -8,7 +8,7 @@ set -euo pipefail
 
 BASE="${1:-/opt/k8s-results}"
 
-SCENARIOS=(s1 s2 s3 s4 s5 s6 s8 s11 s12 s14 s15 s17 s18 s19)
+SCENARIOS=(s1 s2 s3 s4 s5 s6 s8 s11 s12 s14 s15 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28)
 INVARIANTS=(I1 I2 I3 I4 I5 I6 I9 I10)
 
 # ── Collect per-scenario invariant verdicts ───────────────────────────────────

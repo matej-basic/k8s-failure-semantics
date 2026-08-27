@@ -92,6 +92,37 @@ octets in the `vm_specs` map if your network differs.
 - High-availability control plane: three API servers behind a keepalived
   virtual IP (`10.0.0.59`)
 
+## Gray-failure scenarios (S20-S28)
+
+Added from `REVIEW.md` section 3. The original library covers clean crash-stop
+and timing failures; production clusters mostly fail *gray* — the node stays
+Ready while nothing works — and that region was unsampled.
+
+| ID | Fault | What makes it observer-relative |
+|----|-------|--------------------------------|
+| S20 | Pod-network partition, management network intact | Heartbeats ride `ens192` so every node stays Ready while the data plane is dead. Requires Calico to run over `ens224` — it does; the scenario asserts it before injecting |
+| S21 | Keepalived VIP split-brain | Two control-plane nodes claim `10.0.0.59` at once. Dual authority at the network layer rather than the pod layer |
+| S22 | containerd / kubelet freeze (`SIGSTOP`) | Omission rather than crash-stop: the process resumes with stale state and a backlog of missed watch events. Second variant: `-e s22_variant=kubelet` |
+| S23 | etcd `NOSPACE` alarm | Cluster goes read-only while every health check stays green. Raised via `--quota-backend-bytes`, not by filling the disk — a full disk kills the member instead, which is S19's fault |
+| S24 | Admission webhook timeout | `failurePolicy: Fail` vs `Ignore` — same fault, opposite semantics, one field apart |
+| S25 | API priority-and-fairness starvation | Everything Ready, controllers starved. Tests whether the suite can tell "cannot observe" from "observed and chose not to act" |
+| S26 | Node object deleted, kubelet alive | Identity re-creation with a live substrate: same name, new UID |
+| S27 | Negative and substrate clock skew | Backward skew makes leases never expire (S4's forward skew expires them early); substrate skew moves the problem below the controllers. Second variant: `-e s27_variant=substrate` |
+| S28 | Stale etcd member rejoining after compaction | Extends S17 into the recovery phase. **Runs last** — the only scenario that mutates etcd membership |
+
+Notes that matter before running these:
+
+- **S22 and S27 each have a second variant** that `run-all-scenarios.yml` does
+  not run, because the variant is a play var the scenario defines itself and
+  cannot be overridden from an `import_playbook`. Run those passes explicitly.
+- **S28 mutates etcd membership.** Take a baseline snapshot before it and
+  revert after — see `scripts/snapshot-baseline.sh` and
+  `scripts/revert-baseline.sh`.
+- Several of these faults leave the snapshot schema unchanged by design, so
+  they cannot yet certify their own efficacy through `check-invariants.sh` and
+  carry scenario-local evidence files instead. The signals that would close
+  that gap are listed in each scenario's header comment.
+
 ## Reset Between Scenarios
 
 Each scenario playbook:

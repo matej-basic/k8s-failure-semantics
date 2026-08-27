@@ -22,7 +22,7 @@
     snapshot_label: pre_fault
   tasks:
     - name: Verify cluster is healthy before starting
-      shell: kubectl get nodes --no-headers | grep -v Ready | wc -l
+      shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
       register: not_ready_count
       delegate_to: "{{ groups['control_plane'][0] }}"
       run_once: true

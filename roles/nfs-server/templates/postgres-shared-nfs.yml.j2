@@ -1,0 +1,82 @@
+# roles/nfs-server/templates/postgres-shared-nfs.yml.j2
+# Rendered and applied by roles/nfs-server/tasks/k8s-objects.yml.
+#
+# The shared volume that postgres-stateful mounts. Its whole reason to exist is
+# that it is reachable identically from every node, so that a force-deleted
+# StatefulSet pod recreated on a healthy node mounts the SAME bytes the
+# original copy is still writing on the partitioned node.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ nfs_pv_name }}
+  labels:
+    lab: k8s-failure-semantics
+    purpose: dual-ownership-evidence
+spec:
+  capacity:
+    storage: {{ nfs_capacity }}
+  # ReadWriteMany. Two pods on two different nodes have to mount this at the
+  # same time for the experiment to exist at all. It is worth being precise
+  # about what this does and does not concede: access modes are binding-time
+  # metadata, not an enforced lock — the in-tree NFS plugin has no Attacher, so
+  # the second mount would succeed under ReadWriteOnce too. Declaring RWX is
+  # honest about the topology rather than relying on that. It also does not
+  # weaken the finding: the invariant under test (I1) is exclusive *ownership
+  # of a stable identity*, and RWX says nothing about whether two processes may
+  # both be postgres-stateful-0.
+  accessModes:
+    - ReadWriteMany
+  # Retain: the evidence written during a scenario must survive the PVC.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ nfs_storage_class }}
+  mountOptions:
+    # Deliberately close to the defaults: a hard mount, so a stalled write
+    # blocks instead of being silently discarded. A soft mount would let the
+    # kernel drop records under load and the divergence ledger has to be
+    # truthful about what was actually written.
+    - nfsvers=4.1
+    - hard
+  # Pre-binding to exactly one claim, so the volume cannot be captured by an
+  # unrelated PVC on a redeploy.
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    namespace: {{ nfs_pvc_namespace }}
+    name: {{ nfs_pvc_name }}
+  # ── No node affinity. This is the load-bearing property. ──────────────────
+  # It is guaranteed structurally, not by omission-and-hope:
+  #   1. `spec.nodeAffinity` is absent from this manifest. On a PV that field
+  #      is never defaulted or injected by any controller — an NFS PV that
+  #      does not declare it has none, permanently.
+  #   2. The volume source is `nfs:`, an address on the network. Unlike
+  #      `local:` — which the API server REJECTS unless spec.nodeAffinity is
+  #      set — an NFS source has no node to be affine to. The choice of volume
+  #      type is what makes the absence safe, not the absence itself.
+  #   3. `storageClassName` names a class that does not exist as an object, so
+  #      no dynamic provisioner can substitute a node-pinned volume for this
+  #      one; and the claimRef above means the claim binds here or nowhere.
+  #   4. roles/nfs-server/tasks/k8s-objects.yml reads .spec.nodeAffinity back
+  #      off the live PV after applying and fails the run if it is non-empty.
+  # Consequence: the scheduler applies no volume-derived node constraint to
+  # postgres-stateful-0, so a replacement pod created while the original node
+  # is partitioned schedules on any healthy worker.
+  nfs:
+    server: {{ nfs_server_ip }}
+    path: {{ nfs_export_path }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ nfs_pvc_name }}
+  namespace: {{ nfs_pvc_namespace }}
+  labels:
+    lab: k8s-failure-semantics
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ nfs_storage_class }}
+  volumeName: {{ nfs_pv_name }}
+  resources:
+    requests:
+      storage: {{ nfs_capacity }}

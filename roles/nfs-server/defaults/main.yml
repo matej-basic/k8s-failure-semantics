@@ -1,0 +1,89 @@
+---
+# roles/nfs-server/defaults/main.yml
+#
+# Shared, node-agnostic storage for the fault-injection lab.
+#
+# Adapted from performance-benchmark-framework's
+# `kubernetes-deployment/plays/12-nfs-server.yml`. What was kept: the
+# nfs-kernel-server install, the exported directory, the export line, the
+# service restart. What was deliberately dropped or changed:
+#
+#   * the sibling's `ufw: rule=allow port=nfs state=enabled` task. That task
+#     does not just poke a hole — `state: enabled` turns ufw ON. On this lab
+#     that would firewall a live HA cluster (apiserver 6443, etcd 2379/2380,
+#     kubelet 10250, keepalived VRRP) in the middle of a scenario and would
+#     be indistinguishable from an injected fault. These VMs run with no
+#     host firewall by design; the only packet filter they carry is the one
+#     the fault-inject role installs and removes per run.
+#   * `lineinfile` on /etc/exports -> a whole managed file under
+#     /etc/exports.d/. The lab is destroyed and recreated constantly, so the
+#     export must be reproduced from scratch every run rather than accreting
+#     lines; a managed file is idempotent in a way lineinfile is not once the
+#     export options change.
+#   * `mode: 777` (octal-as-decimal, an Ansible footgun) -> '0777' quoted.
+#   * export ACL narrowed from 10.0.0.0/8 to this lab's management /24.
+#   * host chosen from the inventory rather than hardcoded to `doktor2`.
+
+# ── Which host serves the export ──────────────────────────────────────────────
+# worker3, deliberately.
+#
+# The constraint that decides this: whichever host serves the export must stay
+# reachable *from the node the scenario partitions*, or the isolated copy of
+# postgres-stateful-0 loses its volume the moment the fault lands and the
+# divergent-write measurement records one writer instead of two.
+#
+# S2 blocks worker1's OUTBOUND traffic to cp1, cp2, cp3, etcd1-5 and the API
+# VIP. That rules out every control-plane and etcd host: putting the export on
+# any of them means S2 partitions away its own storage and proves nothing.
+# worker1 itself is the partition target, so it is out too. That leaves
+# worker2 and worker3.
+#
+# Between those two, worker3 is the only host in the fleet that no scenario in
+# the suite network-partitions: S8 puts an outbound block on worker2, while the
+# only fault aimed at worker3 (S18) is memory pressure, which degrades the
+# export's latency but never severs it. So worker3 is reachable from every node
+# in every scenario currently in the suite.
+#
+# A future scenario that does partition worker3 must override this — but note
+# that re-pointing it also means re-creating the PV (spec.nfs.server is
+# immutable), so `nfs_pv_name` has to change with it.
+nfs_server_host: worker3
+nfs_server_ip: "{{ hostvars[nfs_server_host].ansible_host }}"
+
+# ── The export ────────────────────────────────────────────────────────────────
+nfs_export_path: /srv/nfs/k8s
+nfs_export_clients: "10.0.0.0/24"          # the ens192 management network
+# no_root_squash: the postgres image's entrypoint runs as root before it
+# gosu's down to uid 999, and the divergence writer runs as root outright.
+# With root squashed neither can create its directory on the export.
+nfs_export_options: "rw,sync,no_root_squash,no_subtree_check"
+
+# Ensuring the export directory exists is idempotent; wiping it is not, and the
+# role is re-run at the start of a scenario while postgres is already serving
+# from it. Left false by default so a re-run never destroys a live data
+# directory; a scenario that wants a clean slate truncates the specific files
+# it reads as evidence instead.
+nfs_reset_export: false
+
+# ── The Kubernetes objects ────────────────────────────────────────────────────
+nfs_pv_name: postgres-shared-nfs
+nfs_pvc_name: postgres-shared-nfs           # must match the claimName in
+                                            # roles/k8s-install/files/postgres-stateful.yml
+nfs_pvc_namespace: default
+nfs_capacity: 5Gi
+# A storageClassName that matches no StorageClass object. Static binding still
+# works (the PV controller matches PV and PVC on the string), and naming it
+# stops a default StorageClass — if one is ever installed — from hijacking the
+# claim and dynamically provisioning something node-affine underneath it.
+nfs_storage_class: nfs-shared-manual
+
+# Where kubectl runs. cp2, not cp1, for the reason recorded in
+# roles/metrics-collect/tasks/main.yml: cp1 holds the keepalived VIP, is the
+# busiest node, and is the one most scenarios partition.
+nfs_kubectl_host: "{{ groups['control_plane'][1] }}"
+nfs_kubeconfig: /etc/kubernetes/admin.conf
+
+# ── Evidence files written on the export by the divergence writer ─────────────
+# Consumed by scenarios/s2/playbook.yml.
+nfs_divergence_log: divergence.log
+nfs_owner_file: owner.txt

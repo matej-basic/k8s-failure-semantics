@@ -1,0 +1,215 @@
+---
+# scenarios/s24/half.yml
+# One half of S24, parameterised by `s24_failure_policy` (Fail | Ignore).
+#
+# The playbook includes this file twice, from a loop, so the two halves are
+# the same code path by construction — there is no second copy that could
+# drift. Everything below is identical between halves except the value of
+# s24_failure_policy, which is substituted into the webhook manifest and into
+# the names of the probe objects.
+#
+# Suffix convention: `fail` / `ignore`, used for snapshot labels, result
+# filenames and probe object names, so the two halves never collide (in
+# particular, a Fail-half object that unexpectedly got created cannot make
+# the Ignore-half create fail with AlreadyExists and muddy the comparison).
+
+- name: "S24[{{ s24_failure_policy }}] — Register the black-holing webhook"
+  shell: kubectl apply -f -
+  args:
+    stdin: "{{ lookup('template', 'templates/webhook.yml.j2') }}"
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ s24_kubectl_host }}"
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Let the webhook registration propagate to every API server"
+  # Webhook configurations reach each API server through its own informer.
+  # Driving an admission attempt immediately after apply can race a server
+  # that has not yet seen the object, which would look like "Fail did not
+  # reject" — a false negative on the headline result.
+  pause:
+    seconds: 15
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Confirm the webhook is registered with the expected policy"
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl get validatingwebhookconfiguration {{ s24_webhook_name }} \
+      -o jsonpath='{.webhooks[0].failurePolicy}'
+  register: s24_live_policy
+  delegate_to: "{{ s24_kubectl_host }}"
+  run_once: true
+  failed_when: (s24_live_policy.stdout | trim) != s24_failure_policy
+
+- name: "S24[{{ s24_failure_policy }}] — Drive real admission attempts through the black hole"
+  # Three writes, all from a control-plane node against a fully healthy
+  # cluster:
+  #
+  #   intercepted.configmap  CREATE of a labelled ConfigMap in the probe
+  #                          namespace — matches the rule, the namespace
+  #                          selector and the object selector, so it is sent
+  #                          to the dead endpoint.
+  #   intercepted.pod        CREATE of a labelled Pod in the same namespace —
+  #                          same path, but with a consequence you can see in
+  #                          crictl: under Ignore a container actually starts,
+  #                          under Fail the cluster simply cannot place a
+  #                          workload it is perfectly capable of running.
+  #   control.configmap      CREATE of an *unlabelled* ConfigMap in `default`
+  #                          — out of scope for both selectors, so it never
+  #                          touches the webhook. This is the healthy-cluster
+  #                          control: its latency and success are what make
+  #                          "the cluster is fine, it just cannot act"
+  #                          a measurement rather than an assertion.
+  #
+  # Latency is recorded for all three. The interesting number is that the two
+  # intercepted writes take ~timeoutSeconds in BOTH halves — Ignore does not
+  # make the fault cheap, it only makes it non-fatal.
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    NS="{{ s24_probe_ns }}"
+    POL="{{ s24_failure_policy }}"
+    SUF="{{ s24_failure_policy | lower }}"
+    LABEL="{{ s24_probe_label_key }}"
+
+    attempt() {
+      local kind="$1" start end rc out
+      start=$(date +%s%3N)
+      out=$(kubectl --request-timeout=90s create -f - 2>&1)
+      rc=$?
+      end=$(date +%s%3N)
+      jq -cn \
+        --arg kind "$kind" \
+        --argjson rc "$rc" \
+        --argjson ms "$((end - start))" \
+        --arg msg "$out" \
+        '{object: $kind, rc: $rc, created: ($rc == 0), latency_ms: $ms, message: $msg}'
+    }
+
+    CM=$(attempt "configmap/${NS}/s24-probe-cm-${SUF}" <<YAML
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: s24-probe-cm-${SUF}
+      namespace: ${NS}
+      labels:
+        ${LABEL}: "true"
+    data:
+      failurePolicy: "${POL}"
+    YAML
+    )
+
+    POD=$(attempt "pod/${NS}/s24-probe-pod-${SUF}" <<YAML
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: s24-probe-pod-${SUF}
+      namespace: ${NS}
+      labels:
+        ${LABEL}: "true"
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+      - name: probe
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+    YAML
+    )
+
+    CTRL=$(attempt "configmap/default/s24-control-cm-${SUF}" <<YAML
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: s24-control-cm-${SUF}
+      namespace: default
+    data:
+      failurePolicy: "${POL}"
+    YAML
+    )
+    kubectl delete configmap "s24-control-cm-${SUF}" -n default \
+      --ignore-not-found >/dev/null 2>&1 || true
+
+    jq -cn \
+      --arg pol "$POL" \
+      --arg live "{{ s24_live_policy.stdout | default('') | trim }}" \
+      --arg url "{{ s24_blackhole_url }}" \
+      --argjson timeout {{ s24_webhook_timeout }} \
+      --argjson cm "$CM" \
+      --argjson pod "$POD" \
+      --argjson ctrl "$CTRL" \
+      '{
+         failure_policy: $pol,
+         webhook_failure_policy_observed: $live,
+         webhook_endpoint: $url,
+         webhook_timeout_seconds: $timeout,
+         intercepted: {configmap: $cm, pod: $pod},
+         control_unintercepted: {configmap: $ctrl}
+       }'
+  args:
+    executable: /bin/bash
+  register: s24_attempt
+  delegate_to: "{{ s24_kubectl_host }}"
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Save this half's admission result"
+  copy:
+    dest: "{{ results_dir }}/admission_attempt_{{ s24_failure_policy | lower }}.json"
+    content: "{{ s24_attempt.stdout }}"
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Wait for the probe pod to run (only when admission let it through)"
+  # Reached only in the half where the broken webhook was ignored. Waiting
+  # here is what puts the new container into the crictl view that
+  # metrics-collect reads on the next snapshot, which is what the
+  # placement_changed efficacy signal is measured from.
+  shell: |
+    kubectl get pod s24-probe-pod-{{ s24_failure_policy | lower }} \
+      -n {{ s24_probe_ns }} -o jsonpath='{.status.phase}' | grep -q Running
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  delegate_to: "{{ s24_kubectl_host }}"
+  run_once: true
+  register: s24_pod_running
+  until: s24_pod_running.rc == 0
+  retries: 20
+  delay: 3
+  when: (s24_attempt.stdout | from_json).intercepted.pod.created | bool
+
+- name: "S24[{{ s24_failure_policy }}] — Snapshot while the fault is active"
+  include_role:
+    name: metrics-collect
+  vars:
+    snapshot_label: "{{ s24_failure_policy | lower }}_active"
+
+- name: "S24[{{ s24_failure_policy }}] — Hold the fault for fault_duration"
+  pause:
+    seconds: "{{ fault_duration | int }}"
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Snapshot at the end of the hold"
+  include_role:
+    name: metrics-collect
+  vars:
+    snapshot_label: "{{ s24_failure_policy | lower }}_hold"
+
+- name: "S24[{{ s24_failure_policy }}] — Remove the webhook (end of this half)"
+  # DELETE on admissionregistration.k8s.io — a verb and a group the webhook's
+  # rule set does not cover — so this call cannot be intercepted by the very
+  # object it is removing, whatever failurePolicy is in force.
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl delete validatingwebhookconfiguration {{ s24_webhook_name }} \
+      --ignore-not-found --timeout=30s
+    kubectl delete validatingwebhookconfiguration -l fault-inject=s24 \
+      --ignore-not-found --timeout=30s
+  delegate_to: "{{ s24_kubectl_host }}"
+  run_once: true
+
+- name: "S24[{{ s24_failure_policy }}] — Settle before the next half"
+  pause:
+    seconds: 15
+  run_once: true

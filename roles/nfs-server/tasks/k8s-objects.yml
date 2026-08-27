@@ -1,0 +1,47 @@
+---
+# roles/nfs-server/tasks/k8s-objects.yml
+# Applied once per play, delegated to nfs_kubectl_host.
+#
+# The manifest is rendered on the controller and fed to `kubectl apply -f -`
+# over stdin, the same way roles/k8s-install/tasks/deploy-workloads.yml applies
+# the workloads — no copy of it is left on the node.
+
+- name: Apply the shared NFS PersistentVolume and PersistentVolumeClaim
+  shell: kubectl apply -f -
+  args:
+    stdin: "{{ lookup('template', 'postgres-shared-nfs.yml.j2') }}"
+  environment:
+    KUBECONFIG: "{{ nfs_kubeconfig }}"
+  delegate_to: "{{ nfs_kubectl_host }}"
+  register: nfs_apply
+  changed_when: "'unchanged' not in nfs_apply.stdout"
+
+- name: Wait for the shared PVC to bind
+  # The PV carries a claimRef naming this PVC, so binding is immediate and
+  # exclusive — no other claim can capture the volume, and this claim cannot
+  # be satisfied by any other volume.
+  shell: |
+    kubectl get pvc {{ nfs_pvc_name }} -n {{ nfs_pvc_namespace }} \
+      -o jsonpath='{.status.phase}'
+  environment:
+    KUBECONFIG: "{{ nfs_kubeconfig }}"
+  delegate_to: "{{ nfs_kubectl_host }}"
+  register: nfs_pvc_phase
+  until: nfs_pvc_phase.stdout == 'Bound'
+  retries: 20
+  delay: 5
+  changed_when: false
+
+- name: Assert the bound PV carries no node affinity
+  # The property the dual-ownership scenarios depend on, checked against the
+  # live object rather than assumed from the manifest. If this ever comes back
+  # non-null, a replacement pod would be constrained to the node the fault
+  # partitioned and the scenario would silently measure nothing.
+  shell: |
+    kubectl get pv {{ nfs_pv_name }} -o jsonpath='{.spec.nodeAffinity}'
+  environment:
+    KUBECONFIG: "{{ nfs_kubeconfig }}"
+  delegate_to: "{{ nfs_kubectl_host }}"
+  register: nfs_pv_affinity
+  changed_when: false
+  failed_when: nfs_pv_affinity.stdout | trim | length > 0

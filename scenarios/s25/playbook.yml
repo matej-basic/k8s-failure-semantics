@@ -1,0 +1,654 @@
+---
+# scenarios/s25/playbook.yml
+# S25: API Priority-and-Fairness (APF) starvation
+#
+# What it does:
+#   A dedicated, deliberately low-priority client floods the API server (through
+#   the keepalived VIP) with authenticated requests. The client is bound to a
+#   custom FlowSchema -> PriorityLevelConfiguration pair, so the pressure is
+#   APF-mediated (the server sheds the low-priority class with 429s) rather than
+#   a brute-force DoS of the machine. Every node stays Ready, etcd stays healthy,
+#   the leader-election leases keep renewing — and yet the control loops can be
+#   starved of the concurrency they need to reconcile. That "healthy but starved"
+#   contrast is the entire point of the scenario.
+#
+# The research question this scenario exists to answer:
+#   Can the suite's invariants distinguish "cannot observe" from
+#   "observed and chose not to act"? A starved control plane can fail in two very
+#   different ways, and the recorded data must separate them:
+#
+#     cannot observe          the controller's LIST/WATCH traffic is itself
+#                             rejected/queued, so its informer cache goes stale
+#                             and it never even sees the change it should react
+#                             to. Evidence: read-verb (get/list/watch) 429s,
+#                             a growing apiserver watch-cache lag, and the
+#                             controller's workqueue_adds_total flatlining
+#                             (no events entering the queue).
+#
+#     observed, did not act   the controller received the watch event (its
+#                             workqueue depth/adds keep climbing) but its
+#                             mutating traffic (create/update/patch/delete) is
+#                             429'd, so the queued work never drains into actual
+#                             object changes. Evidence: write-verb 429s while
+#                             read traffic still succeeds, workqueue depth rising
+#                             without the corresponding object mutations landing.
+#
+#   To make that distinction *recoverable from the data* we inject a concrete
+#   reconciliation stimulus during the flood (delete a nginx-stateless pod, a
+#   change the Deployment/ReplicaSet controller must observe and the scheduler
+#   must act on) and record, side by side:
+#     - what the control plane SAW: controller-manager / scheduler workqueue
+#       adds+depth, the per-API-server watch-cache lag from metrics-collect,
+#       and the lease renew activity;
+#     - what the control plane DID: whether a replacement pod object was
+#       created, scheduled and bound, and how long that took;
+#     - which requests APF actually rejected, split by priority level, flow
+#       schema and verb (read vs write).
+#   A replacement that never appears during the flood but appears once the flood
+#   stops proves the effect was starvation (transient, recoverable), not a crash.
+#
+# Why the observer's own reads are trustworthy here:
+#   Every measurement in this scenario is taken with the kubeadm admin identity
+#   (group system:masters), which the built-in `exempt` FlowSchema exempts from
+#   all APF limiting. The observer therefore never competes with the flood for
+#   concurrency and can always see the ground truth. That isolates the question
+#   to the *controllers*: any inability to observe/act we record is theirs, not
+#   an artefact of the measurement being starved too.
+#
+# Topology / safety:
+#   The flood is generated FROM the three worker nodes (client-side load toward
+#   the control plane), not on the API servers themselves. Each flood worker is
+#   a bash loop with THREE independent stop conditions — a marker file, a hard
+#   wall-clock deadline baked in at launch, and pkill in teardown — so an
+#   orphaned generator cannot run away and corrupt a later scenario in the sweep.
+#   The whole inject/hold/stop/observe lifecycle lives inside one block/always;
+#   the `always` unconditionally kills every flood process on every worker,
+#   removes the APF objects, and finally asserts that nothing survived.
+#
+# Efficacy (D6) note — see the scenario_meta.json task below and the report:
+#   None of the seven efficacy signals defined in check-invariants.sh evidence
+#   THIS fault, because APF starvation is defined precisely by the signals they
+#   watch staying stable: nodes stay Ready (no node_status_changed /
+#   target_node_status_changed), etcd keeps every member (no etcd_members_dropped),
+#   the leader-election leases are protected and keep their holders (no
+#   lease_holder_changed), the API view is never lost (no api_view_lost), the
+#   in-cluster data-plane probe is unaffected (no probe_degraded), and
+#   placement_changed would fire from our own stimulus regardless of whether
+#   starvation occurred, so it is not evidence of the fault. We therefore declare
+#   a NEW signal, `apf_starvation_observed`, and record the raw evidence
+#   (apf_evidence.json) it must be computed from. Until check-invariants.sh is
+#   extended centrally to compute it, S25 will read as FAULT_INEFFECTIVE — that
+#   conservative default is preferable to certifying efficacy from a signal that
+#   does not actually measure this fault. This is called out in the report; no
+#   shared defaults are edited here.
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S25 — Pre-flight baseline
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s25
+    scenario_name: "API priority-and-fairness starvation"
+    snapshot_label: pre_fault
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Verify cluster is healthy (all nodes Ready)
+      shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
+      register: not_ready_count
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready_count.stdout | int > 0
+
+    - name: Verify APF is enabled and expose the built-in priority levels
+      # Records the starting APF configuration so the flood's custom objects can
+      # be read against the controllers' own priority levels (workload-high,
+      # workload-low, leader-election) during analysis.
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl get prioritylevelconfigurations.flowcontrol.apiserver.k8s.io -o json \
+          | jq '[.items[] | {name: .metadata.name, type: .spec.type,
+                 shares: .spec.limited.nominalConcurrencyShares}]'
+      register: apf_levels_prefault
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      ignore_errors: yes
+
+    - name: Save baseline APF priority levels
+      copy:
+        dest: "{{ results_dir }}/apf_priority_levels_prefault.json"
+        content: "{{ apf_levels_prefault.stdout | default('null', true) }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+  roles:
+    - role: metrics-collect
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S25 — Inject APF starvation, hold, stimulate, stop, observe
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s25
+    # ── Tunables (all overridable on the command line) ──────────────────────
+    # flood_concurrency  parallel client loops PER worker node
+    # flood_shares       nominalConcurrencyShares of the flood's own priority
+    #                    level. Higher = the flood claims more of the server's
+    #                    concurrency and applies more pressure to the shared
+    #                    borrowable pool. Kept modest by default; raise it to
+    #                    push the controllers past APF's protective guarantees.
+    # flood_hard_deadline  wall-clock seconds after which EVERY flood worker
+    #                    self-terminates even if it is never signalled. This is
+    #                    the runaway guard: fault_duration + margin.
+    flood_concurrency: "{{ s25_flood_concurrency | default(40) }}"
+    flood_shares: "{{ s25_flood_shares | default(100) }}"
+    flood_hard_deadline: "{{ (fault_duration | int) + (observation_window | int) + 60 }}"
+    flood_hosts: "{{ groups['workers'] }}"
+    apf_cp: "{{ groups['control_plane'][1] }}"          # cp2 — reachable, holds admin.conf
+    flood_marker: "/tmp/s25-flood/worker.sh"            # unique argv marker for pkill -f
+  tasks:
+    - name: Fault lifecycle (guaranteed teardown in always)
+      block:
+        # ── Create the APF objects that make the flood low-priority ──────────
+        - name: Render the S25 APF + flood-client RBAC manifest onto {{ apf_cp }}
+          # A single manifest so apply/delete are symmetric. The flood client is
+          # a dedicated ServiceAccount matched by a low matchingPrecedence
+          # FlowSchema (wins over the built-in service-accounts schema at 9000)
+          # onto a dedicated PriorityLevelConfiguration. limitResponse: Reject
+          # means once the flood exceeds its level's concurrency the server
+          # answers 429 IMMEDIATELY — that is the clean, APF-mediated rejection
+          # we record as evidence, and it caps the flood so it cannot become a
+          # machine-level DoS. The minimal Role lets the flood's reads return
+          # 200 (real apiserver work) until APF starts shedding them.
+          copy:
+            dest: /tmp/s25-apf.yaml
+            content: |
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: s25-flood
+                namespace: default
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: Role
+              metadata:
+                name: s25-flood-reader
+                namespace: default
+              rules:
+                - apiGroups: [""]
+                  resources: ["configmaps"]
+                  verbs: ["get", "list"]
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata:
+                name: s25-flood-reader
+                namespace: default
+              roleRef:
+                apiGroup: rbac.authorization.k8s.io
+                kind: Role
+                name: s25-flood-reader
+              subjects:
+                - kind: ServiceAccount
+                  name: s25-flood
+                  namespace: default
+              ---
+              apiVersion: flowcontrol.apiserver.k8s.io/v1
+              kind: PriorityLevelConfiguration
+              metadata:
+                name: s25-flood
+              spec:
+                type: Limited
+                limited:
+                  nominalConcurrencyShares: {{ flood_shares | int }}
+                  lendablePercent: 0
+                  limitResponse:
+                    type: Reject
+              ---
+              apiVersion: flowcontrol.apiserver.k8s.io/v1
+              kind: FlowSchema
+              metadata:
+                name: s25-flood
+              spec:
+                priorityLevelConfiguration:
+                  name: s25-flood
+                matchingPrecedence: 500
+                distinguisherMethod:
+                  type: ByUser
+                rules:
+                  - subjects:
+                      - kind: ServiceAccount
+                        serviceAccount:
+                          name: s25-flood
+                          namespace: default
+                    resourceRules:
+                      - verbs: ["*"]
+                        apiGroups: ["*"]
+                        resources: ["*"]
+                    nonResourceRules:
+                      - verbs: ["*"]
+                        nonResourceURLs: ["*"]
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+
+        - name: Apply the S25 APF + flood-client objects
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl apply -f /tmp/s25-apf.yaml
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+
+        - name: Mint a bounded-lifetime token for the flood ServiceAccount
+          # --duration bounds the token to the run; even a leaked token is
+          # useless afterwards. Runs on cp2 (admin.conf present).
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl create token s25-flood -n default \
+              --duration={{ flood_hard_deadline | int + 120 }}s
+          register: s25_flood_token
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+          no_log: true
+
+        - name: Publish the flood token to the play (run_once fact propagation)
+          set_fact:
+            flood_token: "{{ s25_flood_token.stdout }}"
+          run_once: true
+          no_log: true
+
+        - name: Distribute the flood worker script to each worker node
+          copy:
+            dest: /tmp/s25-flood/worker.sh
+            mode: '0755'
+            content: |
+              #!/bin/bash
+              # S25_FLOOD_MARKER — low-priority APF flood client. Three stop
+              # conditions: the /tmp/s25-flood/run marker file, the hard
+              # wall-clock DEADLINE passed as $2, and pkill -f in teardown.
+              TOKEN="$(cat /tmp/s25-flood/token 2>/dev/null)"
+              VIP="$1"; DEADLINE="$2"; ID="$3"
+              OUT="/tmp/s25-flood/w${ID}.json"
+              tot=0; c429=0; c200=0; c403=0; other=0
+              while [ "$(date +%s)" -lt "$DEADLINE" ] && [ -f /tmp/s25-flood/run ]; do
+                code=$(curl -sk -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  --max-time 5 \
+                  "${VIP}/api/v1/namespaces/default/configmaps?limit=500" 2>/dev/null || echo 000)
+                tot=$((tot+1))
+                case "$code" in
+                  429) c429=$((c429+1));;
+                  200) c200=$((c200+1));;
+                  403) c403=$((c403+1));;
+                  *)   other=$((other+1));;
+                esac
+              done
+              printf '{"worker":%s,"total":%s,"http_429":%s,"http_200":%s,"http_403":%s,"other":%s}\n' \
+                "$ID" "$tot" "$c429" "$c200" "$c403" "$other" > "$OUT"
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+
+        - name: Distribute the flood launcher script to each worker node
+          copy:
+            dest: /tmp/s25-flood/launch.sh
+            mode: '0755'
+            content: |
+              #!/bin/bash
+              # Launches $CONC background flood workers, each with a hard
+              # deadline. Writes their PIDs and drops the run marker.
+              set -u
+              VIP="$1"; CONC="$2"; HARD="$3"
+              DEADLINE=$(( $(date +%s) + HARD ))
+              touch /tmp/s25-flood/run
+              : > /tmp/s25-flood/pids
+              i=1
+              while [ "$i" -le "$CONC" ]; do
+                nohup /tmp/s25-flood/worker.sh "$VIP" "$DEADLINE" "$i" >/dev/null 2>&1 &
+                echo $! >> /tmp/s25-flood/pids
+                i=$((i+1))
+              done
+              echo "launched ${CONC} flood workers; hard deadline in ${HARD}s"
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+
+        - name: Install the flood token on each worker (0600)
+          copy:
+            dest: /tmp/s25-flood/token
+            mode: '0600'
+            content: "{{ flood_token }}"
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          no_log: true
+
+        # ── Baseline APF / controller metrics, just before the flood ─────────
+        - name: Scrape baseline APF metrics from each API server
+          include_tasks: scrape-apf.yml
+          vars:
+            apf_label: baseline
+
+        - name: Scrape baseline controller-manager / scheduler workqueue metrics
+          include_tasks: scrape-controllers.yml
+          vars:
+            ctl_label: baseline
+
+        # ── Declare what this fault must observably do (D6) ──────────────────
+        - name: Declare fault efficacy (scenario_meta.json)
+          # See the header note: no existing efficacy signal evidences APF
+          # starvation, so we require a NEW signal `apf_starvation_observed`.
+          # apf_evidence.json (written in teardown-independent steps below) holds
+          # the raw numbers it must be computed from. target_node is empty — this
+          # fault is not aimed at any node.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "fault_type": "apf_priority_starvation",
+                "efficacy": {
+                  "target_node": "",
+                  "require": ["apf_starvation_observed"]
+                },
+                "new_signal": {
+                  "name": "apf_starvation_observed",
+                  "computed_from": "apf_evidence.json",
+                  "definition": "true when the flooded low-priority client accrued 429s (flood contained by APF) AND/OR a control-plane priority level other than s25-flood showed rejected/queued requests above baseline; i.e. APF actively shed load. See report for the exact predicate to register centrally."
+                },
+                "note": "Nodes stay Ready and etcd stays healthy by design, so target_node_status_changed / etcd_members_dropped are the WRONG signals here. Until check-invariants.sh computes apf_starvation_observed, this run reads FAULT_INEFFECTIVE conservatively."
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── Inject: start the flood on every worker ──────────────────────────
+        - name: Start the low-priority flood on each worker
+          shell: |
+            /tmp/s25-flood/launch.sh "https://{{ api_vip }}:6443" \
+              "{{ flood_concurrency | int }}" "{{ flood_hard_deadline | int }}"
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          register: flood_launch
+
+        - name: Confirm flood workers are running on each worker
+          shell: pgrep -f "{{ flood_marker }}" | wc -l
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          register: flood_running
+          changed_when: false
+
+        # ── Hold (first half of fault_duration), then snapshot ───────────────
+        - name: Hold — first half of fault_duration under flood
+          pause:
+            seconds: "{{ (fault_duration | int / 2) | int }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: flood_mid }
+
+        - name: Scrape APF metrics mid-flood
+          include_tasks: scrape-apf.yml
+          vars:
+            apf_label: flood_mid
+
+        - name: Scrape controller workqueue metrics mid-flood
+          include_tasks: scrape-controllers.yml
+          vars:
+            ctl_label: flood_mid
+
+        # ── Reconciliation stimulus (runs during the flood) ──────────────────
+        # Delete one nginx-stateless pod. The Deployment/ReplicaSet controller
+        # must OBSERVE the delete (watch event) and ACT (create a replacement);
+        # the scheduler must ACT (bind it). We sample the resulting object state
+        # for the SECOND half of fault_duration and record it as a time series.
+        # The admin identity we sample with is APF-exempt, so this measures the
+        # CONTROLLERS' ability to act, never the observer's ability to see.
+        - name: Inject reconciliation stimulus and sample controller action during flood
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            APP="{{ stateless_app_name }}"
+            NS="{{ stateful_app_namespace }}"
+            OUT=/tmp/s25-reconcile-during.jsonl
+            : > "$OUT"
+            kubectl get pods -l app="$APP" -n "$NS" -o json 2>/dev/null \
+              | jq -c '{event:"pre",ts:(now*1000|floor),
+                        pods:[.items[]|{name:.metadata.name,node:.spec.nodeName,phase:.status.phase}]}' >> "$OUT"
+            VICTIM=$(kubectl get pods -l app="$APP" -n "$NS" \
+                       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            T0=$(date +%s%3N)
+            kubectl delete pod "$VICTIM" -n "$NS" --wait=false >/dev/null 2>&1 || true
+            echo "{\"event\":\"deleted\",\"victim\":\"$VICTIM\",\"t0_ms\":$T0}" >> "$OUT"
+            END=$(( $(date +%s) + {{ (fault_duration | int / 2) | int }} ))
+            while [ "$(date +%s)" -lt "$END" ]; do
+              NOW=$(date +%s%3N)
+              if OUT_JSON=$(kubectl get pods -l app="$APP" -n "$NS" -o json 2>/dev/null); then
+                echo "$OUT_JSON" | jq -c --argjson now "$NOW" \
+                  '{event:"sample",ts:$now,
+                    total:(.items|length),
+                    running:([.items[]|select(.status.phase=="Running")]|length),
+                    unscheduled:([.items[]|select(.spec.nodeName==null)]|length),
+                    bound:([.items[]|select(.spec.nodeName!=null)]|length)}' >> "$OUT"
+              else
+                echo "{\"event\":\"sample\",\"ts\":$NOW,\"error\":\"admin_read_failed\"}" >> "$OUT"
+              fi
+              sleep 3
+            done
+            cat "$OUT"
+          register: reconcile_during
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Save during-flood reconciliation trace
+          copy:
+            dest: "{{ results_dir }}/reconcile_during_flood.jsonl"
+            content: "{{ reconcile_during.stdout | default('', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: flood_end }
+
+        - name: Scrape APF metrics at end of flood
+          include_tasks: scrape-apf.yml
+          vars:
+            apf_label: flood_end
+
+        - name: Scrape controller workqueue metrics at end of flood
+          include_tasks: scrape-controllers.yml
+          vars:
+            ctl_label: flood_end
+
+        # ── Collect the flood clients' own 429 tallies (before we stop them) ─
+        - name: Stop the flood — drop the run marker on each worker
+          shell: rm -f /tmp/s25-flood/run
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+
+        - name: Wait for flood workers to flush their per-worker tallies
+          pause:
+            seconds: 8
+          run_once: true
+
+        - name: Gather each worker's flood request tally
+          shell: |
+            cat /tmp/s25-flood/w*.json 2>/dev/null | jq -s '.' || echo '[]'
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          register: flood_tallies
+          changed_when: false
+
+        - name: Save per-worker flood request tallies and compute apf_evidence.json
+          # apf_evidence.json is the file the new `apf_starvation_observed`
+          # efficacy signal is computed from. total_429 > 0 proves APF actively
+          # rejected the low-priority client (starvation was APF-mediated, the
+          # flood was contained rather than DoS-ing the box). The per-priority
+          # rejection deltas live in the apf_*_*.txt scrapes alongside it.
+          copy:
+            dest: "{{ results_dir }}/apf_evidence.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "flood_shares": {{ flood_shares | int }},
+                "flood_concurrency_per_worker": {{ flood_concurrency | int }},
+                "flood_hosts": {{ flood_hosts | to_json }},
+                "per_worker_tallies": [
+                  {% for r in flood_tallies.results %}{{ r.stdout | default('[]', true) }}{% if not loop.last %},{% endif %}
+                  {% endfor %}
+                ]
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # ── Observe (recovery window after the flood stops) ──────────────────
+        # The replacement pod that the flood may have prevented should now be
+        # created/bound; recording that recovery is what proves the effect was
+        # transient starvation rather than a crash.
+        - name: Sample controller recovery after the flood stops
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            APP="{{ stateless_app_name }}"
+            NS="{{ stateful_app_namespace }}"
+            OUT=/tmp/s25-reconcile-post.jsonl
+            : > "$OUT"
+            END=$(( $(date +%s) + {{ observation_window | int }} ))
+            REPLICAS={{ stateless_app_replicas | default(3) | int }}
+            recovered_ms="null"
+            START=$(date +%s%3N)
+            while [ "$(date +%s)" -lt "$END" ]; do
+              NOW=$(date +%s%3N)
+              J=$(kubectl get pods -l app="$APP" -n "$NS" -o json 2>/dev/null || echo '{"items":[]}')
+              READY=$(echo "$J" | jq '[.items[]|select(.status.phase=="Running" and ([.status.conditions[]?|select(.type=="Ready")|.status]|first=="True"))]|length')
+              echo "$J" | jq -c --argjson now "$NOW" --argjson ready "$READY" \
+                '{event:"sample",ts:$now,total:(.items|length),ready:$ready}' >> "$OUT"
+              if [ "$READY" -ge "$REPLICAS" ] && [ "$recovered_ms" = "null" ]; then
+                recovered_ms=$(( NOW - START ))
+                echo "{\"event\":\"recovered\",\"ready\":$READY,\"recovered_after_ms\":$recovered_ms}" >> "$OUT"
+                break
+              fi
+              sleep 5
+            done
+            cat "$OUT"
+          register: reconcile_post
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Save post-flood reconciliation / recovery trace
+          copy:
+            dest: "{{ results_dir }}/reconcile_post_flood.jsonl"
+            content: "{{ reconcile_post.stdout | default('', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: post_flood_t30 }
+
+        - name: Scrape APF metrics after the flood (recovery)
+          include_tasks: scrape-apf.yml
+          vars:
+            apf_label: post_flood
+
+        - name: Scrape controller workqueue metrics after the flood (recovery)
+          include_tasks: scrape-controllers.yml
+          vars:
+            ctl_label: post_flood
+
+        - name: Observe — settle before the final snapshot
+          pause:
+            seconds: "{{ (observation_window | int / 2) | int }}"
+          run_once: true
+
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: post_flood_t90 }
+
+      # ── Unconditional teardown ─────────────────────────────────────────────
+      always:
+        # Order matters: kill FIRST (idempotently, without failing the play),
+        # then remove the APF objects, then LAST assert no flood survived. If
+        # the kill somehow left survivors, the APF cleanup still runs before the
+        # asserting task fails the play, so we never leave orphaned APF objects.
+        - name: Teardown — stop marker + kill every flood process on each worker
+          shell: |
+            rm -f /tmp/s25-flood/run
+            pkill -f "{{ flood_marker }}" 2>/dev/null || true
+            n=0
+            while pgrep -f "{{ flood_marker }}" >/dev/null 2>&1; do
+              n=$((n+1))
+              [ "$n" -gt 10 ] && break
+              pkill -9 -f "{{ flood_marker }}" 2>/dev/null || true
+              sleep 1
+            done
+            echo "remaining=$(pgrep -f "{{ flood_marker }}" | wc -l | tr -d ' ')"
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Teardown — remove the S25 APF objects and flood-client RBAC
+          shell: |
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl delete -f /tmp/s25-apf.yaml --ignore-not-found --wait=false || true
+            kubectl delete flowschema.flowcontrol.apiserver.k8s.io s25-flood --ignore-not-found || true
+            kubectl delete prioritylevelconfiguration.flowcontrol.apiserver.k8s.io s25-flood --ignore-not-found || true
+          delegate_to: "{{ apf_cp }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Teardown — remove flood scratch files from each worker
+          shell: rm -rf /tmp/s25-flood
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Teardown — VERIFY no flood process survives on any worker
+          # This is deliberately the LAST teardown task and it is allowed to
+          # fail the play: a surviving generator would corrupt every later
+          # scenario, so a leak must be loud, not swallowed.
+          shell: pgrep -f "{{ flood_marker }}" | wc -l | tr -d ' '
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
+          register: flood_survivors
+          changed_when: false
+          failed_when: flood_survivors.stdout | int > 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S25 — Post-fault recovery snapshots
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s25
+  tasks:
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_recover_t30 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: S25 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s25
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ invariant_report.stdout }}"

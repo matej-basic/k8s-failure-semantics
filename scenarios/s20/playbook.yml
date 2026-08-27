@@ -1,0 +1,729 @@
+---
+# scenarios/s20/playbook.yml
+# S20: Pod-network partition with the management network intact
+#
+# What it does:
+#   Every VM has two NICs (INFRASTRUCTURE.md): ens192 on the management
+#   network 10.0.0.0/24, ens224 on the pod network 192.168.200.0/24 (same
+#   host octet). This scenario drops *only* 192.168.200.0/24 traffic at the
+#   target worker's edge — in both directions — and leaves 10.0.0.0/24
+#   completely untouched.
+#
+#   That is the whole point. Blocking the management network too would make
+#   this an ordinary partition (S1/S2/S11 already do that) and destroy the
+#   result. Because 10.0.0.0/24 stays open:
+#     - the kubelet keeps reaching the API VIP 10.0.0.59 and keeps renewing
+#       its Lease, so the node never goes NotReady;
+#     - the API server keeps reaching the kubelet;
+#     - etcd (10.0.0.56-.58/.60/.61) is untouched, so quorum never moves;
+#     - Ansible itself keeps its SSH session to the target over 10.0.0.x,
+#       which is why the fault can be torn down from the outside.
+#   Meanwhile Calico's overlay between this node and every other node runs
+#   over 192.168.200.0/24 and is now dead: no pod on the target can talk to
+#   any pod, Service or CoreDNS instance off-node, and no off-node client
+#   can reach a pod on the target.
+#
+#   Rule placement is load-bearing. Calico jumps to cali-INPUT/cali-OUTPUT
+#   from the first rule of each built-in chain, and cali-INPUT's own first
+#   rule unconditionally ACCEPTs IPIP packets from cali40all-hosts-net —
+#   which holds exactly the six pod-network node addresses. Since this pod
+#   network is IPIP-encapsulated (10.244.x/26 via 192.168.200.x dev tunl0),
+#   inter-node pod traffic is protocol 4 between two 192.168.200.x addresses
+#   and is whitelisted there in both directions. Rules are therefore
+#   INSERTED ahead of that jump, never appended, and two assertions prove it
+#   held: a static one comparing rule positions against the cali jump, and a
+#   dynamic one requiring non-zero packet counters on the DROPs once the
+#   fault has been running. Presence is not reachability, and reachability
+#   is not effect.
+#
+# What we measure:
+#   - Every node still reports Ready with a fresh heartbeat throughout
+#     (control-plane belief: perfectly healthy cluster)
+#   - The nginx-stateless Service is still published with a full, Ready
+#     endpoint set — readiness probes are executed by the *local* kubelet
+#     and therefore keep passing — while a client on another node cannot
+#     reach a single backend (I2: reachability publication)
+#   - Per-pod reachability from off-node, which is the evidence a future
+#     I3c ("declared healthy yet not actually functional" — REVIEW.md) would
+#     be computed from
+#   - I1, I3 and I9 are expected to stay clean: nothing is declared failed,
+#     nothing is rescheduled, no etcd member is lost. That signature —
+#     I2 violated while I3 is preserved — is the sharpest observer-relative
+#     split the lab can produce, and no other scenario produces it.
+#
+# Target: worker1 by default; override with -e s20_target=worker2.
+#
+# Control-plane operations run on cp2 (control_plane[1]) for the same reason
+# S2 gives: cp1 holds the keepalived VIP and its sshd rejects bursty
+# connections. metrics-collect already defaults its own queries to cp2.
+
+- name: S20 — Pre-flight, topology assertion and baseline snapshot
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s20
+    scenario_name: "Pod-network partition with the management network intact"
+    s20_target_node: "{{ s20_target | default('worker1') }}"
+    s20_pod_net_cidr: "{{ s20_pod_network | default('192.168.200.0/24') }}"
+    s20_pod_net_prefix: "{{ s20_pod_net_cidr.split('/')[0].split('.')[0:3] | join('.') }}."
+    s20_probe_host: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+    s20_other_workers: "{{ groups['workers'] | difference([s20_target_node]) }}"
+    # The fault is only a fault if Calico actually carries pod traffic over
+    # the pod network. Set to false to run anyway (and expect the run to be
+    # labelled FAULT_INEFFECTIVE by check-invariants.sh).
+    s20_assert_pod_net_underlay: "{{ s20_assert_underlay | default(true) }}"
+  tasks:
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Verify cluster is healthy before the run
+      shell: kubectl get nodes --no-headers | grep -v " Ready" | wc -l
+      register: s20_not_ready
+      delegate_to: "{{ s20_probe_host }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: s20_not_ready.stdout | int > 0
+
+    # ── Topology assertion ────────────────────────────────────────────────
+    # S11 and S12 in the May 2026 sweep both injected faults that missed
+    # their target and still produced a full set of invariant verdicts. The
+    # equivalent failure mode here is silent and total: if Calico picked
+    # ens192 during IP autodetection (calico.yaml's default method is
+    # first-found, and roles/k8s-install/tasks/control-plane-init.yml applies
+    # the upstream manifest unmodified), the overlay runs over 10.0.0.0/24
+    # and blocking 192.168.200.0/24 does precisely nothing. Assert the
+    # premise before injecting rather than discovering it in the aggregate.
+    - name: Read the address Calico uses as the target's underlay endpoint
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        OUT=$(kubectl get node {{ s20_target_node }} -o json 2>/dev/null | jq -c '{
+          node: .metadata.name,
+          internalIP: ([.status.addresses[] | select(.type=="InternalIP") | .address][0] // null),
+          calico_underlay: (.metadata.annotations["projectcalico.org/IPv4Address"] // null),
+          calico_ipip_tunnel: (.metadata.annotations["projectcalico.org/IPv4IPIPTunnelAddr"] // null),
+          calico_vxlan_tunnel: (.metadata.annotations["projectcalico.org/IPv4VXLANTunnelAddr"] // null)
+        }' 2>/dev/null)
+        # An unparseable or empty answer must land on the "could not verify"
+        # branch below, rather than blowing up the from_json in the when
+        # clause of the assertion.
+        if [ -z "$OUT" ]; then
+          OUT='{"node": "{{ s20_target_node }}", "internalIP": null, "calico_underlay": null, "calico_ipip_tunnel": null, "calico_vxlan_tunnel": null}'
+        fi
+        echo "$OUT"
+      register: s20_underlay
+      delegate_to: "{{ s20_probe_host }}"
+      run_once: true
+
+    - name: Read the target's own view of its interfaces and pod-network routes
+      shell: |
+        set -u
+        echo "### ip -4 -o addr"
+        ip -4 -o addr show || true
+        echo "### routes via the pod network"
+        ip -4 route show | grep -F "{{ s20_pod_net_prefix }}" || true
+        echo "### tunnel devices"
+        ip -d link show type ipip 2>/dev/null || true
+        ip -d link show type vxlan 2>/dev/null || true
+      register: s20_target_ifaces
+      delegate_to: "{{ s20_target_node }}"
+      run_once: true
+
+    - name: Save pod-network topology evidence
+      copy:
+        dest: "{{ results_dir }}/pod_network_topology.txt"
+        content: |
+          target_node: {{ s20_target_node }}
+          blocked_cidr: {{ s20_pod_net_cidr }}
+          untouched_cidr: 10.0.0.0/24 (management — kubelet heartbeats, etcd, SSH)
+          calico_node_annotations: {{ s20_underlay.stdout | trim }}
+
+          {{ s20_target_ifaces.stdout }}
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Abort if Calico's underlay for the target is not on the pod network
+      fail:
+        msg: >-
+          S20 blocks {{ s20_pod_net_cidr }} only, but Calico reports
+          "{{ (s20_underlay.stdout | from_json).calico_underlay }}" as
+          {{ s20_target_node }}'s underlay endpoint. The overlay therefore
+          does not traverse the pod network and this fault would be a no-op
+          (the S11/S12 failure mode). Fix it centrally — set
+          IP_AUTODETECTION_METHOD=interface=ens224 on the calico-node
+          DaemonSet, or set --node-ip on the kubelets — then re-run. To run
+          anyway, pass -e s20_assert_underlay=false.
+      run_once: true
+      when:
+        - s20_assert_pod_net_underlay | bool
+        - (s20_underlay.stdout | from_json).calico_underlay is not none
+        - not (s20_underlay.stdout | from_json).calico_underlay.startswith(s20_pod_net_prefix)
+
+    - name: Warn if Calico did not publish an underlay address to assert against
+      debug:
+        msg: >-
+          Calico published no projectcalico.org/IPv4Address annotation for
+          {{ s20_target_node }}; the pod-network premise could not be
+          verified up front. Check pod_network_topology.txt and the fault
+          efficacy verdict in invariant_report.json before using this run.
+      run_once: true
+      when: (s20_underlay.stdout | from_json).calico_underlay is none
+
+    # ── Pin the observed workload onto the target ─────────────────────────
+    # Same reasoning S2 gives for pinning postgres-stateful-0: an invariant
+    # is only exercised if the fault sits on the path the invariant is
+    # measured over. I2 is measured by metrics-collect's single in-cluster
+    # curl of the nginx-stateless ClusterIP from cp2. With the default 3
+    # replicas spread one per worker, kube-proxy sends roughly two thirds of
+    # those probes to a backend the fault does not touch, and whether the
+    # run registers as EFFECTIVE becomes a coin toss. Concentrating all
+    # replicas on the target makes every probe traverse the blocked path, so
+    # I2 and the efficacy signal are deterministic. The spread is restored
+    # at the end of the run.
+    - name: Concentrate nginx-stateless onto the target, then release the cordon
+      block:
+        - name: Cordon the other workers so nginx-stateless can only land on the target
+          shell: kubectl cordon {{ s20_other_workers | join(' ') }}
+          delegate_to: "{{ s20_probe_host }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+        - name: Roll nginx-stateless onto the target
+          shell: |
+            kubectl rollout restart deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }}
+            kubectl rollout status deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }} --timeout=300s
+          delegate_to: "{{ s20_probe_host }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+        - name: Wait until every nginx-stateless replica is Running on the target
+          shell: |
+            TOTAL=$(kubectl get pods -n {{ stateful_app_namespace }} \
+              -l app={{ stateless_app_name }} --no-headers 2>/dev/null | wc -l)
+            ON_TARGET=$(kubectl get pods -n {{ stateful_app_namespace }} \
+              -l app={{ stateless_app_name }} \
+              --field-selector spec.nodeName={{ s20_target_node }},status.phase=Running \
+              --no-headers 2>/dev/null | wc -l)
+            echo "total=$TOTAL on_target=$ON_TARGET"
+            test "$TOTAL" -gt 0 -a "$TOTAL" = "$ON_TARGET"
+          register: s20_placement
+          until: s20_placement.rc == 0
+          retries: 30
+          delay: 6
+          delegate_to: "{{ s20_probe_host }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+      always:
+        - name: Uncordon the other workers
+          shell: kubectl uncordon {{ s20_other_workers | join(' ') }}
+          delegate_to: "{{ s20_probe_host }}"
+          run_once: true
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Baseline snapshot
+      include_role:
+        name: metrics-collect
+      vars:
+        snapshot_label: pre_fault
+
+- name: S20 — Inject the pod-network partition, hold, tear down, observe
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s20
+    scenario_name: "Pod-network partition with the management network intact"
+    s20_target_node: "{{ s20_target | default('worker1') }}"
+    s20_pod_net_cidr: "{{ s20_pod_network | default('192.168.200.0/24') }}"
+    s20_pod_net_prefix: "{{ s20_pod_net_cidr.split('/')[0].split('.')[0:3] | join('.') }}."
+    # The target's own address on the pod network — same host octet as its
+    # management address (INFRASTRUCTURE.md). Exempted from the DROP rules so
+    # the node can still talk to itself on that address; without the
+    # exemption a locally-originated packet to its own pod-network IP would
+    # traverse OUTPUT and INPUT and be dropped.
+    s20_target_pod_net_ip: "{{ s20_pod_net_prefix }}{{ hostvars[s20_target_node].ansible_host.split('.')[3] }}"
+    s20_rule_tag: "fault-inject-podnet-{{ scenario_id }}"
+    s20_probe_host: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+    s20_other_workers: "{{ groups['workers'] | difference([s20_target_node]) }}"
+    s20_probe_attempts: 12
+    # fault_duration is held across three in-fault snapshots,
+    # observation_window across two post-fault ones.
+    s20_hold_step: "{{ (fault_duration | int) // 3 }}"
+    s20_observe_step: "{{ (observation_window | int) // 2 }}"
+    # One data-plane measurement, run from a node on the far side of the
+    # partition (cp2). Records, in a single pass: the published endpoint set,
+    # the Service-level reachability rate, per-pod reachability for every
+    # backend on the target, and every node's Ready condition with its
+    # heartbeat age. The pairing of "endpoints published + Ready=True" with
+    # "nothing answers" is the entire result of this scenario, and it is what
+    # a future I3c check would be computed from.
+    s20_dataplane_probe: |
+      set -u
+      export KUBECONFIG=/etc/kubernetes/admin.conf
+      SVC_IP=$(kubectl get svc {{ stateless_app_name }} -n {{ stateful_app_namespace }} \
+        -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+      OK=0; FAIL=0
+      if [ -n "$SVC_IP" ]; then
+        for _ in $(seq 1 {{ s20_probe_attempts }}); do
+          CODE=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$SVC_IP/" 2>/dev/null || true)
+          if [ "$CODE" = "200" ]; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
+        done
+      fi
+      PODS=$(kubectl get pods -n {{ stateful_app_namespace }} \
+        -l app={{ stateless_app_name }} \
+        --field-selector spec.nodeName={{ s20_target_node }} -o json 2>/dev/null \
+        | jq -r '.items[] | (.status.podIP // "none") + " " + .metadata.name' 2>/dev/null)
+      PER_POD=""
+      while read -r POD_IP POD_NAME; do
+        [ -z "${POD_IP:-}" ] && continue
+        [ "$POD_IP" = "none" ] && continue
+        CODE=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$POD_IP/" 2>/dev/null || true)
+        case "${CODE:-}" in ''|*[!0-9]*) CODE=000 ;; esac
+        PER_POD="$PER_POD{\"pod\":\"$POD_NAME\",\"podIP\":\"$POD_IP\",\"httpCode\":$((10#$CODE))},"
+      done <<< "$PODS"
+      PER_POD="[${PER_POD%,}]"
+      ENDPOINTS=$(kubectl get endpoints {{ stateless_app_name }} -n {{ stateful_app_namespace }} -o json 2>/dev/null \
+        | jq -c '{ready: [.subsets[]?.addresses[]?.ip], notReady: [.subsets[]?.notReadyAddresses[]?.ip]}' 2>/dev/null || echo null)
+      NODES=$(kubectl get nodes -o json 2>/dev/null | jq -c '[.items[] | {
+        name: .metadata.name,
+        ready: ([.status.conditions[] | select(.type=="Ready") | .status][0]),
+        lastHeartbeat: ([.status.conditions[] | select(.type=="Ready") | .lastHeartbeatTime][0])
+      }]' 2>/dev/null || echo null)
+      # A kubectl that returned nothing leaves the variable empty, and an
+      # empty --argjson aborts the probe. Missing evidence must read as null,
+      # never as a failed task.
+      [ -z "${ENDPOINTS:-}" ] && ENDPOINTS=null
+      [ -z "${NODES:-}" ] && NODES=null
+      [ -z "${PER_POD:-}" ] && PER_POD='[]'
+      jq -nc \
+        --arg probe_source "{{ s20_probe_host }}" \
+        --arg target "{{ s20_target_node }}" \
+        --arg svc_ip "$SVC_IP" \
+        --argjson ok "$OK" --argjson fail "$FAIL" \
+        --argjson per_pod "$PER_POD" \
+        --argjson endpoints "$ENDPOINTS" \
+        --argjson nodes "$NODES" \
+        '{probe_source: $probe_source, target_node: $target, clusterIP: $svc_ip,
+          service_attempts: ($ok + $fail), service_ok: $ok, service_failed: $fail,
+          per_pod_reachability: $per_pod, published_endpoints: $endpoints,
+          node_ready: $nodes}'
+  tasks:
+    - name: Baseline data-plane reachability (before injection)
+      shell: "{{ s20_dataplane_probe }}"
+      register: s20_dp_baseline
+      delegate_to: "{{ s20_probe_host }}"
+      run_once: true
+
+    - name: Save baseline data-plane measurement
+      copy:
+        dest: "{{ results_dir }}/dataplane_pre_fault.json"
+        content: "{{ s20_dp_baseline.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    # ── Injection, hold, and unconditional teardown ───────────────────────
+    # Everything from the first iptables rule to the last in-fault snapshot
+    # sits in this block. Its `always` removes the rules whatever happens —
+    # a failed kubectl, an unreachable host, an interrupted run. The repo
+    # convention is that a fault never outlives its run, and a pod-network
+    # partition left behind would look exactly like a healthy cluster to
+    # every subsequent scenario's pre-flight check, which is the worst
+    # possible way for it to survive.
+    - block:
+        # ── Rule placement ────────────────────────────────────────────────
+        # Every rule below is INSERTED, never appended. Calico owns the top
+        # of the built-in chains on these nodes:
+        #
+        #   -A INPUT  -m comment --comment "cali:..." -j cali-INPUT   <- rule 1
+        #   -A cali-INPUT -p ipencap -m set --match-set cali40all-hosts-net
+        #        src -m addrtype --dst-type LOCAL -j ACCEPT           <- rule 1
+        #
+        # and cali40all-hosts-net contains exactly the six pod-network node
+        # addresses (192.168.200.49/.51/.52/.53/.54/.55). The pod network
+        # here is IPIP-encapsulated — worker1 routes 10.244.121.64/26 via
+        # 192.168.200.51 dev tunl0 — so inter-node pod traffic is protocol 4
+        # between two 192.168.200.x addresses: precisely the packets Calico
+        # whitelists at the top of the chain, in both directions. An
+        # APPENDED DROP is therefore never evaluated and the whole scenario
+        # is a silent no-op — the D5 failure mode (REVIEW.md) that S11 and
+        # S12 shipped a full sweep with.
+        #
+        # `action: insert` puts a rule at position 1, so the LAST insert into
+        # a chain ends up in FRONT. The DROPs are inserted first and the
+        # self-exemption ACCEPTs second, which yields the required order:
+        #
+        #   INPUT :  1 ACCEPT -s <own pod-net IP>
+        #            2 DROP   -s 192.168.200.0/24
+        #            3 -j cali-INPUT ...
+        #   OUTPUT:  1 ACCEPT -d <own pod-net IP>
+        #            2 DROP   -d 192.168.200.0/24
+        #            3 -j cali-OUTPUT ...
+        #   FORWARD: 1 DROP   -d 192.168.200.0/24
+        #            2 DROP   -s 192.168.200.0/24
+        #            3 -j cali-FORWARD ...
+        #
+        # Inverting those two steps would put the DROP in front of the
+        # exemption and break the node's own pod-net self-traffic.
+        - name: Block outbound traffic to the pod network
+          iptables:
+            chain: OUTPUT
+            destination: "{{ s20_pod_net_cidr }}"
+            jump: DROP
+            action: insert
+            comment: "{{ s20_rule_tag }}"
+          when: inventory_hostname == s20_target_node
+
+        - name: Block inbound traffic from the pod network
+          iptables:
+            chain: INPUT
+            source: "{{ s20_pod_net_cidr }}"
+            jump: DROP
+            action: insert
+            comment: "{{ s20_rule_tag }}"
+          when: inventory_hostname == s20_target_node
+
+        - name: Block forwarded pod-network traffic in both directions
+          # Pod traffic that the node routes rather than originates —
+          # anything that reaches a local pod veth from off-node, and the
+          # inner packets of a decapsulated tunnel — traverses FORWARD, not
+          # INPUT/OUTPUT. Both are DROPs, so their relative order does not
+          # matter; both must precede the cali-FORWARD jump.
+          iptables:
+            chain: FORWARD
+            source: "{{ item.source | default(omit) }}"
+            destination: "{{ item.destination | default(omit) }}"
+            jump: DROP
+            action: insert
+            comment: "{{ s20_rule_tag }}"
+          loop:
+            - { source: "{{ s20_pod_net_cidr }}" }
+            - { destination: "{{ s20_pod_net_cidr }}" }
+          when: inventory_hostname == s20_target_node
+
+        - name: Exempt the node's own pod-network address from the block
+          # Inserted AFTER the DROPs so it lands in front of them.
+          iptables:
+            chain: "{{ item.chain }}"
+            source: "{{ item.source | default(omit) }}"
+            destination: "{{ item.destination | default(omit) }}"
+            jump: ACCEPT
+            action: insert
+            comment: "{{ s20_rule_tag }}"
+          loop:
+            - { chain: INPUT, source: "{{ s20_target_pod_net_ip }}" }
+            - { chain: OUTPUT, destination: "{{ s20_target_pod_net_ip }}" }
+          when: inventory_hostname == s20_target_node
+
+        - name: Record the injected ruleset
+          shell: iptables-save | grep -F "{{ s20_rule_tag }}" || true
+          register: s20_injected_rules
+          changed_when: false
+          when: inventory_hostname == s20_target_node
+
+        - name: Assert the injection did not touch the management network
+          # If any injected rule mentions 10.0.0.x this is no longer S20:
+          # the kubelet would stop heartbeating, the node would go NotReady,
+          # and the run would be an ordinary partition wearing S20's label.
+          #
+          # Necessary but NOT sufficient: this proves the rules are harmless,
+          # not that they are reachable. The order check below proves that.
+          shell: |
+            iptables-save | grep -F "{{ s20_rule_tag }}" | grep -c "10\.0\.0\." || true
+          register: s20_mgmt_touched
+          changed_when: false
+          failed_when: s20_mgmt_touched.stdout | trim | int > 0
+          when: inventory_hostname == s20_target_node
+
+        - name: Assert the injected rules are reachable, not shadowed by Calico
+          # Reachability, not mere presence. Calico jumps to cali-INPUT /
+          # cali-OUTPUT / cali-FORWARD from the top of each built-in chain
+          # and unconditionally ACCEPTs IPIP between hosts in
+          # cali40all-hosts-net, so a DROP placed after that jump is dead
+          # code and the scenario silently measures an undisturbed cluster.
+          # Compare positions: every one of our DROPs must sit at a lower
+          # index than the cali jump in its chain. `iptables -S` prints the
+          # policy as its first line, so the numbers are offset by one from
+          # the real rule numbers — irrelevant, since only the comparison
+          # matters. A chain with no cali jump at all cannot shadow us and
+          # passes with a note.
+          shell: |
+            set -u
+            STATUS=0
+            REPORT=""
+            for CHAIN in INPUT OUTPUT FORWARD; do
+              RULES=$(iptables -S "$CHAIN" 2>/dev/null || true)
+              OURS=$(echo "$RULES" | grep -n -F "{{ s20_rule_tag }}" | grep -- "-j DROP" \
+                     | cut -d: -f1 | sort -n | tail -1)
+              CALI=$(echo "$RULES" | grep -n -E -- "-j cali-$CHAIN([[:space:]]|$)" \
+                     | cut -d: -f1 | sort -n | head -1)
+              if [ -z "$OURS" ]; then
+                STATUS=1
+                REPORT="$REPORT$CHAIN: NO DROP RULE PRESENT; "
+              elif [ -z "$CALI" ]; then
+                REPORT="$REPORT$CHAIN: ours@$OURS, no cali jump in chain (ok); "
+              elif [ "$OURS" -lt "$CALI" ]; then
+                REPORT="$REPORT$CHAIN: ours@$OURS before cali@$CALI (ok); "
+              else
+                STATUS=1
+                REPORT="$REPORT$CHAIN: ours@$OURS SHADOWED BY cali@$CALI; "
+              fi
+            done
+            echo "$REPORT"
+            exit $STATUS
+          register: s20_rule_order
+          changed_when: false
+          when: inventory_hostname == s20_target_node
+
+        - name: Save the rule-order proof
+          copy:
+            dest: "{{ results_dir }}/iptables_rule_order.txt"
+            content: |
+              {{ s20_rule_order.stdout | trim }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          when: inventory_hostname == s20_target_node
+
+        - name: Save the injected ruleset
+          copy:
+            dest: "{{ results_dir }}/iptables_injected.txt"
+            content: "{{ s20_injected_rules.stdout }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          when: inventory_hostname == s20_target_node
+
+        - name: Declare what this fault must observably do
+          # D6 / fault efficacy. The obvious assertion —
+          # target_node_status_changed — would be exactly WRONG here: the
+          # management network is deliberately left intact so the kubelet
+          # keeps heartbeating and the node keeps reporting Ready. Demanding
+          # a node-status change would mark every correct run INEFFECTIVE
+          # and every run that accidentally severed the management network
+          # EFFECTIVE, i.e. it would assert the opposite of the scenario.
+          #
+          # probe_degraded is the signal that actually evidences this fault:
+          # it fires when metrics-collect's in-cluster curl of the
+          # nginx-stateless ClusterIP — issued from cp2, on the far side of
+          # the partition — stops returning 200 while it returned 200 at
+          # baseline. Pre-flight concentrated every backend on the target, so
+          # every one of those probes crosses the blocked pod network; the
+          # only way for this signal not to fire is for the pod network not
+          # to have been blocked. That is precisely the condition it exists
+          # to detect.
+          #
+          # Signals deliberately NOT required:
+          #   target_node_status_changed / node_status_changed — the node
+          #     staying Ready is the result, not a failure to inject
+          #   placement_changed — nothing is declared failed, so nothing is
+          #     rescheduled; a container restart does not change the
+          #     identity-per-node set the signal is computed from
+          #   etcd_members_dropped / api_view_lost / lease_holder_changed —
+          #     all of those ride the management network, which is untouched
+          #
+          # target_node is still declared, even though no node-status change
+          # is required: it makes check-invariants.sh evaluate
+          # target_node_status_changed for the target specifically and record
+          # it as false, which is positive evidence for this scenario's
+          # claim rather than an absence of evidence.
+          copy:
+            dest: "{{ results_dir }}/scenario_meta.json"
+            content: |
+              {
+                "scenario_id": "{{ scenario_id }}",
+                "fault_type": "pod_network_partition",
+                "blocked_cidr": "{{ s20_pod_net_cidr }}",
+                "untouched_cidr": "10.0.0.0/24",
+                "efficacy": {
+                  "target_node": "{{ s20_target_node }}",
+                  "require": ["probe_degraded"]
+                }
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Log the injection
+          debug:
+            msg: >-
+              FAULT INJECTED on {{ s20_target_node }}: {{ s20_pod_net_cidr }}
+              dropped in both directions; 10.0.0.0/24 untouched, so kubelet
+              heartbeats, etcd and SSH all keep flowing.
+          run_once: true
+
+        # ── Hold the fault for fault_duration ─────────────────────────────
+        - pause: { seconds: "{{ s20_hold_step }}" }
+          run_once: true
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: fault_t1 }
+
+        - pause: { seconds: "{{ s20_hold_step }}" }
+          run_once: true
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: fault_t2 }
+
+        - name: Data-plane reachability during the partition
+          shell: "{{ s20_dataplane_probe }}"
+          register: s20_dp_during
+          delegate_to: "{{ s20_probe_host }}"
+          run_once: true
+
+        - name: Save mid-fault data-plane measurement
+          copy:
+            dest: "{{ results_dir }}/dataplane_during_fault.json"
+            content: "{{ s20_dp_during.stdout }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Assert the injected rules are actually dropping packets
+          # The dynamic half of the reachability proof, and the one that
+          # cannot be argued with: rule position is a static claim, a
+          # non-zero packet counter is a measurement. It is checked here,
+          # after the mid-fault probe, precisely because that probe
+          # guarantees traffic — cp2 curls a pod IP on the target, which
+          # leaves cp2 as IPIP to {{ s20_target_pod_net_ip }} and lands on
+          # the target's INPUT chain. BIRD's BGP keepalives to the other
+          # nodes hit the OUTPUT rule over the same window. A zero counter
+          # here means the fault is not biting and the run is worthless, so
+          # it fails loudly now rather than becoming a discarded sweep.
+          shell: |
+            set -u
+            iptables-save -c | grep -F "{{ s20_rule_tag }}" | grep -- "-j DROP" \
+              | sed -n 's/^\[\([0-9][0-9]*\):.*/\1/p' \
+              | awk '{s+=$1} END {print s+0}'
+          register: s20_drop_packets
+          changed_when: false
+          failed_when: s20_drop_packets.stdout | trim | int == 0
+          when: inventory_hostname == s20_target_node
+
+        - name: Record per-rule packet counters
+          shell: iptables-save -c | grep -F "{{ s20_rule_tag }}" || true
+          register: s20_rule_counters
+          changed_when: false
+          when: inventory_hostname == s20_target_node
+
+        - name: Save the packet-counter proof
+          copy:
+            dest: "{{ results_dir }}/iptables_counters_during_fault.txt"
+            content: |
+              total_packets_dropped_by_s20_rules: {{ s20_drop_packets.stdout | trim }}
+
+              {{ s20_rule_counters.stdout }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          when: inventory_hostname == s20_target_node
+
+        - name: Capture node-local container truth on the target during the partition
+          # The target's containers are all still running and all still
+          # Ready to their local kubelet. Paired with dataplane_during_fault
+          # this is the I3c evidence: declared healthy, demonstrably not
+          # serving anything off-node.
+          shell: |
+            crictl ps -o json | jq -c '[.containers[] | {name: .metadata.name, state: .state, podName: .labels."io.kubernetes.pod.name"}]'
+          register: s20_target_containers
+          changed_when: false
+          when: inventory_hostname == s20_target_node
+
+        - name: Save target container state
+          copy:
+            dest: "{{ results_dir }}/target_containers_during_fault.json"
+            content: "{{ s20_target_containers.stdout }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          when: inventory_hostname == s20_target_node
+
+        - pause: { seconds: "{{ s20_hold_step }}" }
+          run_once: true
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: fault_t3 }
+
+      always:
+        - name: Remove the pod-network block
+          shell: |
+            iptables-save | grep -v "{{ s20_rule_tag }}" | iptables-restore
+          when: inventory_hostname == s20_target_node
+
+        - name: Verify no S20 rule survives
+          shell: iptables-save | grep -c "{{ s20_rule_tag }}" || true
+          register: s20_rules_left
+          changed_when: false
+          failed_when: s20_rules_left.stdout | trim | int > 0
+          when: inventory_hostname == s20_target_node
+
+        - name: Log teardown
+          debug:
+            msg: "FAULT REMOVED on {{ s20_target_node }}: {{ s20_pod_net_cidr }} block cleared."
+          run_once: true
+
+    # ── Post-fault observation ────────────────────────────────────────────
+    - pause: { seconds: "{{ s20_observe_step }}" }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t1 }
+
+    - name: Data-plane reachability after the partition is removed
+      shell: "{{ s20_dataplane_probe }}"
+      register: s20_dp_post
+      delegate_to: "{{ s20_probe_host }}"
+      run_once: true
+
+    - name: Save post-fault data-plane measurement
+      copy:
+        dest: "{{ results_dir }}/dataplane_post_fault.json"
+        content: "{{ s20_dp_post.stdout }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - pause: { seconds: "{{ s20_observe_step }}" }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_fault_t2 }
+
+# Pre-flight concentrated every nginx-stateless replica on the target so the
+# I2 probe would traverse the fault. That placement must not outlive the run
+# either: the next scenario expects the default one-per-worker spread.
+#
+# This is a play of its own rather than an `always:` on the observation
+# block, because the reachability assertions above are fatal by design. When
+# one of them fires, the target host is marked failed and every remaining
+# task in that play is skipped for it — an `always:` local to the block would
+# be skipped along with them. A separate play still executes on the ten hosts
+# that did not fail, and `run_once` + `delegate_to` picks one of those, so the
+# workload is un-pinned whether the run succeeded or aborted. It also runs
+# after the final snapshot, so the redistribution cannot register as
+# placement_changed.
+- name: S20 — Restore workload placement
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s20
+    s20_target_node: "{{ s20_target | default('worker1') }}"
+    s20_probe_host: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+    s20_other_workers: "{{ groups['workers'] | difference([s20_target_node]) }}"
+  tasks:
+    - name: Restore the nginx-stateless spread across all workers
+      shell: |
+        kubectl uncordon {{ s20_other_workers | join(' ') }}
+        kubectl rollout restart deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }}
+        kubectl rollout status deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }} --timeout=300s
+      delegate_to: "{{ s20_probe_host }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+- name: S20 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s20
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ invariant_report.stdout }}"

@@ -1,0 +1,654 @@
+---
+# scenarios/s22/playbook.yml
+# S22: Container runtime and kubelet freeze (omission failure)
+#
+# What it does:
+#   SIGSTOPs a single long-lived system process on one worker, holds it
+#   stopped for `fault_duration`, then SIGCONTs it. Two variants, selected by
+#   `s22_variant`:
+#
+#     containerd  — freeze containerd.service (the CRI runtime)
+#     kubelet     — freeze kubelet.service    (the node agent)
+#
+#   Nothing is killed, nothing is restarted, no unit ever leaves the `active
+#   (running)` state, and no network rule is touched. The process is simply
+#   descheduled by the kernel and later resumed with its address space, its
+#   client connections and its in-memory caches exactly as it left them.
+#
+# Why this scenario exists (the taxonomy cell the suite cannot otherwise reach):
+#   Every other fault in this suite is crash-stop (a process/node/member
+#   stops and, when it comes back, comes back cold) or timing (delay, skew) or
+#   a partition. A SIGSTOP is an *omission* failure in the classical
+#   crash / omission / timing / arbitrary taxonomy: the component neither
+#   crashes nor answers wrongly — it simply fails to emit and fails to consume
+#   for an interval, and then resumes as the *same* process. That distinction
+#   is measurable here and nowhere else in the suite:
+#
+#     - the unit's MainPID and ExecMainStartTimestamp are unchanged across the
+#       fault, and NRestarts does not increase -> not a crash;
+#     - the set of running containers on the node is byte-identical before and
+#       after -> nothing started, nothing stopped, no workload moved;
+#     - yet the control plane's view of the node changed (Unknown for the
+#       kubelet variant, NotReady/PLEG for the containerd variant) and then
+#       reverted without any restart having happened;
+#     - on resume the process must drain a backlog of watch events it missed
+#       while stopped (captured from the journal after SIGCONT).
+#
+# What we measure:
+#   - Whether the node's Ready condition changes while the node is, locally,
+#     entirely intact (I1/I3-class observer divergence)
+#   - Whether pods on the target keep running and serving throughout (I2)
+#   - Whether the control plane declares a failure that node-local truth
+#     contradicts, and how long the two views disagree
+#   - Recovery semantics of a resumed-with-stale-state process, as opposed to
+#     the restarted-from-cold process every other scenario produces
+#
+# Control-plane queries are delegated to control_plane[1] (cp2), matching
+# metrics-collect's default and S2's rationale: cp1 holds the keepalived VIP
+# and its sshd intermittently rejects bursty connections.
+#
+# Requires systemd >= 254 on the target for `systemctl kill --kill-whom=`
+# (renamed from --kill-who in v254). Ubuntu 24.04 ships systemd 255.
+#
+# SAFETY — read before changing anything below.
+#   A SIGSTOPped kubelet or containerd that is never SIGCONTed leaves the node
+#   permanently broken for every later scenario in the sweep. The resume is
+#   therefore guaranteed three times over; see the "dead-man" comment on the
+#   arming task and the `always:` block.
+
+- name: S22 — Process freeze (SIGSTOP/SIGCONT) omission failure
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s22
+    scenario_name: "Container runtime and kubelet freeze (omission failure)"
+
+    # ── Parameters ────────────────────────────────────────────────────────
+    # Override on the command line, e.g.
+    #   -e s22_variant=kubelet -e s22_target=worker2
+    s22_variant: containerd          # containerd | kubelet
+    s22_target: worker1              # must be a member of groups['workers']
+
+    s22_unit_for_variant:
+      containerd: containerd.service
+      kubelet: kubelet.service
+    s22_unit: "{{ s22_unit_for_variant[s22_variant] }}"
+
+    # ── Hold length ───────────────────────────────────────────────────────
+    # Chosen per variant so the fault outlives the control plane's own
+    # detection threshold but stays *below* the 300 s default
+    # tolerationSeconds of the NoExecute not-ready/unreachable taints — so the
+    # node is declared failed but no pod is ever evicted, which is what keeps
+    # "nothing started or stopped in the interval" true.
+    #
+    #   kubelet    180 s — node-monitor-grace-period is ~40 s, so the node
+    #                      goes Ready=Unknown well inside the window.
+    #   containerd 300 s — the kubelet only notices a wedged CRI when PLEG
+    #                      relist has been blocked past its 3-minute
+    #                      threshold; 300 s clears that with margin.
+    s22_hold_for_variant:
+      containerd: 300
+      kubelet: 180
+    fault_duration: "{{ s22_hold | default(s22_hold_for_variant[s22_variant]) }}"
+    observation_window: 180
+
+    # The on-host dead-man resume fires this many seconds after it is armed,
+    # i.e. comfortably after Ansible's own SIGCONT should already have run.
+    s22_deadman_after: "{{ (fault_duration | int) + 120 }}"
+    s22_deadman_unit: s22-deadman-resume
+
+    # ── Fault efficacy (D6) ───────────────────────────────────────────────
+    # The honest question is: did the freeze actually reach the target?
+    #
+    # The signal that evidences an *omission* failure — as opposed to a crash
+    # — is `target_node_status_changed`: the node the fault was aimed at
+    # changed its Ready status, while (per the node-local evidence this
+    # scenario writes alongside the snapshots) its kubelet/containerd was
+    # never restarted and its containers never changed. A crash-stop scenario
+    # produces the same node-status signal; the pairing of that signal with an
+    # unchanged MainPID / ExecMainStartTimestamp / container-id set is what
+    # makes this an omission and not a crash, and that pairing is what the
+    # paper cites.
+    #
+    # Signals deliberately NOT required:
+    #   placement_changed  — would fire for the containerd variant, but only
+    #                        because `crictl ps` on a frozen runtime returns
+    #                        nothing and metrics-collect falls back to []. That
+    #                        is the measurement failing, not the cluster
+    #                        changing state; asserting it would be dishonest.
+    #   probe_degraded     — pods keep serving throughout by design; a fault
+    #                        that degraded the service probe would mean the
+    #                        hold outlived the eviction tolerations.
+    #   lease_holder_changed / etcd_members_dropped — no control-plane or etcd
+    #                        component is touched.
+    #
+    # And the conditional below is the point the reviewer asked for: a
+    # deliberately short hold (a containerd freeze under the PLEG threshold)
+    # leaves the node Ready on purpose — that is a *result*, not a miss — so in
+    # that configuration the scenario asserts no status change at all and falls
+    # back to "any observable change counts". See the report for the
+    # `target_process_frozen` signal that would let a short-hold run assert its
+    # own efficacy directly from s22_process_identity.json.
+    s22_status_change_threshold:
+      containerd: 210
+      kubelet: 90
+    s22_efficacy_require: >-
+      {{ ['target_node_status_changed']
+         if (fault_duration | int) >= (s22_status_change_threshold[s22_variant] | int)
+         else [] }}
+
+  tasks:
+    # ── Guard rails ───────────────────────────────────────────────────────
+
+    - name: Validate the scenario parameters
+      assert:
+        that:
+          - s22_variant in ['containerd', 'kubelet']
+          - s22_target in groups['workers']
+          # Lower bound: shorter than this and neither detector can fire, so
+          # the run carries no information either way. Upper bound: a hold
+          # much past the 300 s NoExecute tolerations starts evicting pods,
+          # at which point the fault is no longer a pure omission.
+          - (fault_duration | int) >= 60
+          - (fault_duration | int) <= 600
+        fail_msg: >-
+          s22_variant must be containerd|kubelet (got '{{ s22_variant }}') and
+          s22_target must be a worker (got '{{ s22_target }}').
+          Freezing a control-plane node's kubelet is out of scope for S22.
+        quiet: yes
+      run_once: true
+      delegate_to: "{{ groups['observer'][0] }}"
+
+    - name: Create results directory
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Verify cluster is healthy before injecting
+      shell: kubectl get nodes --no-headers | grep -v ' Ready' | wc -l
+      register: not_ready_count
+      delegate_to: "{{ groups['control_plane'][1] }}"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: not_ready_count.stdout | int > 0
+
+    # ── Node-local baseline: process identity and container inventory ─────
+
+    - name: Record the target process identity before the freeze
+      # MainPID + ExecMainStartTimestamp + NRestarts are the crash/omission
+      # discriminator: if all three are unchanged after the fault, the process
+      # that came back is literally the process that went away.
+      shell: |
+        set -u
+        UNIT="{{ s22_unit }}"
+        PID=$(systemctl show -p MainPID --value "$UNIT")
+        RESTARTS=$(systemctl show -p NRestarts --value "$UNIT")
+        ACTIVE=$(systemctl show -p ActiveState --value "$UNIT")
+        SUB=$(systemctl show -p SubState --value "$UNIT")
+        START=$(systemctl show -p ExecMainStartTimestamp --value "$UNIT")
+        KILLMODE=$(systemctl show -p KillMode --value "$UNIT")
+        PSTATE="?"
+        if [ -n "${PID:-}" ] && [ "${PID}" != "0" ] && [ -r "/proc/${PID}/stat" ]; then
+          PSTATE=$(cut -d')' -f2 "/proc/${PID}/stat" | awk '{print $1}')
+        fi
+        jq -cn \
+          --arg phase "pre_fault" --arg unit "$UNIT" --arg pid "${PID:-}" \
+          --arg restarts "${RESTARTS:-}" --arg active "${ACTIVE:-}" \
+          --arg sub "${SUB:-}" --arg start "${START:-}" \
+          --arg killmode "${KILLMODE:-}" --arg pstate "$PSTATE" \
+          '{phase:$phase, unit:$unit, main_pid:$pid, n_restarts:$restarts,
+            active_state:$active, sub_state:$sub, exec_main_start:$start,
+            kill_mode:$killmode, proc_state:$pstate}'
+      register: s22_identity_pre
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+
+    - name: Record the target's running containers before the freeze
+      shell: |
+        set -o pipefail
+        crictl ps -o json 2>/dev/null \
+          | jq -c '[.containers[] | {
+              id: .id,
+              name: .metadata.name,
+              createdAt: .createdAt,
+              state: .state,
+              podName: .labels."io.kubernetes.pod.name",
+              podNamespace: .labels."io.kubernetes.pod.namespace"
+            }] | sort_by(.id)' \
+        || echo '[]'
+      register: s22_containers_pre
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+
+    # ── Efficacy declaration (D6) ─────────────────────────────────────────
+    # Written before the fault so the run is self-describing even if the run
+    # is interrupted mid-window.
+
+    - name: Declare what this fault must observably do
+      copy:
+        dest: "{{ results_dir }}/scenario_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "scenario_name": "{{ scenario_name }}",
+            "fault_type": "process_freeze",
+            "failure_class": "omission",
+            "variant": "{{ s22_variant }}",
+            "unit": "{{ s22_unit }}",
+            "hold_seconds": {{ fault_duration | int }},
+            "efficacy": {
+              "target_node": "{{ s22_target }}",
+              "require": {{ s22_efficacy_require | to_json }}
+            }
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Baseline snapshot
+      include_role: { name: metrics-collect }
+      vars: { snapshot_label: pre_fault }
+
+    # ── Dead-man resume, armed BEFORE the process is ever stopped ──────────
+    #
+    # This is the primary safety guarantee, and it is deliberately the one
+    # thing in this playbook that the failure path cannot disarm.
+    #
+    # A transient systemd timer on the *target host itself* schedules
+    # `systemctl kill --signal=SIGCONT` for fault_duration + 120 s. It is
+    # owned by PID 1, not by this playbook, so it still fires if the Ansible
+    # controller loses its SSH connection, is Ctrl-C'd, panics, or is killed
+    # outright — every one of which would otherwise strand a stopped kubelet.
+    # The redundant SIGCONT it delivers after a normal run is a no-op on a
+    # running process, so the timer is never cancelled: a safety net that the
+    # error path is allowed to remove is not a safety net.
+    #
+    # It also bounds the worst case for the observer. metrics-collect probes
+    # the frozen node (kubelet :10250 with no --max-time, crictl against a
+    # wedged CRI socket); a frozen process accepts the TCP connection in the
+    # kernel and then never answers, so such a probe blocks for exactly as
+    # long as the freeze lasts. With the dead-man armed, "as long as the
+    # freeze lasts" is bounded by the timer whatever else goes wrong.
+    #
+    # Arming is a hard prerequisite: `set -e` here plus the is-active check
+    # below mean that if the timer cannot be created, the play aborts *before*
+    # any SIGSTOP is sent.
+    - name: Arm the on-host dead-man resume timer
+      shell: |
+        set -eu
+        systemctl stop {{ s22_deadman_unit }}.timer   >/dev/null 2>&1 || true
+        systemctl stop {{ s22_deadman_unit }}.service >/dev/null 2>&1 || true
+        systemctl reset-failed {{ s22_deadman_unit }}.timer {{ s22_deadman_unit }}.service >/dev/null 2>&1 || true
+        systemd-run --collect \
+          --unit={{ s22_deadman_unit }} \
+          --on-active={{ s22_deadman_after }} \
+          --timer-property=AccuracySec=1s \
+          --description="S22 dead-man SIGCONT for {{ s22_unit }}" \
+          /usr/bin/systemctl kill --kill-whom=main --signal=SIGCONT {{ s22_unit }}
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+
+    - name: Verify the dead-man timer is armed before freezing anything
+      shell: systemctl is-active {{ s22_deadman_unit }}.timer
+      register: s22_deadman_armed
+      changed_when: false
+      failed_when: "'active' not in s22_deadman_armed.stdout"
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+
+    # ── Fault window ──────────────────────────────────────────────────────
+    # Everything between the SIGSTOP and the SIGCONT lives inside this
+    # block/always. `always:` runs even if an observation task fails, so the
+    # in-band resume happens promptly on the error path too; the dead-man
+    # above covers the cases `always:` cannot (lost connection, killed
+    # controller, unreachable host).
+
+    - block:
+        - name: "Freeze {{ s22_unit }} on {{ s22_target }} (SIGSTOP)"
+          # Why `systemctl kill --kill-whom=main` rather than pkill:
+          #
+          #   1. It signals exactly the unit's MainPID as systemd currently
+          #      knows it. `pkill -STOP containerd` also matches every
+          #      `containerd-shim-runc-v2` on the node — freezing the shims
+          #      freezes the containers themselves, which would turn this
+          #      into a workload fault and destroy the "nothing started or
+          #      stopped, everything kept serving" result. Even `pkill -x
+          #      containerd` only avoids that by luck of the exact name.
+          #   2. There is no PID-reuse hazard: the unit is the handle, so the
+          #      matching SIGCONT cannot land on an unrelated process that
+          #      inherited the PID.
+          #   3. `--kill-whom=main` is explicit rather than relying on
+          #      KillMode. containerd.service ships KillMode=process (which is
+          #      why `systemctl restart containerd` does not kill running
+          #      containers), but kubelet.service does not; stating the scope
+          #      makes the behaviour identical for both variants and immune to
+          #      a future unit-file change.
+          #   4. SIGSTOP delivered this way does not change the unit's state:
+          #      systemd still reports active (running) and never restarts it,
+          #      which is precisely the omission semantics we want.
+          shell: |
+            set -eu
+            systemctl kill --kill-whom=main --signal=SIGSTOP {{ s22_unit }}
+          delegate_to: "{{ s22_target }}"
+          run_once: true
+
+        - name: Confirm the target process is actually stopped (state T)
+          # Direct evidence that the fault landed, independent of anything the
+          # cluster does or does not notice. This is the measurement a
+          # short-hold "the node stayed Ready" run rests on.
+          shell: |
+            set -u
+            PID=$(systemctl show -p MainPID --value {{ s22_unit }})
+            [ -n "$PID" ] && [ "$PID" != "0" ] || { echo "no main pid"; exit 1; }
+            S=$(cut -d')' -f2 "/proc/$PID/stat" | awk '{print $1}')
+            echo "pid=$PID proc_state=$S"
+            [ "$S" = "T" ] || [ "$S" = "t" ]
+          register: s22_frozen_check
+          until: s22_frozen_check.rc == 0
+          retries: 5
+          delay: 2
+          delegate_to: "{{ s22_target }}"
+          run_once: true
+
+        - name: Record that the freeze took effect
+          copy:
+            dest: "{{ results_dir }}/s22_freeze_evidence.txt"
+            content: |
+              variant={{ s22_variant }}
+              unit={{ s22_unit }}
+              target={{ s22_target }}
+              hold_seconds={{ fault_duration | int }}
+              deadman_after_seconds={{ s22_deadman_after }}
+              frozen_check={{ s22_frozen_check.stdout | default('') | trim }}
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        # t+30: too early for any detector to have fired. This snapshot is the
+        # "the cluster has not noticed yet" reference point.
+        - pause: { seconds: 30 }
+          run_once: true
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: freeze_t30 }
+
+        # Hold out to (fault_duration - 60), by which point the kubelet variant
+        # is past node-monitor-grace-period and the containerd variant is past
+        # the PLEG relist threshold.
+        - pause:
+            seconds: "{{ [((fault_duration | int) - 90), 0] | max }}"
+          run_once: true
+        - include_role: { name: metrics-collect }
+          vars: { snapshot_label: freeze_late }
+
+        - name: Capture the control plane's view of the frozen node mid-freeze
+          # Taken from a healthy control-plane node, so it cannot block on the
+          # frozen process. The lease renewTime is the sharpest number here:
+          # it is frozen at the instant of the SIGSTOP for the kubelet variant
+          # and keeps advancing for the containerd variant, which is the whole
+          # difference between the two.
+          shell: |
+            set -u
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            NODE=$(kubectl get node {{ s22_target }} -o json 2>/dev/null \
+                   | jq -c '{name: .metadata.name,
+                             conditions: .status.conditions,
+                             taints: .spec.taints,
+                             nodeInfo: .status.nodeInfo}' || echo null)
+            LEASE=$(kubectl get lease {{ s22_target }} -n kube-node-lease -o json 2>/dev/null \
+                    | jq -c '{holder: .spec.holderIdentity, renewTime: .spec.renewTime}' || echo null)
+            PODS=$(kubectl get pods --all-namespaces \
+                     --field-selector spec.nodeName={{ s22_target }} -o json 2>/dev/null \
+                   | jq -c '[.items[] | {name: .metadata.name,
+                                         namespace: .metadata.namespace,
+                                         phase: .status.phase,
+                                         deletionTimestamp: .metadata.deletionTimestamp,
+                                         restarts: [.status.containerStatuses[]?.restartCount]}]' || echo null)
+            jq -cn --argjson node "${NODE:-null}" --argjson lease "${LEASE:-null}" \
+                   --argjson pods "${PODS:-null}" \
+              '{phase: "mid_freeze", node: $node, node_lease: $lease, pods: $pods}'
+          register: s22_cp_view_mid
+          delegate_to: "{{ groups['control_plane'][1] }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Save the mid-freeze control-plane view
+          copy:
+            dest: "{{ results_dir }}/s22_control_plane_view_mid_freeze.json"
+            content: "{{ s22_cp_view_mid.stdout | default('null', true) }}"
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+        - name: Hold out the remainder of the fault window
+          pause:
+            seconds: 60
+          run_once: true
+
+      always:
+        # ── Resume. Idempotent by construction ────────────────────────────
+        # SIGCONT to a process that is already running is a no-op, so this is
+        # safe to run whether or not the SIGSTOP above ever happened, and safe
+        # to run twice (Ansible here, dead-man timer later). It sends the
+        # signal both through systemd (unit-scoped, no PID-reuse hazard) and,
+        # as a fallback, directly to the resolved MainPID in case the unit has
+        # meanwhile lost its systemd bookkeeping, then polls /proc until the
+        # process is demonstrably out of the stopped state, re-signalling on
+        # each pass.
+        - name: "Resume {{ s22_unit }} on {{ s22_target }} (SIGCONT)"
+          shell: |
+            set -u
+            UNIT="{{ s22_unit }}"
+            systemctl kill --kill-whom=main --signal=SIGCONT "$UNIT" 2>/dev/null || true
+            PID=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)
+            if [ -n "${PID:-}" ] && [ "$PID" != "0" ]; then
+              kill -CONT "$PID" 2>/dev/null || true
+              i=0
+              while [ "$i" -lt 30 ]; do
+                if [ ! -r "/proc/$PID/stat" ]; then
+                  echo "pid=$PID state=gone"
+                  exit 0
+                fi
+                S=$(cut -d')' -f2 "/proc/$PID/stat" | awk '{print $1}')
+                case "$S" in
+                  T|t)
+                    kill -CONT "$PID" 2>/dev/null || true
+                    systemctl kill --kill-whom=main --signal=SIGCONT "$UNIT" 2>/dev/null || true
+                    sleep 1
+                    ;;
+                  *)
+                    echo "pid=$PID state=$S"
+                    exit 0
+                    ;;
+                esac
+                i=$((i + 1))
+              done
+              echo "pid=$PID state=STILL_STOPPED"
+              exit 1
+            fi
+            echo "pid=none"
+            exit 0
+          register: s22_resume
+          delegate_to: "{{ s22_target }}"
+          run_once: true
+          ignore_errors: yes
+
+        - name: Verify the target process is running again
+          # Deliberately a hard failure. If this fires, the node is left with a
+          # stopped process and every later scenario would run against a broken
+          # worker — the operator must see it. The dead-man timer is still
+          # armed at this point and has not yet fired, so it remains the
+          # backstop; nothing in this playbook cancels it.
+          shell: |
+            set -u
+            PID=$(systemctl show -p MainPID --value {{ s22_unit }})
+            [ -n "$PID" ] && [ "$PID" != "0" ] || { echo "no main pid"; exit 1; }
+            S=$(cut -d')' -f2 "/proc/$PID/stat" | awk '{print $1}')
+            echo "pid=$PID proc_state=$S"
+            case "$S" in T|t) exit 1 ;; *) exit 0 ;; esac
+          register: s22_resume_check
+          until: s22_resume_check.rc == 0
+          retries: 12
+          delay: 5
+          delegate_to: "{{ s22_target }}"
+          run_once: true
+
+        - name: Record the target process identity after the resume
+          shell: |
+            set -u
+            UNIT="{{ s22_unit }}"
+            PID=$(systemctl show -p MainPID --value "$UNIT")
+            RESTARTS=$(systemctl show -p NRestarts --value "$UNIT")
+            ACTIVE=$(systemctl show -p ActiveState --value "$UNIT")
+            SUB=$(systemctl show -p SubState --value "$UNIT")
+            START=$(systemctl show -p ExecMainStartTimestamp --value "$UNIT")
+            KILLMODE=$(systemctl show -p KillMode --value "$UNIT")
+            PSTATE="?"
+            if [ -n "${PID:-}" ] && [ "${PID}" != "0" ] && [ -r "/proc/${PID}/stat" ]; then
+              PSTATE=$(cut -d')' -f2 "/proc/${PID}/stat" | awk '{print $1}')
+            fi
+            jq -cn \
+              --arg phase "post_resume" --arg unit "$UNIT" --arg pid "${PID:-}" \
+              --arg restarts "${RESTARTS:-}" --arg active "${ACTIVE:-}" \
+              --arg sub "${SUB:-}" --arg start "${START:-}" \
+              --arg killmode "${KILLMODE:-}" --arg pstate "$PSTATE" \
+              '{phase:$phase, unit:$unit, main_pid:$pid, n_restarts:$restarts,
+                active_state:$active, sub_state:$sub, exec_main_start:$start,
+                kill_mode:$killmode, proc_state:$pstate}'
+          register: s22_identity_post
+          delegate_to: "{{ s22_target }}"
+          run_once: true
+
+        - name: Save the crash-vs-omission discriminator
+          # `same_process: true` is the claim that separates S22 from every
+          # crash-stop scenario in the suite: the node's status changed and
+          # then reverted, and the process behind it was never replaced.
+          copy:
+            dest: "{{ results_dir }}/s22_process_identity.json"
+            content: |
+              {
+                "variant": "{{ s22_variant }}",
+                "unit": "{{ s22_unit }}",
+                "target": "{{ s22_target }}",
+                "hold_seconds": {{ fault_duration | int }},
+                "pre_fault": {{ s22_identity_pre.stdout | default('null', true) }},
+                "post_resume": {{ s22_identity_post.stdout | default('null', true) }},
+                "frozen_check": "{{ s22_frozen_check.stdout | default('') | trim }}",
+                "resume_result": "{{ s22_resume.stdout | default('') | trim }}",
+                "same_process": {{ (
+                     (s22_identity_pre.stdout | default('{}', true) | from_json).main_pid
+                       == (s22_identity_post.stdout | default('{}', true) | from_json).main_pid
+                     and
+                     (s22_identity_pre.stdout | default('{}', true) | from_json).exec_main_start
+                       == (s22_identity_post.stdout | default('{}', true) | from_json).exec_main_start
+                     and
+                     (s22_identity_pre.stdout | default('{}', true) | from_json).n_restarts
+                       == (s22_identity_post.stdout | default('{}', true) | from_json).n_restarts
+                   ) | to_json }}
+              }
+          delegate_to: "{{ groups['observer'][0] }}"
+          run_once: true
+
+    # ── Post-fault observation ────────────────────────────────────────────
+
+    - name: Record the target's running containers after the resume
+      shell: |
+        set -o pipefail
+        crictl ps -o json 2>/dev/null \
+          | jq -c '[.containers[] | {
+              id: .id,
+              name: .metadata.name,
+              createdAt: .createdAt,
+              state: .state,
+              podName: .labels."io.kubernetes.pod.name",
+              podNamespace: .labels."io.kubernetes.pod.namespace"
+            }] | sort_by(.id)' \
+        || echo '[]'
+      register: s22_containers_post
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+      retries: 6
+      delay: 10
+      until: s22_containers_post.rc == 0
+
+    - name: Save the "nothing started, nothing stopped" comparison
+      # The other half of the omission claim. Identical container ids AND
+      # identical createdAt timestamps across the fault window means the
+      # runtime neither started nor stopped anything while it was frozen, and
+      # nothing was recreated on resume.
+      copy:
+        dest: "{{ results_dir }}/s22_container_identity.json"
+        content: |
+          {
+            "target": "{{ s22_target }}",
+            "pre_fault": {{ s22_containers_pre.stdout | default('[]', true) }},
+            "post_resume": {{ s22_containers_post.stdout | default('[]', true) }},
+            "identical_container_ids": {{ (
+                 (s22_containers_pre.stdout | default('[]', true) | from_json
+                    | map(attribute='id') | list | sort)
+                 == (s22_containers_post.stdout | default('[]', true) | from_json
+                    | map(attribute='id') | list | sort)
+               ) | to_json }},
+            "identical_created_at": {{ (
+                 (s22_containers_pre.stdout | default('[]', true) | from_json
+                    | map(attribute='createdAt') | list | sort)
+                 == (s22_containers_post.stdout | default('[]', true) | from_json
+                    | map(attribute='createdAt') | list | sort)
+               ) | to_json }}
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Capture the resumed process's recovery journal
+      # The "stale in-memory state and a backlog of missed watch events" half
+      # of the research claim. Both units are captured for either variant: for
+      # the containerd freeze the interesting lines ("PLEG is not healthy",
+      # "container runtime is down", relist latency) are the kubelet's, and
+      # for the kubelet freeze they are the kubelet's watch reconnects
+      # ("Watch close", "expired", "Failed to watch", resync) after SIGCONT.
+      shell: |
+        journalctl -u containerd -u kubelet \
+          --since "-{{ (fault_duration | int) + 300 }}s" \
+          --no-pager -o short-iso 2>/dev/null | tail -n 600 || true
+      register: s22_journal
+      delegate_to: "{{ s22_target }}"
+      run_once: true
+      ignore_errors: yes
+
+    - name: Save the recovery journal
+      copy:
+        dest: "{{ results_dir }}/s22_recovery_journal.txt"
+        content: "{{ s22_journal.stdout | default('') }}"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - pause: { seconds: 30 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_resume_t30 }
+
+    - pause: { seconds: 60 }
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_resume_t90 }
+
+    - pause:
+        seconds: "{{ [((observation_window | int) - 90), 0] | max }}"
+      run_once: true
+    - include_role: { name: metrics-collect }
+      vars: { snapshot_label: post_resume_final }
+
+- name: S22 — Invariant report
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s22
+  tasks:
+    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+      register: invariant_report
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ invariant_report.stdout }}"
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ invariant_report.stdout }}"

@@ -30,3 +30,21 @@ fault_efficacy_defaults:
   etcd_compact: []
   clock_skew: []
   memory_pressure: []
+
+  # ── Gray-failure fault types (S20-S28) ──────────────────────────────────
+  # These faults deliberately leave the substrate looking healthy, which is
+  # why most of them declare no required signal: the existing vocabulary can
+  # only express "the cluster visibly reacted", and asserting that here would
+  # mark a correctly-executed run FAULT_INEFFECTIVE. The scenarios that need a
+  # stronger assertion write their own scenario_meta.json and carry their own
+  # evidence file instead. See the `require_proposed` field some of them emit
+  # for the signals that would let them self-certify once implemented.
+  pod_network_partition: ["probe_degraded"]
+  vrrp_vip_split: []
+  process_freeze: ["target_node_status_changed"]
+  etcd_nospace: []
+  admission_webhook_timeout: []
+  apf_priority_starvation: []
+  node_object_deleted: ["placement_changed"]
+  clock_skew_negative: []
+  etcd_stale_member: ["etcd_members_dropped"]

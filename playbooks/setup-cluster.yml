@@ -14,6 +14,26 @@
   roles:
     - role: k8s-install
 
+- name: Provision the shared NFS volume for the stateful workload
+  # postgres-stateful now claims the postgres-shared-nfs PVC instead of using
+  # an emptyDir, so the export and the PV/PVC must exist or the pod sits
+  # Pending forever. This is required, not optional: every scenario that
+  # touches postgres-stateful-0 depends on it.
+  #
+  # Why NFS rather than a local provisioner: S2 needs the replacement pod to
+  # schedule on a HEALTHY node while the original is partitioned. A node-affine
+  # volume would drag it back to the partitioned node and the scenario would
+  # measure nothing. An NFS PV carries no node affinity, so both copies mount
+  # the same volume and divergent writes become measurable — which is the
+  # difference between "the same pod name existed twice" and "two live
+  # processes wrote to one volume with no fencing".
+  #
+  # Runs after k8s-install because the PV/PVC need a live API server.
+  hosts: k8s_cluster
+  gather_facts: no
+  roles:
+    - role: nfs-server
+
 - name: Copy admin kubeconfig to observer
   hosts: "{{ groups['observer'][0] }}"
   gather_facts: no

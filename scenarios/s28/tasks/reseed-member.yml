@@ -1,0 +1,334 @@
+---
+# scenarios/s28/tasks/reseed-member.yml
+# Re-seed one etcd member: remove it from the cluster, wipe its data
+# directory, re-add it as a LEARNER, start it with
+# --initial-cluster-state=existing, wait for it to catch up, promote it back
+# to a voting member.
+#
+# Imported twice by scenarios/s28/playbook.yml:
+#   * once in the main block, as the measured re-seed;
+#   * once from the `always:` teardown, as the repair path, if the member is
+#     still missing or not voting when the scenario ends.
+# It is imported (not included) so `ansible-playbook --syntax-check` covers
+# it, and every cluster-wide etcdctl call is delegated to s28_ctl, which is
+# by construction never the member being re-seeded.
+#
+# Inputs (set by the playbook):
+#   s28_target        member to re-seed (inventory hostname)
+#   s28_ctl           an etcd member that is NOT the target
+#   s28_ectl          the etcdctl invocation prefix (API version + certs)
+#   s28_reseed_phase  "primary" or "repair" — labels the artefacts
+#   s28_reseed_snapshots  take a metrics snapshot inside the re-seed window
+#
+# Why a learner and not a straight voting `member add`:
+#   A voting member added while it is still empty counts towards quorum
+#   immediately, so the cluster would momentarily need 3 of 5 with one of the
+#   5 known-dead. A learner neither votes nor counts, so the cluster stays at
+#   4 voting members with all 4 alive for the whole window. `member promote`
+#   additionally REFUSES to run until the learner's raft log is in sync with
+#   the leader, which gives the scenario a hard, etcd-authored "the re-seed
+#   has completed" signal instead of a guessed sleep.
+#
+# Why the IDs are parsed out of etcdctl's plain output and not its JSON:
+#   etcd member IDs are uint64. `--write-out=json | jq` rounds anything above
+#   2^53 to a different number, and `member remove` on a wrong ID is exactly
+#   the mistake this scenario must never make. The plain output prints the ID
+#   in hex, which survives the round trip intact.
+
+- name: "[reseed:{{ s28_reseed_phase }}] Read current membership"
+  shell: |
+    {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+      --command-timeout=15s member list
+  register: s28_rs_members
+  delegate_to: "{{ s28_ctl }}"
+  run_once: true
+  changed_when: false
+  retries: 6
+  delay: 10
+  until: s28_rs_members.rc == 0
+
+- name: "[reseed:{{ s28_reseed_phase }}] Locate the target member by its peer URL"
+  # Matched on the peer URL, not the name: a member that has been added but
+  # has not started yet carries an EMPTY name, so name matching would miss a
+  # half-finished re-seed left by an aborted run — the one case the repair
+  # path exists for.
+  shell: |
+    set -o pipefail
+    {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+      --command-timeout=15s member list \
+      | awk -F', *' '$4 == "https://{{ hostvars[s28_target]['ansible_host'] }}:2380" { print $1 }'
+  register: s28_rs_lookup
+  delegate_to: "{{ s28_ctl }}"
+  run_once: true
+  changed_when: false
+
+- name: "[reseed:{{ s28_reseed_phase }}] Report what the re-seed starts from"
+  debug:
+    msg: >-
+      reseed[{{ s28_reseed_phase }}]: cluster reports
+      {{ s28_rs_members.stdout_lines | length }} members; {{ s28_target }} is
+      {{ ('present as ' ~ s28_rs_lookup.stdout)
+         if (s28_rs_lookup.stdout | trim | length) > 0 else 'ABSENT' }}
+  run_once: true
+
+# ── 1. remove ────────────────────────────────────────────────────────────────
+# Removing drops the cluster to N-1 voting members. Quorum of N-1 is
+# ((N-1)//2)+1 and all N-1 survivors are alive, so quorum is never at risk.
+# The playbook asserts that arithmetic before it injects anything.
+
+- name: "[reseed:{{ s28_reseed_phase }}] Stop etcd on the target before removing it"
+  # Order matters: a still-running member that has been removed from the
+  # cluster keeps sending raft messages under an ID the survivors no longer
+  # know. Stop it first, remove it second.
+  systemd:
+    name: etcd
+    state: stopped
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Remove the stale member from the cluster"
+  shell: |
+    {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+      --command-timeout=20s member remove {{ s28_rs_lookup.stdout | trim }}
+  register: s28_rs_remove
+  delegate_to: "{{ s28_ctl }}"
+  run_once: true
+  when: (s28_rs_lookup.stdout | trim | length) > 0
+
+- name: "[reseed:{{ s28_reseed_phase }}] Save the member-remove output"
+  copy:
+    dest: "{{ results_dir }}/reseed_{{ s28_reseed_phase }}_member_remove.txt"
+    content: |
+      target_member_id={{ s28_rs_lookup.stdout | default('') | trim }}
+      {{ s28_rs_remove.stdout | default('(member was already absent)') }}
+      {{ s28_rs_remove.stderr | default('') }}
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+# ── 2. wipe ──────────────────────────────────────────────────────────────────
+
+- name: "[reseed:{{ s28_reseed_phase }}] Move the stale data directory aside"
+  # Moved, not deleted: the stale WAL and snapshot files ARE this scenario's
+  # evidence — they hold the log position compaction ran past — and a re-seed
+  # that turns out to have been unnecessary stays reversible. etcd refuses to
+  # bootstrap into a directory that already holds member/, so the path has to
+  # end up empty rather than merely pruned.
+  shell: |
+    set -euo pipefail
+    # The destination carries its own timestamp and is never overwritten: the
+    # repair path can run in the same scenario as the primary re-seed, and
+    # `mv` onto an existing directory would nest one data directory inside the
+    # other instead of failing.
+    DEST="{{ etcd_data_dir }}.stale-s28-$(date -u +%Y%m%d%H%M%S)"
+    if [ -e "$DEST" ]; then
+      DEST="${DEST}-$$"
+    fi
+    if [ -d "{{ etcd_data_dir }}/member" ]; then
+      mv "{{ etcd_data_dir }}" "$DEST"
+      echo "moved {{ etcd_data_dir }} -> $DEST"
+    else
+      echo "no member/ directory present; nothing to move"
+    fi
+    mkdir -p "{{ etcd_data_dir }}"
+    chmod 0700 "{{ etcd_data_dir }}"
+  register: s28_rs_wipe
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+# ── 3. re-add as a learner ───────────────────────────────────────────────────
+
+- name: "[reseed:{{ s28_reseed_phase }}] Add the member back as a learner"
+  shell: |
+    {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+      --command-timeout=20s member add {{ s28_target }} --learner \
+      --peer-urls=https://{{ hostvars[s28_target]['ansible_host'] }}:2380
+  register: s28_rs_add
+  delegate_to: "{{ s28_ctl }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Parse the learner ID and its initial-cluster string"
+  set_fact:
+    s28_rs_new_id: >-
+      {{ (s28_rs_add.stdout | regex_search('Member ([0-9a-fA-F]+) added', '\1')
+          | default([''], true) | first | default('', true)) }}
+    # etcdctl prints the exact ETCD_INITIAL_CLUSTER the new member must start
+    # with. The inventory-derived fallback keeps the re-seed alive if a future
+    # etcdctl changes that output format; the two agree for this lab, because
+    # the membership after a remove+add is the inventory set again.
+    s28_rs_initial_cluster: >-
+      {{ (s28_rs_add.stdout | regex_search('ETCD_INITIAL_CLUSTER="([^"]+)"', '\1')
+          | default([''], true) | first | default('', true))
+         | default(s28_rs_initial_cluster_fallback, true) }}
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] The learner must have an ID and a cluster string"
+  assert:
+    that:
+      - (s28_rs_new_id | length) > 0
+      - (s28_rs_initial_cluster | length) > 0
+    fail_msg: >-
+      Could not parse `etcdctl member add` output for {{ s28_target }}.
+      The member has been REMOVED and its data wiped; the cluster is running
+      on {{ (groups['etcd'] | length) - 1 }} members and needs manual repair:
+      `etcdctl member add {{ s28_target }} --learner
+      --peer-urls=https://{{ hostvars[s28_target]['ansible_host'] }}:2380`,
+      then start etcd on {{ s28_target }} with
+      --initial-cluster-state=existing. Raw output was:
+      {{ s28_rs_add.stdout | default('') }}
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Save the member-add output"
+  copy:
+    dest: "{{ results_dir }}/reseed_{{ s28_reseed_phase }}_member_add.txt"
+    content: |
+      {{ s28_rs_add.stdout | default('') }}
+      {{ s28_rs_add.stderr | default('') }}
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+# ── 4. start it with --initial-cluster-state=existing ────────────────────────
+
+- name: "[reseed:{{ s28_reseed_phase }}] Install the rejoin drop-in"
+  # The unit written by roles/k8s-install hardcodes --initial-cluster-state=new
+  # and the bootstrap membership. A member with an EMPTY data directory reads
+  # those flags, so starting it unmodified would have it try to bootstrap a
+  # second cluster with a fresh cluster ID and fail on an ID mismatch. etcd
+  # gives command-line flags precedence over ETCD_* environment variables, so
+  # an `Environment=` drop-in cannot fix this: ExecStart has to be reset with
+  # an empty assignment and restated.
+  #
+  # The replacement ExecStart is derived from the unit on disk — awk pulls the
+  # ExecStart line plus its backslash continuations, sed rewrites exactly two
+  # flags — rather than re-templated here, so it cannot drift from the role.
+  shell: |
+    set -euo pipefail
+    UNIT=/etc/systemd/system/etcd.service
+    NEW_CLUSTER='{{ s28_rs_initial_cluster }}'
+    mkdir -p /etc/systemd/system/etcd.service.d
+    {
+      echo '[Service]'
+      echo 'ExecStart='
+      awk '/^ExecStart=/{f=1} f{print} f && !/\\[[:space:]]*$/{exit}' "$UNIT" \
+        | sed -e 's|--initial-cluster-state=new|--initial-cluster-state=existing|' \
+              -e "s|--initial-cluster=[^ ]*|--initial-cluster=${NEW_CLUSTER}|"
+    } > /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+    grep -q -- '--initial-cluster-state=existing' /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+    grep -q -- "--initial-cluster=${NEW_CLUSTER}" /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+    cat /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+  register: s28_rs_dropin
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Save the rejoin drop-in"
+  copy:
+    dest: "{{ results_dir }}/reseed_{{ s28_reseed_phase }}_dropin.conf"
+    content: "{{ s28_rs_dropin.stdout | default('') }}\n"
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Record when the re-seed window opens"
+  set_fact:
+    s28_rs_start_epoch: "{{ lookup('pipe', 'date -u +%s') }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Start the re-seeded member"
+  systemd:
+    name: etcd
+    daemon_reload: yes
+    state: started
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Wait for the re-seeded member to listen"
+  wait_for:
+    host: 127.0.0.1
+    port: 2379
+    delay: 3
+    timeout: 180
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Snapshot the cluster mid-re-seed"
+  # The window this scenario exists to measure: the member is present as a
+  # learner streaming the leader's snapshot, and is not yet voting. What the
+  # API servers report here — .observers[] in the snapshot — is the question
+  # S17 opens and does not close.
+  include_role:
+    name: metrics-collect
+  vars:
+    snapshot_label: reseed_window
+  when: s28_reseed_snapshots | bool
+
+# ── 5. promote back to a voting member ───────────────────────────────────────
+
+- name: "[reseed:{{ s28_reseed_phase }}] Promote the learner once it has caught up"
+  # `member promote` fails with "can only promote a learner member which is in
+  # sync with leader" until the learner's raft log has caught up, so this loop
+  # is etcd's own catch-up gate rather than a timer. Up to 10 minutes.
+  shell: |
+    {{ s28_ectl }} --endpoints=https://{{ hostvars[s28_ctl]['ansible_host'] }}:2379 \
+      --command-timeout=20s member promote {{ s28_rs_new_id }}
+  register: s28_rs_promote
+  delegate_to: "{{ s28_ctl }}"
+  run_once: true
+  failed_when: false
+  changed_when: s28_rs_promote.rc == 0
+  retries: 40
+  delay: 15
+  until: >-
+    s28_rs_promote.rc == 0
+    or ('not a learner' in ((s28_rs_promote.stdout | default('')) ~ (s28_rs_promote.stderr | default(''))))
+
+- name: "[reseed:{{ s28_reseed_phase }}] Record when the re-seed window closes"
+  set_fact:
+    s28_rs_end_epoch: "{{ lookup('pipe', 'date -u +%s') }}"
+    s28_rs_promoted: >-
+      {{ (s28_rs_promote.rc == 0)
+         or ('not a learner' in ((s28_rs_promote.stdout | default('')) ~ (s28_rs_promote.stderr | default('')))) }}
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Save the promote output"
+  copy:
+    dest: "{{ results_dir }}/reseed_{{ s28_reseed_phase }}_member_promote.txt"
+    content: |
+      member_id={{ s28_rs_new_id }}
+      rc={{ s28_rs_promote.rc | default('') }}
+      attempts={{ s28_rs_promote.attempts | default(1) }}
+      reseed_window_seconds={{ (s28_rs_end_epoch | int) - (s28_rs_start_epoch | int) }}
+      --- stdout ---
+      {{ s28_rs_promote.stdout | default('') }}
+      --- stderr ---
+      {{ s28_rs_promote.stderr | default('') }}
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Remove the rejoin drop-in"
+  # Safe without a restart: the member now has a WAL, and etcd ignores every
+  # --initial-cluster* flag once the data directory is populated. Leaving the
+  # drop-in behind is the real hazard — a later scenario that wipes this node
+  # would silently inherit a stale membership string.
+  file:
+    path: /etc/systemd/system/etcd.service.d/s28-rejoin.conf
+    state: absent
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] Reload systemd after removing the drop-in"
+  systemd:
+    daemon_reload: yes
+  delegate_to: "{{ s28_target }}"
+  run_once: true
+
+- name: "[reseed:{{ s28_reseed_phase }}] The learner must have been promoted"
+  assert:
+    that:
+      - s28_rs_promoted | bool
+    fail_msg: >-
+      {{ s28_target }} was re-seeded but never caught up enough to leave
+      learner state within 10 minutes. The cluster is running on
+      {{ (groups['etcd'] | length) - 1 }} voting members plus one learner: it
+      has quorum and is serving, but it is NOT the
+      {{ groups['etcd'] | length }}-voting-member cluster the rest of the
+      suite expects. Repair before running another scenario. Last promote
+      error: {{ s28_rs_promote.stderr | default('') }}
+  run_once: true
