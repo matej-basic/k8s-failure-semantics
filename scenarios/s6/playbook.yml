@@ -12,8 +12,30 @@
 #   file is a multi-play playbook (each play targets a different host
 #   group), so it cannot be converted to `include_tasks`. Five explicit
 #   imports is the simplest form that keeps the inner file intact and
-#   still gets parsed at playbook-import time. To change the repeat
-#   count, edit the imports below.
+#   still gets parsed at playbook-import time.
+#
+# THE ITERATION COUNT OF *THIS FILE* IS NOT VARIABLE.
+#   It is the number of `import_playbook:` entries below, and no variable
+#   can change that — imports are resolved at parse time, before any
+#   variable exists. `repeat_count` below is NOT the iteration count: it
+#   only sizes the directory-creation loop in the setup play, and it is
+#   asserted against the number of imports so the two can never silently
+#   disagree. README.md's `-e repeat_count=10` has never worked and cannot
+#   be made to work here; it changes how many empty directories are
+#   created and nothing else.
+#
+#   To run a different number of iterations, use the suite-wide harness,
+#   which invokes run-one.yml once per iteration from bash and therefore
+#   takes a real runtime K:
+#
+#       scripts/repeat-scenario.sh s6 -n 10
+#
+#   That produces exactly the same paths this file does
+#   (results/s6/<run_id>/run_1 .. run_K) and passes run-one.yml exactly the
+#   same two variables (run_number, run_results_dir). This file stays as it
+#   is so the `--tags s6` entry in playbooks/run-all-scenarios.yml keeps
+#   working unchanged; if you edit the imports below, update repeat_count
+#   to match or the setup play will stop you.
 
 - name: S6 — Set up repeat-run study
   hosts: "{{ groups['observer'][0] }}"
@@ -21,8 +43,31 @@
   vars:
     scenario_id: s6
     scenario_name: "Repeat-run recovery study"
-    repeat_count: 5
+    # Number of `import_playbook: run-one.yml` entries in this file. Ground
+    # truth for how many iterations S6 runs when invoked as a playbook. Change
+    # it only together with the imports.
+    s6_import_iterations: 5
+    # Sizes the directory-creation loop below. Kept for backward compatibility
+    # with the documented (non-functional) `-e repeat_count=` override; the
+    # assert above stops that override from producing a mismatched tree.
+    repeat_count: "{{ s6_import_iterations }}"
   tasks:
+    # repeat_count is a description of the imports below, not a control over
+    # them. Assert the two agree, so a future edit to either one fails loudly
+    # here instead of silently creating six directories for five runs (or
+    # letting `-e repeat_count=10` look like it did something).
+    - name: repeat_count must match the number of import_playbook iterations
+      assert:
+        that:
+          - repeat_count | int == s6_import_iterations | int
+        fail_msg: >-
+          repeat_count is {{ repeat_count }} but scenarios/s6/playbook.yml
+          contains {{ s6_import_iterations }} import_playbook iterations.
+          The iteration count is the number of imports; repeat_count only
+          sizes the directory loop. To run a different number of iterations
+          use: scripts/repeat-scenario.sh s6 -n <K>
+        success_msg: "S6 will run {{ s6_import_iterations }} iterations"
+
     - name: Create per-run results directories
       file:
         path: "{{ results_dir }}/run_{{ item }}"

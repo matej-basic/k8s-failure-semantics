@@ -2,6 +2,29 @@
 # playbooks/run-all-scenarios.yml
 # Runs all scenarios in sequence with pre-flight health checks between each.
 # Pass --tags "s1,s3,s11" to run a subset.
+#
+# ── This sweep runs each scenario ONCE (REVIEW.md M3) ────────────────────────
+# One pass of the 23 scenarios already takes several hours, so N=1 stays the
+# default here: invoking this playbook must not silently become a multi-day
+# commitment against a live lab. Repetition is opt-in and lives outside this
+# file, in scripts/repeat-scenario.sh, which runs a scenario's unit of
+# repetition K times and writes each iteration to
+#     results/<sN>/<run_id>/run_<K>/
+#
+#     scripts/repeat-scenario.sh s2 -n 5                  # one scenario, N=5
+#     scripts/repeat-scenario.sh s1:5 s2:5 s20:3          # per-scenario N
+#     scripts/repeat-scenario.sh --plan -n 5 --detached   # REVIEW.md's N >= 5
+#
+# The per-scenario counts live in inventory/group_vars/all.yml
+# (scenario_repeat_default / scenario_repeat_counts). The harness derives the
+# scenario list from the `tags: sN` entries in THIS file, so a scenario
+# registered here is automatically repeatable — nothing else to update.
+#
+# The harness is not invoked from here on purpose: Ansible cannot loop
+# `import_playbook` (see the comment at the top of scenarios/s6/playbook.yml),
+# so a repeat count expressed inside a playbook can only ever be the number of
+# import entries someone typed. Driving the loop from bash is what makes K a
+# real runtime argument.
 
 - name: Pre-run cluster health check
   hosts: "{{ groups['control_plane'][0] }}"
@@ -67,7 +90,13 @@
   import_playbook: _health-check.yml
   tags: s5
 
-- name: S6 — Repeat-run recovery study
+# S6 is the one scenario that repeats itself: its playbook.yml imports
+# run-one.yml five times, and that count is fixed by the number of import
+# entries in the file. The sweep therefore runs S6 five times and every other
+# scenario once. To run S6 (or any scenario) a different number of times, use
+# scripts/repeat-scenario.sh — for S6 it drives scenarios/s6/run-one.yml
+# directly, with the same variables and the same output paths.
+- name: S6 — Repeat-run recovery study (5 iterations, fixed by its imports)
   import_playbook: ../scenarios/s6/playbook.yml
   tags: s6
 

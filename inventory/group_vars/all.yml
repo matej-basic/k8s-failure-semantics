@@ -265,3 +265,44 @@ informer_object_name: "{{ observer_informer_name }}-{{ scenario_id }}-{{ run_id 
 # while nine curls cost a few MB. Each is bounded by --max-time at 0.8 x the
 # tick and by timeout(1) at 0.9 x the tick, exactly like every other sub-query.
 trace_observers_enabled: true
+
+# ── Repetition plan (REVIEW.md M3) ────────────────────────────────────────────
+# Every scenario has exactly one run in results/, so no timing measurement has
+# a variance and no violation has a frequency. REVIEW.md M3 asks for N >= 5 per
+# scenario, median + IQR for every timing measurement, violation frequency
+# instead of a boolean, and I4 evaluated for any scenario with N > 1.
+#
+# The mechanism is scripts/repeat-scenario.sh, which runs a scenario's unit of
+# repetition K times and writes each iteration to
+#     results/<sN>/<run_id>/run_<K>/
+# — the layout S6 has always produced, now available to all 23 scenarios.
+#
+# THE DEFAULT IS DELIBERATELY 1.
+# A single pass of the 23 scenarios already takes several hours; N=5 across the
+# suite is a multi-day run against a live lab that is also serving the paper.
+# Making 5 the default would mean every `run-all-scenarios.yml` invocation
+# silently became a multi-day commitment. So the sweep keeps doing exactly what
+# it does today, and repetition is something the operator asks for:
+#
+#     scripts/repeat-scenario.sh s2 -n 5           # one scenario, N=5
+#     scripts/repeat-scenario.sh s1:5 s2:5 s20:3   # per-scenario N
+#     scripts/repeat-scenario.sh --plan            # the counts below
+#     scripts/repeat-scenario.sh --plan -n 5 --detached   # the M3 target
+#
+# Precedence for the iteration count, highest first:
+#     sN:K on the command line
+#   > -n K on the command line
+#   > scenario_repeat_counts[sN] below
+#   > scenario_repeat_default below
+#
+# These two vars are read by scripts/repeat-scenario.sh (awk, no YAML parser on
+# the macOS controller) and are also available to any playbook that wants them.
+# Keep the map flat, two-space indented, one `sN: <int>` per line.
+
+scenario_repeat_default: 1
+
+scenario_repeat_counts:
+  # S6 is the repeat-run recovery study; five iterations is the experiment's
+  # own design, not a harness default. scenarios/s6/playbook.yml still hard-
+  # codes the same five, so the sweep and the harness agree.
+  s6: 5
