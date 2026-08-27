@@ -1,0 +1,85 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04 subiquity autoinstall seed.
+#
+# Rendered by templatefile() from ubuntu-24.04.pkr.hcl and handed to the
+# installer on a second CD-ROM labelled `cidata` (cd_content + cd_label), NOT
+# over HTTP — the build VM sits on 10.0.0.0/24 with no verified route back to
+# a listener on the operator's Mac.
+#
+# Placeholders: ${username}, ${password_hash}, ${ssh_public_key}
+# ---------------------------------------------------------------------------
+autoinstall:
+  version: 1
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # Build-time networking only. The installer-generated netplan file is
+  # deleted again in provision/prepare-template.sh so that nothing in the
+  # template pins an address that would survive cloning.
+  network:
+    version: 2
+    ethernets:
+      any-nic:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  identity:
+    # Overwritten on every clone by VMware Guest OS Customization
+    # (clone.customize.linux_options.host_name in terraform/modules/vm).
+    hostname: ubuntu-template
+    username: ${username}
+    # Hash of a random string that was generated once and thrown away. The
+    # installer refuses an empty identity.password, so this is ballast: the
+    # account is locked with `passwd -l` in late-commands below and sshd runs
+    # with PasswordAuthentication no, so there is no password login at all.
+    password: '${password_hash}'
+
+  ssh:
+    install-server: true
+    # No password auth anywhere in the template.
+    allow-pw: false
+    authorized-keys:
+      - "${ssh_public_key}"
+
+  storage:
+    # `direct`, not `lvm`: a single ext4 root as the last partition on the
+    # disk. Terraform clones this 20 GB template into 40 GB (etcd) and 60 GB
+    # (cp/worker) VMs, and cloud-init's growpart+resizefs modules grow a plain
+    # partition on first boot. With LVM they would grow the PV partition and
+    # then stop, leaving the LV — and therefore the filesystem — at 20 GB.
+    layout:
+      name: direct
+
+  packages:
+    # open-vm-tools: VMware Tools. Required both for guest customization and
+    #   for Terraform's wait_for_guest_net_timeout to ever return.
+    - open-vm-tools
+    # perl: the open-vm-tools deployPkg customization path is perl-based.
+    - perl
+    # python3: ansible.cfg pins interpreter_python = /usr/bin/python3.
+    - python3
+    - openssh-server
+    # cloud-guest-utils ships growpart, which is what actually enlarges the
+    # root partition when a clone is given a bigger disk.
+    - cloud-guest-utils
+
+  # Keep the image lean; roles/common installs everything the lab needs and
+  # explicitly masks the apt auto-update timers.
+  updates: security
+
+  late-commands:
+    # Passwordless sudo at the exact path Ansible expects.
+    - |
+      printf '%s ALL=(ALL) NOPASSWD:ALL\n' '${username}' > /target/etc/sudoers.d/${username}
+    - chmod 0440 /target/etc/sudoers.d/${username}
+    # Lock the password so the installer hash above is permanently unusable.
+    - curtin in-target --target=/target -- passwd -l ${username}
+    # SSH must come up on its own on every clone.
+    - curtin in-target --target=/target -- systemctl enable ssh.service
+    # open-vm-tools must be running before vCenter will hand the guest a
+    # customization spec.
+    - curtin in-target --target=/target -- systemctl enable open-vm-tools.service

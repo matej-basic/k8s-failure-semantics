@@ -27,6 +27,16 @@ override.tf.json
 tfplan
 *.tfplan
 
+# --- Packer ---
+# The vCenter password lives in packer/credentials.pkrvars.hcl; the .example
+# alongside it carries only a placeholder and is tracked deliberately.
+packer/*.pkrvars.hcl
+packer/*.pkrvars.hcl.json
+packer/packer_cache/
+packer/*.log
+packer/packer-manifest.json
+packer/*manifest.json
+
 # --- Ansible ---
 *.retry
 .vault_pass
