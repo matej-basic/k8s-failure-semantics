@@ -61,6 +61,13 @@
     scenario_id: s11
   tasks:
     - name: Block worker1 outbound to API server port 6443 only
+      # The API VIP must be in this list. worker1's kubelet reaches the API
+      # server through keepalived at {{ api_vip }}, not through the individual
+      # control-plane addresses, so blocking only cp1/cp2/cp3 leaves the
+      # heartbeat path open: in the May 2026 run worker1 stayed Ready=True in
+      # all seven snapshots and the scenario measured an undisturbed cluster
+      # while still emitting eight invariant verdicts. S2 already carries the
+      # same correction as `extra_peer_ips`.
       iptables:
         chain: OUTPUT
         protocol: tcp
@@ -68,10 +75,25 @@
         destination: "{{ item }}"
         jump: DROP
         comment: "fault-inject-kubelet-partition-{{ scenario_id }}"
-      loop: "{{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list }}"
+      loop: "{{ (groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list)
+                + [api_vip] }}"
+
+    - name: Declare what this fault must observably do
+      copy:
+        dest: "{{ results_dir }}/scenario_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "fault_type": "kubelet_api_partition",
+            "efficacy": {
+              "target_node": "worker1",
+              "require": ["target_node_status_changed"]
+            }
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
 
     - debug:
-        msg: "FAULT INJECTED: kubelet→API blocked on worker1 (port 6443 only)"
+        msg: "FAULT INJECTED: kubelet→API blocked on worker1 (port 6443, including the VIP {{ api_vip }})"
 
 - name: S11 — Poll divergence state every 30s
   hosts: k8s_cluster:etcd

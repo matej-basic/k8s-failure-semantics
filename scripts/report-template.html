@@ -67,6 +67,18 @@
   td.v-VIOLATED { background: rgba(247, 118, 142, 0.22); color: var(--err); }
   td.v-INSUFFICIENT_DATA { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
   td.v-NO_DATA, td.v-PARSE_ERROR { background: var(--bg-elev); color: var(--na); }
+  /* DETECTOR_INVALID: the invariant was already violated in the baseline
+     snapshot, so the detector — not the cluster — is what failed. Styled
+     apart from VIOLATED because reading one as the other is the mistake the
+     calibration gate exists to prevent. */
+  td.v-DETECTOR_INVALID { background: rgba(122, 162, 247, 0.16); color: var(--info, #7aa2f7); }
+  td.v-FAULT_INEFFECTIVE { background: var(--bg-elev); color: var(--na); font-style: italic; }
+
+  .stale-notice { border: 1px solid rgba(247, 118, 142, 0.5);
+    background: rgba(247, 118, 142, 0.10); color: var(--fg);
+    border-radius: 6px; padding: 12px 14px; margin: 0 0 18px; font-size: 13px;
+    line-height: 1.55; }
+  .stale-notice b { color: var(--err); }
 
   .badges { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; }
   .badge { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 500;
@@ -598,15 +610,24 @@ window.addEventListener("hashchange", () => {
 });
 
 // ── Verdict helpers ──────────────────────────────────────────────────────────
+function verdictLabel(v) {
+  return v.replace("INSUFFICIENT_DATA", "INSUF")
+          .replace("DETECTOR_INVALID", "INVALID")
+          .replace("FAULT_INEFFECTIVE", "NO FAULT")
+          .replace("PARSE_ERROR", "ERROR");
+}
 function verdictCell(v) {
   v = v || "NO_DATA";
-  return `<td class="v-${v}">${v.replace("INSUFFICIENT_DATA","INSUF").replace("PARSE_ERROR","ERROR")}</td>`;
+  const title = v === "DETECTOR_INVALID"
+    ? ' title="This invariant was already violated in the baseline snapshot, before any fault was injected — the detector is at fault, not the cluster."'
+    : "";
+  return `<td class="v-${v}"${title}>${verdictLabel(v)}</td>`;
 }
 function verdictBadge(v) {
   v = v || "NO_DATA";
   const cls = v === "PRESERVED" ? "ok" : v === "VIOLATED" ? "err"
             : v === "INSUFFICIENT_DATA" ? "warn" : "na";
-  return `<span class="badge ${cls}">${v}</span>`;
+  return `<span class="badge ${cls}">${verdictLabel(v)}</span>`;
 }
 
 // ── Pull verdicts from a scenario's latest run ───────────────────────────────
@@ -627,7 +648,7 @@ function renderOverview() {
   const present = Object.keys(DATA.scenarios);
   const all = Object.keys(CATALOG);
 
-  let totalP = 0, totalV = 0, totalI = 0;
+  let totalP = 0, totalV = 0, totalI = 0, totalD = 0;
   for (const sc of present) {
     const v = latestVerdicts(sc);
     if (!v) continue;
@@ -635,12 +656,27 @@ function renderOverview() {
       if (v[k] === "PRESERVED") totalP++;
       else if (v[k] === "VIOLATED") totalV++;
       else if (v[k] === "INSUFFICIENT_DATA") totalI++;
+      else if (v[k] === "DETECTOR_INVALID") totalD++;
     }
   }
+  // totalD is deliberately outside `total`: a detector disqualified at
+  // baseline measured nothing, and folding it into a violation rate is how
+  // the May 2026 sweep reported a 45% violation rate built largely on
+  // artifacts.
   const total = totalP + totalV + totalI;
 
   let html = `
     <h2>Overview</h2>
+    <div class="stale-notice">
+      <b>These results predate the measurement fixes of Aug 27 2026.</b>
+      The narrative on this page was written against the May 2026 sweep, whose
+      checker ordered snapshots by filename, could not detect
+      <code>Ready=Unknown</code>, and probed the service from a vantage point
+      with no route to it. The I2, I5 and I6 columns of that sweep are
+      artifacts of those defects, not measurements: re-run the suite and
+      rebuild this report before citing any figure here. See
+      <code>REVIEW.md</code> (D1–D6) for what changed and why.
+    </div>
     <div class="crumb"><span>Results path:</span> <code>${escapeHtml(DATA.results_path)}</code></div>
     <div class="cards">
       <div class="card"><div class="n">${present.length}<span style="color:var(--fg-dim);font-size:14px;font-weight:400">&nbsp;/ ${all.length}</span></div><div class="lbl">scenarios with data</div></div>
@@ -962,6 +998,16 @@ function renderFindings() {
   const sdata = id => `<a href="#/scenario/${id}">${id.toUpperCase()}</a>`;
   let html = `
     <h2>Findings — observed behaviour, May 20 sweep</h2>
+    <div class="stale-notice">
+      <b>These results predate the measurement fixes of Aug 27 2026.</b>
+      The narrative on this page was written against the May 2026 sweep, whose
+      checker ordered snapshots by filename, could not detect
+      <code>Ready=Unknown</code>, and probed the service from a vantage point
+      with no route to it. The I2, I5 and I6 columns of that sweep are
+      artifacts of those defects, not measurements: re-run the suite and
+      rebuild this report before citing any figure here. See
+      <code>REVIEW.md</code> (D1–D6) for what changed and why.
+    </div>
     <div class="crumb">12 of 14 scenarios with full data · 82 invariant verdicts · 36 violated · 46 preserved · grounded in <code>results/*/invariant_report.json</code></div>
 
     <div class="findings-toc">

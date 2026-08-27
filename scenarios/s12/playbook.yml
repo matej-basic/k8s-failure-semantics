@@ -86,11 +86,23 @@
     scenario_id: s12
     fault_type: network_flap
     target_host: cp1
-    peer_hosts:
-      - cp2
-      - cp3
-    flap_interval: 10
+    # cp2/cp3 alone is not enough. The controller-manager on cp1 renews its
+    # lease through cp1's own API server, which writes to etcd — and the etcd
+    # members were never blocked, so in the May 2026 run the lease was renewed
+    # normally throughout the "storm": aggregate_report.json records
+    # cm_holder_changes 0 and sched_holder_changes 0 over 120 samples. Cutting
+    # cp1 off from etcd and from the VIP is what makes the lease expire.
+    peer_hosts: "{{ ['cp2', 'cp3'] + groups['etcd'] }}"
+    extra_peer_ips:
+      - "{{ api_vip }}"
+    # Blocked windows must outlast leaseDurationSeconds (15s by default) or
+    # the holder never loses the lease; open windows only need to be long
+    # enough for it to be reacquired.
+    flap_block_seconds: 25
+    flap_open_seconds: 15
     flap_count: 6
+    efficacy_require:
+      - lease_holder_changed
   roles:
     - role: fault-inject
 

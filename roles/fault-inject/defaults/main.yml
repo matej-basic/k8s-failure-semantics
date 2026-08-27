@@ -1,0 +1,32 @@
+---
+# roles/fault-inject/defaults/main.yml
+
+# What each fault type must observably do for the run to count as a real
+# measurement. check-invariants.sh asserts these against the collected
+# snapshots and labels a run that fails its own assertion FAULT_INEFFECTIVE,
+# so it can be excluded from the aggregate instead of quietly contributing
+# verdicts that describe an undisturbed cluster.
+#
+# Signal names are defined in scripts/check-invariants.sh (fault_efficacy):
+#   target_node_status_changed  the node the fault was aimed at changed its
+#                               Ready status relative to the baseline
+#   node_status_changed         any node did
+#   lease_holder_changed        a controller-manager or scheduler lease
+#                               changed hands
+#   etcd_members_dropped        fewer etcd members responded than at baseline
+#   probe_degraded              the in-cluster service probe changed result
+#   placement_changed           the set of running containers per node changed
+#   api_view_lost               an API server stopped answering for a snapshot
+#
+# An empty list means "any observable change counts" — appropriate for faults
+# whose effect is a latency or throughput perturbation rather than a state
+# transition. A scenario overrides with efficacy_require / efficacy_target_node.
+fault_efficacy_defaults:
+  network_partition: ["target_node_status_changed"]
+  network_asymmetric: ["target_node_status_changed"]
+  network_flap: ["lease_holder_changed"]
+  network_delay: []
+  etcd_latency: []
+  etcd_compact: []
+  clock_skew: []
+  memory_pressure: []

@@ -21,8 +21,14 @@ collect_verdicts() {
       | sort | tail -1)
 
     if [ -z "$report" ]; then
+      # NO_DATA means the scenario never produced a report — it was skipped or
+      # it died mid-run. That is not the same as a scenario that ran and found
+      # nothing, and the row carries run_validity so the two cannot be read as
+      # the same thing (S5 and S6 sat in the May 2026 heatmap as NO_DATA rows
+      # beside real verdicts, and I4 went unevaluated suite-wide as a result).
       row=$(jq -n --arg sc "$sc" \
-        '{scenario: $sc, I1: "NO_DATA", I2: "NO_DATA", I3: "NO_DATA", I4: "NO_DATA", I5: "NO_DATA", I6: "NO_DATA", I9: "NO_DATA", I10: "NO_DATA"}')
+        '{scenario: $sc, run_validity: "NOT_RUN", fault_efficacy: null,
+          I1: "NO_DATA", I2: "NO_DATA", I3: "NO_DATA", I4: "NO_DATA", I5: "NO_DATA", I6: "NO_DATA", I9: "NO_DATA", I10: "NO_DATA"}')
     else
       # Build the row by indexing each invariant we know about. Using //
       # "NO_DATA" gracefully handles reports written before I6/I9/I10
@@ -32,6 +38,12 @@ collect_verdicts() {
         ($inv | map({(.invariant): .verdict}) | add) as $by_id |
         {
           scenario: $sc,
+          run_validity: (.run_validity // "UNKNOWN"),
+          fault_efficacy: (if .fault_efficacy
+                           then {verdict: .fault_efficacy.verdict,
+                                 fired: (.fault_efficacy.fired // []),
+                                 missing_required: (.fault_efficacy.missing_required // [])}
+                           else null end),
           I1:  ($by_id.I1  // "NO_DATA"),
           I2:  ($by_id.I2  // "NO_DATA"),
           I3:  ($by_id.I3  // "NO_DATA"),
@@ -43,7 +55,7 @@ collect_verdicts() {
         }
       ' "$report" 2>/dev/null || \
       jq -n --arg sc "$sc" \
-        '{scenario: $sc, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
+        '{scenario: $sc, run_validity: "PARSE_ERROR", fault_efficacy: null, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
     fi
 
     out=$(echo "$out" | jq --argjson row "$row" '. + [$row]')
@@ -163,9 +175,20 @@ VARIANCE=$(collect_recovery_variance)
 AMPLIFICATION=$(collect_amplification)
 TERMINATION=$(collect_termination_timing)
 
-# Overall statistics
-TOTAL_PRESERVED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "PRESERVED")] | length')
-TOTAL_VIOLATED=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "VIOLATED")] | length')
+# Overall statistics.
+#
+# Counted over runs whose fault actually did something: a run labelled
+# FAULT_INEFFECTIVE measured an undisturbed cluster, so its verdicts describe
+# nothing and must not enter the rate. DETECTOR_INVALID verdicts are counted
+# separately for the same reason — they are disqualified detectors, not
+# findings, and folding them into the denominator is how the May 2026 sweep
+# arrived at a 45% violation rate built largely on artifacts.
+VALID_VERDICTS=$(echo "$VERDICTS" | jq '[.[] | select((.run_validity // "UNKNOWN") != "FAULT_INEFFECTIVE" and (.run_validity // "UNKNOWN") != "NOT_RUN")]')
+TOTAL_PRESERVED=$(echo "$VALID_VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "PRESERVED")] | length')
+TOTAL_VIOLATED=$(echo "$VALID_VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "VIOLATED")] | length')
+TOTAL_INVALID=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "DETECTOR_INVALID")] | length')
+RUNS_INEFFECTIVE=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length')
+RUNS_NOT_RUN=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "NOT_RUN")] | length')
 
 jq -n \
   --argjson verdicts "$VERDICTS" \
@@ -175,15 +198,22 @@ jq -n \
   --argjson termination "$TERMINATION" \
   --argjson preserved "$TOTAL_PRESERVED" \
   --argjson violated "$TOTAL_VIOLATED" \
+  --argjson invalid "$TOTAL_INVALID" \
+  --argjson ineffective "$RUNS_INEFFECTIVE" \
+  --argjson notrun "$RUNS_NOT_RUN" \
   '{
     generated_at: now | todate,
     summary: {
       total_invariant_checks: ($preserved + $violated),
       total_preserved: $preserved,
       total_violated: $violated,
+      detectors_invalidated: $invalid,
+      runs_fault_ineffective: $ineffective,
+      scenarios_not_run: $notrun,
       violation_rate_pct: (if ($preserved + $violated) > 0
         then ($violated * 100 / ($preserved + $violated) | round)
-        else 0 end)
+        else 0 end),
+      counting_note: "Rates cover runs whose fault produced an observable change. DETECTOR_INVALID verdicts (invariants already violated at baseline) and FAULT_INEFFECTIVE runs are reported separately and excluded from the denominator."
     },
     invariant_heatmap: $verdicts,
     divergence_timing: $timing,

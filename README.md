@@ -161,14 +161,48 @@ ansible-playbook ... scenarios/s6/playbook.yml -e repeat_count=10
 
 ## Invariant Verdicts
 
-Each scenario produces an `invariant_report.json` with verdicts:
+Each scenario produces an `invariant_report.json`. Eight invariants are
+evaluated (I7 and I8 do not exist; the numbering follows the paper's drafts):
 
-- `PRESERVED` — invariant held throughout all snapshots
+| ID  | Name                            | What a violation means |
+|-----|---------------------------------|------------------------|
+| I1  | Exclusive authority             | One pod identity ran on two nodes at once |
+| I2  | Reachability publication        | Endpoints published backends that were not serving |
+| I3  | Failure declaration consistency | A node the control plane stopped vouching for still ran containers |
+| I4  | Recovery coherence              | Repeated runs of the same fault converged to different states |
+| I5  | Observation-action consistency  | Two API servers disagreed, or one served a provably stale read |
+| I6  | Watch progress monotonicity     | An observed revision went backwards |
+| I9  | Quorum continuity               | etcd lost majority, or members disagreed on leader / raft term |
+| I10 | Reconciliation termination      | New warnings kept appearing after the fault was removed |
+
+Per-invariant verdicts:
+
+- `PRESERVED` — invariant held in every snapshot
 - `VIOLATED` — invariant was broken in at least one snapshot
-- `INSUFFICIENT_DATA` — not enough snapshots to evaluate (mainly I4)
+- `INSUFFICIENT_DATA` — the run does not contain the evidence this invariant
+  needs (I4 outside S6; I5 for runs recorded before per-API-server views)
+- `DETECTOR_INVALID` — the invariant was **already violated in the baseline
+  snapshot, before any fault was injected**. The detector is at fault, not the
+  cluster, and the verdict is disqualified for the whole run. The measured
+  verdict is kept alongside it as `measured_verdict`.
+
+Each report also carries a run-level `run_validity`:
+
+- `OK` — the fault produced an observable change against the baseline
+- `FAULT_INEFFECTIVE` — it did not. The run measured an undisturbed cluster,
+  so its invariant verdicts describe nothing and `aggregate-results.sh`
+  excludes them from the rates. What each fault must observably do is declared
+  in `scenario_meta.json`, written by the `fault-inject` role (defaults per
+  fault type in `roles/fault-inject/defaults/main.yml`, overridden per
+  scenario with `efficacy_require` / `efficacy_target_node`).
 
 The `aggregate_report.json` collects all verdicts into the heatmap
 described as Figure 7 in the paper.
+
+> **The results committed before Aug 27 2026 predate these checks.** See
+> [`REVIEW.md`](REVIEW.md) — the May 2026 sweep's I2, I5 and I6 columns are
+> artifacts of defects in the checker, not measurements. Re-run the suite
+> before citing any figure from it.
 
 ---
 

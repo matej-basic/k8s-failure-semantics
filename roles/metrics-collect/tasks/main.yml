@@ -19,6 +19,19 @@
     snapshot_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
   run_once: true
 
+- name: Advance the per-run snapshot counter
+  # Snapshots must be evaluated in the order they were taken. Filename order
+  # cannot deliver that (t_plus_120 sorts before t_plus_30, post_fault_*
+  # before pre_fault), and label parsing would have to know every scenario's
+  # naming scheme. The counter is written into each snapshot so
+  # check-invariants.sh has an explicit order that depends on neither
+  # filenames nor any cluster node's clock. `run_once` propagates the fact to
+  # every host in the play, so it keeps counting across the repeated
+  # include_role calls within a scenario.
+  set_fact:
+    snapshot_index: "{{ (snapshot_index | default(0) | int) + 1 }}"
+  run_once: true
+
 # ── etcd observer ────────────────────────────────────────────────────────────
 
 - name: Collect etcd member health and leader status
@@ -87,6 +100,7 @@
                reason: .reason,
                message: .message
              }],
+             taints: .spec.taints,
              unschedulable: .spec.unschedulable
            }]' 2>/dev/null || echo null)
     PS=$(run_or_null kubectl get pods -n {{ stateful_app_namespace }} -o json \
@@ -161,6 +175,66 @@
 # snapshot-assembly task below splices it in directly as the control_plane
 # object — no per-field shims needed.
 
+# ── Per-API-server observer views ─────────────────────────────────────────────
+# The suite's subject is observers that disagree, but every measurement above
+# is taken from ONE API server (metrics_cp_host, cp2 by default). This task
+# asks each API server the same questions at the same instant, addressing it
+# by its own IP rather than through the keepalived VIP — the VIP would hand
+# every query to whichever node currently holds it, which is precisely the
+# ambiguity we are trying to measure.
+#
+#   probe_rv_quorum — resourceVersion of a collection read straight through to
+#                     etcd (linearizable);
+#   probe_rv_cache  — the same collection with resourceVersion=0, which the
+#                     API server answers from its watch cache;
+#   node_ready      — that API server's answer for every node's Ready status.
+#
+# The gap between the two revisions is this API server's watch-cache lag; the
+# gap between one server's node_ready map and another's is observer-relative
+# disagreement with no interpretation layer in between. I5 is evaluated from
+# these. A server that cannot answer records ok:false and is skipped rather
+# than counted as agreement.
+#
+# The kubeadm API server certificate carries the node's own address in its
+# SANs, so --server against ansible_host validates with the same admin.conf CA.
+
+- name: Collect the per-API-server view of the cluster
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    SERVER="https://{{ ansible_host }}:6443"
+    TIMEOUT="{{ observer_view_timeout | default('5s') }}"
+    rv_quorum=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
+      get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1' 2>/dev/null \
+      | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || echo "")
+    rv_cache=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
+      get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1&resourceVersion=0' 2>/dev/null \
+      | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || echo "")
+    node_ready=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
+      get nodes -o json 2>/dev/null \
+      | jq -c '[.items[] | {
+            key: .metadata.name,
+            value: ([.status.conditions[] | select(.type == "Ready") | .status][0] // "Missing")
+          }] | from_entries' 2>/dev/null || echo "")
+    jq -cn \
+      --arg host "{{ inventory_hostname }}" \
+      --arg server "$SERVER" \
+      --arg q "${rv_quorum:-}" \
+      --arg c "${rv_cache:-}" \
+      --argjson nr "${node_ready:-null}" \
+      '{
+         host: $host,
+         server: $server,
+         ok: (($q | length) > 0),
+         probe_rv_quorum: (if ($q | length) > 0 then $q else null end),
+         probe_rv_cache:  (if ($c | length) > 0 then $c else null end),
+         node_ready: $nr
+       }'
+  register: apiserver_view
+  when: inventory_hostname in groups['control_plane']
+  ignore_errors: yes
+  ignore_unreachable: yes
+
 # ── Per-node kubelet observer ─────────────────────────────────────────────────
 # These two tasks talk to each cluster host directly. During a partition the
 # fault target may briefly drop its ssh mux ("Broken pipe") which Ansible
@@ -207,23 +281,47 @@
   ignore_errors: yes
   ignore_unreachable: yes
 
-# ── External client observer ──────────────────────────────────────────────────
+# ── Client observer ───────────────────────────────────────────────────────────
+# This used to run on the observer — the workstation running Ansible — against
+# the service ClusterIP. ClusterIP CIDRs are not routable from there, so every
+# snapshot of every scenario in the May 2026 sweep recorded httpCode 0,
+# including pre_fault, and I2 was reported VIOLATED in 11 of 12 scenarios
+# before any fault was injected. S15 documents the same constraint in its own
+# header and works around it by running its traffic generator on a
+# control-plane node; this does the same, on the host metrics_cp_host already
+# designates as reachable for the run.
+#
+# The distinction the old version could not express: a probe that RAN AND
+# FAILED (httpCode 0 from a refused connection, or 5xx) is evidence, while a
+# probe that COULD NOT RUN AT ALL is missing data. The latter now emits
+# httpCode: null, and check-invariants.sh skips it instead of counting it as a
+# violation. probe_source records where the request came from, so a future
+# change of vantage point is visible in the data rather than silent.
 
-- name: Probe service reachability from observer
+- name: Probe service reachability from inside the cluster
   shell: |
-    SVC_IP=$(kubectl get svc nginx-stateless -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
-    if [ -n "$SVC_IP" ]; then
-      result=$(curl -sk --max-time 3 http://$SVC_IP/ -o /dev/null -w '%{http_code}' 2>/dev/null)
-      echo "{\"service\": \"nginx-stateless\", \"clusterIP\": \"$SVC_IP\", \"httpCode\": $result}"
-    else
-      echo '{"service": "nginx-stateless", "error": "no_clusterIP"}'
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    SVC_IP=$(kubectl get svc {{ stateless_app_name }} -n {{ stateful_app_namespace }} \
+      -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+    if [ -z "$SVC_IP" ]; then
+      echo '{"service": "{{ stateless_app_name }}", "clusterIP": null, "httpCode": null, "probe_source": "in_cluster", "error": "no_clusterIP"}'
+      exit 0
     fi
+    code=$(curl -sk --max-time 3 "http://$SVC_IP/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "")
+    if [ -z "$code" ]; then
+      code_json=null
+    else
+      # curl writes 000 on a failed connection; strip the leading zeros so the
+      # value is valid JSON (and a real, countable failure rather than null).
+      code_json=$((10#$code))
+    fi
+    echo "{\"service\": \"{{ stateless_app_name }}\", \"clusterIP\": \"$SVC_IP\", \"httpCode\": $code_json, \"probe_source\": \"in_cluster\"}"
   register: service_probe
-  delegate_to: "{{ groups['observer'][0] }}"
+  delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
   run_once: true
-  environment:
-    KUBECONFIG: /tmp/admin.conf
   ignore_errors: yes
+  ignore_unreachable: yes
 
 # ── Assemble and write snapshot ───────────────────────────────────────────────
 
@@ -234,6 +332,24 @@
   # each host triplicated. Start each snapshot from an empty list.
   set_fact:
     node_snapshots: []
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: Reset per-API-server view accumulator before assembling this snapshot
+  # Same reasoning as the node accumulator above: set_fact persists for the
+  # whole play, so without the reset the observer list grows by one entry per
+  # control-plane node on every snapshot of the scenario.
+  set_fact:
+    observer_views: []
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+- name: Assemble per-API-server observer views
+  set_fact:
+    observer_views: "{{ observer_views | default([]) + [
+      hostvars[item]['apiserver_view']['stdout'] | default('') | trim
+    ] }}"
+  loop: "{{ groups['control_plane'] }}"
   delegate_to: "{{ groups['observer'][0] }}"
   run_once: true
 
@@ -258,13 +374,16 @@
         "scenario_id": "{{ scenario_id }}",
         "run_id": "{{ run_id }}",
         "snapshot_label": "{{ snapshot_label }}",
+        "snapshot_index": {{ snapshot_index | default(0) | int }},
         "timestamp": "{{ snapshot_ts }}",
         "etcd": {
           "member_status": {{ etcd_status.stdout | default('null', true) }},
-          "current_revision": {{ etcd_revision.stdout | default('null', true) }}
+          "current_revision": {{ etcd_revision.stdout | default('null', true) }},
+          "expected_members": {{ groups['etcd'] | length }}
         },
         "control_plane": {{ cp_state.stdout | default('null', true) }},
         "nodes": {{ node_snapshots | to_json }},
+        "observers": [ {{ observer_views | default([]) | reject('equalto', '') | join(', ') }} ],
         "external_probe": {{ service_probe.stdout | default('null', true) }}
       }
   delegate_to: "{{ groups['observer'][0] }}"

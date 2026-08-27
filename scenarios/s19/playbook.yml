@@ -125,6 +125,21 @@
         comment: "fault-inject-quorum-split-{{ scenario_id }}"
       loop: "{{ s19_majority }}"
 
+    - name: Declare what this fault must observably do
+      copy:
+        dest: "{{ results_dir }}/scenario_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "fault_type": "etcd_quorum_split",
+            "efficacy": {
+              "target_node": "",
+              "require": ["etcd_members_dropped"]
+            }
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
     - name: Log the split
       debug:
         msg: >-

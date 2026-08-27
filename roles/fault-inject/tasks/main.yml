@@ -2,6 +2,31 @@
 # roles/fault-inject/tasks/main.yml
 # Dispatcher — include the appropriate fault task file
 
+- name: Declare what this fault must observably do
+  # The fault-efficacy assertion. A scenario whose injection misses its target
+  # still produces a full set of invariant verdicts, and those verdicts
+  # describe an undisturbed cluster — S11 (blocked the control-plane IPs but
+  # not the API VIP the kubelet uses) and S12 (flapped cp1 against cp2/cp3
+  # while leaving cp1 to etcd open) are both of that kind in the May 2026
+  # sweep. check-invariants.sh reads this file and marks a run that fails its
+  # own assertion FAULT_INEFFECTIVE. Defaults per fault type live in
+  # defaults/main.yml; a scenario overrides with efficacy_require and
+  # efficacy_target_node.
+  copy:
+    dest: "{{ results_dir }}/scenario_meta.json"
+    content: |
+      {
+        "scenario_id": {{ scenario_id | to_json }},
+        "fault_type": {{ fault_type | to_json }},
+        "efficacy": {
+          "target_node": {{ (efficacy_target_node | default(target_host | default(''), true)) | to_json }},
+          "require": {{ (efficacy_require | default(fault_efficacy_defaults[fault_type] | default([]), true)) | to_json }}
+        }
+      }
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+  when: fault_type != 'teardown'
+
 - name: Inject network partition fault
   include_tasks: network-partition.yml
   when: fault_type == 'network_partition'

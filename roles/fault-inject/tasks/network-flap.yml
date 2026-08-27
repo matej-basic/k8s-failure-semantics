@@ -5,17 +5,28 @@
 #
 # target_host: host whose connectivity will flap
 # peer_hosts: hosts to flap connectivity toward
-# flap_interval: seconds between each toggle (default: 10)
+# flap_interval: legacy symmetric toggle interval (default: 10)
+# flap_block_seconds: seconds connectivity stays blocked (default: flap_interval)
+# flap_open_seconds: seconds connectivity stays open (default: flap_interval)
 # flap_count: number of on/off cycles (default: 6)
+# extra_peer_ips: raw IPs to flap that are not inventory hosts — the API VIP
 
 - name: Set flap defaults
+  # Blocked and open windows are configured separately because they answer
+  # different questions: the blocked window has to outlast the lease duration
+  # for the holder to lose it, while the open window only has to be long
+  # enough for the lease to be reacquired. A symmetric 10s/10s flap against a
+  # 15s lease cannot expire anything.
   set_fact:
     flap_interval: "{{ flap_interval | default(10) }}"
     flap_count: "{{ flap_count | default(6) }}"
+    flap_block_seconds: "{{ flap_block_seconds | default(flap_interval | default(10)) }}"
+    flap_open_seconds: "{{ flap_open_seconds | default(flap_interval | default(10)) }}"
 
 - name: Resolve peer IPs
   set_fact:
-    peer_ips: "{{ peer_hosts | map('extract', hostvars, 'ansible_host') | list }}"
+    peer_ips: "{{ (peer_hosts | map('extract', hostvars, 'ansible_host') | list)
+                  + (extra_peer_ips | default([])) }}"
 
 - name: Install flap script on target host
   copy:
@@ -24,7 +35,8 @@
     content: |
       #!/bin/bash
       PEER_IPS="{{ peer_ips | join(' ') }}"
-      INTERVAL={{ flap_interval }}
+      BLOCK_FOR={{ flap_block_seconds }}
+      OPEN_FOR={{ flap_open_seconds }}
       CYCLES={{ flap_count }}
       TAG="fault-inject-flap-{{ scenario_id }}"
 
@@ -34,10 +46,10 @@
           iptables -A OUTPUT -d $ip -j DROP -m comment --comment "$TAG"
           iptables -A INPUT -s $ip -j DROP -m comment --comment "$TAG"
         done
-        sleep $INTERVAL
+        sleep $BLOCK_FOR
         echo "[$(date -u +%H:%M:%S)] Flap cycle $i/$CYCLES — UNBLOCKING"
         iptables-save | grep -v "$TAG" | iptables-restore
-        sleep $INTERVAL
+        sleep $OPEN_FOR
       done
       echo "[$(date -u +%H:%M:%S)] Flap sequence complete"
   when: inventory_hostname == target_host
@@ -50,5 +62,5 @@
 
 - name: Log flap fault started
   debug:
-    msg: "FAULT INJECTED: network flap on {{ target_host }} — {{ flap_count }} cycles of {{ flap_interval }}s each"
+    msg: "FAULT INJECTED: network flap on {{ target_host }} — {{ flap_count }} cycles of {{ flap_block_seconds }}s blocked / {{ flap_open_seconds }}s open toward {{ peer_ips | join(', ') }}"
   when: inventory_hostname == target_host
