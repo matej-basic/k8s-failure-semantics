@@ -67,10 +67,47 @@ for sc in sorted(os.listdir(root)):
     if not os.path.isdir(sc_path) or not sc.startswith("s"):
         continue
     runs = {}
+    # A run directory is either a single run, with snapshot_*.json directly
+    # inside it, or a repeated batch produced by scripts/repeat-scenario.sh,
+    # which nests each iteration in run_<K>/ and drops a repeat_manifest.json
+    # beside them. Without this expansion a batch reads as zero snapshots and
+    # the whole scenario silently disappears from the report -- the failure
+    # would look like "the scenario was never run" rather than "the report
+    # cannot read this layout".
+    #
+    # Iterations are surfaced as separate runs keyed "<run_id>/run_<K>", so a
+    # repeated scenario shows one entry per iteration and every consumer that
+    # already handles several runs per scenario keeps working unchanged.
+    def iteration_dirs(run_path):
+        names = []
+        for fn in os.listdir(run_path):
+            if not fn.startswith("run_"):
+                continue
+            if not os.path.isdir(os.path.join(run_path, fn)):
+                continue
+            tail = fn[len("run_"):]
+            if tail.isdigit():
+                names.append((int(tail), fn))
+        # Numeric, not lexical: run_10 must not sort before run_2.
+        return [fn for _, fn in sorted(names)]
+
+    expanded = []
     for run in sorted(os.listdir(sc_path)):
         run_path = os.path.join(sc_path, run)
         if not os.path.isdir(run_path):
             continue
+        iters = iteration_dirs(run_path)
+        is_batch = iters and (
+            os.path.isfile(os.path.join(run_path, "repeat_manifest.json"))
+            or not any(f.startswith("snapshot_") for f in os.listdir(run_path))
+        )
+        if is_batch:
+            for it in iters:
+                expanded.append((run + "/" + it, os.path.join(run_path, it)))
+        else:
+            expanded.append((run, run_path))
+
+    for run, run_path in expanded:
         snaps = {}
         for fn in sorted(os.listdir(run_path)):
             full = os.path.join(run_path, fn)
