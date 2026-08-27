@@ -73,6 +73,19 @@
      calibration gate exists to prevent. */
   td.v-DETECTOR_INVALID { background: rgba(122, 162, 247, 0.16); color: var(--info, #7aa2f7); }
   td.v-FAULT_INEFFECTIVE { background: var(--bg-elev); color: var(--na); font-style: italic; }
+  /* NOT_APPLICABLE: this fault class cannot produce the state the invariant
+     forbids, so the cell is a question that was never asked. It gets its own
+     colour rather than sharing PRESERVED's green — reading the two as the same
+     thing is exactly what inflated the preserved column (REVIEW.md M4). It is
+     also deliberately NOT the same grey as NO_DATA: "inapplicable" is a
+     judgement the checker made, "no data" is the absence of one. */
+  td.v-NOT_APPLICABLE { background: rgba(86, 95, 114, 0.22); color: var(--fg-dim);
+    border: 1px dashed var(--fg-faint); }
+  /* Any verdict this report does not know about. Rendered verbatim and marked,
+     never folded into a default bucket: a vocabulary that grows again must show
+     up as something a reader can see, not as a silent NO_DATA. */
+  td.v-UNRECOGNISED { background: rgba(224, 175, 104, 0.10); color: var(--warn);
+    border: 1px dotted var(--warn); }
 
   .stale-notice { border: 1px solid rgba(247, 118, 142, 0.5);
     background: rgba(247, 118, 142, 0.10); color: var(--fg);
@@ -87,6 +100,18 @@
   .badge.err { background: rgba(247, 118, 142, 0.22); color: var(--err); }
   .badge.warn { background: rgba(224, 175, 104, 0.16); color: var(--warn); }
   .badge.na { color: var(--na); }
+  .badge.inapplicable { background: rgba(86, 95, 114, 0.22); color: var(--fg-dim);
+    border: 1px dashed var(--fg-faint); }
+  .badge.info { background: rgba(122, 162, 247, 0.16); color: var(--accent); }
+  .badge.unrecognised { background: rgba(224, 175, 104, 0.10); color: var(--warn);
+    border: 1px dotted var(--warn); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 0;
+    color: var(--fg-dim); font-size: 11px; }
+  .legend .badge { cursor: default; }
+  .dur { color: var(--fg-dim); font-size: 11px; margin-left: 8px; }
+  .dur b { color: var(--fg); font-weight: 500; }
+  .na-why { color: var(--fg-dim); font-size: 12px; margin-top: 6px;
+    border-left: 2px solid var(--fg-faint); padding-left: 10px; }
 
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px; margin: 12px 0; max-width: 720px; }
@@ -610,24 +635,59 @@ window.addEventListener("hashchange", () => {
 });
 
 // ── Verdict helpers ──────────────────────────────────────────────────────────
-function verdictLabel(v) {
-  return v.replace("INSUFFICIENT_DATA", "INSUF")
-          .replace("DETECTOR_INVALID", "INVALID")
-          .replace("FAULT_INEFFECTIVE", "NO FAULT")
-          .replace("PARSE_ERROR", "ERROR");
+//
+// The vocabulary is a table, and every entry carries its own label, badge class
+// and tooltip. Anything NOT in the table is rendered verbatim as UNRECOGNISED
+// rather than collapsing into a default bucket: this page used to map every
+// unknown verdict to the grey "na" badge, which is how a new verdict can be
+// added to the checker and silently read as "no data" in the report.
+const VERDICTS = {
+  PRESERVED: { label: "PRESERVED", badge: "ok", counted: true,
+    tip: "The invariant was evaluated against every snapshot of this run and held in all of them." },
+  VIOLATED: { label: "VIOLATED", badge: "err", counted: true,
+    tip: "The invariant failed in at least one snapshot. VIOLATED verdicts carry first_violation_ts and duration_s." },
+  INSUFFICIENT_DATA: { label: "INSUF", badge: "warn", counted: false,
+    tip: "The run carries no evidence either way — too few snapshots, or the fields the check reads were never collected. Excluded from the violation rate." },
+  NOT_APPLICABLE: { label: "N/A", badge: "inapplicable", counted: false,
+    tip: "This fault class cannot produce the state the invariant forbids, so the cell is a question that was never asked. Reported separately from PRESERVED, and excluded from the violation rate — counting it as preserved is what inflated the preserved column." },
+  DETECTOR_INVALID: { label: "INVALID", badge: "info", counted: false,
+    tip: "This invariant was already violated in the baseline snapshot, before any fault was injected — the detector is at fault, not the cluster. Excluded from the violation rate." },
+  FAULT_INEFFECTIVE: { label: "NO FAULT", badge: "na", counted: false,
+    tip: "The run's own efficacy assertion failed: the fault produced no observable change, so every verdict in the run describes an undisturbed cluster. The whole run is excluded from the violation rate." },
+  NO_DATA: { label: "NO_DATA", badge: "na", counted: false,
+    tip: "The scenario produced no invariant report — it was skipped, or it died mid-run." },
+  PARSE_ERROR: { label: "ERROR", badge: "na", counted: false,
+    tip: "The invariant report exists but could not be parsed." },
+};
+const VERDICT_ORDER = ["PRESERVED", "VIOLATED", "INSUFFICIENT_DATA", "NOT_APPLICABLE",
+                       "DETECTOR_INVALID", "FAULT_INEFFECTIVE", "NO_DATA", "PARSE_ERROR"];
+
+function verdictInfo(v) {
+  return VERDICTS[v] || { label: v, badge: "unrecognised", counted: false, unknown: true,
+    tip: "Verdict not known to this report template. Shown verbatim rather than folded into NO_DATA — update the VERDICTS table in scripts/report-template.html." };
 }
-function verdictCell(v) {
+function verdictLabel(v) { return verdictInfo(v).label; }
+
+function verdictCell(v, extraTip) {
   v = v || "NO_DATA";
-  const title = v === "DETECTOR_INVALID"
-    ? ' title="This invariant was already violated in the baseline snapshot, before any fault was injected — the detector is at fault, not the cluster."'
-    : "";
-  return `<td class="v-${v}"${title}>${verdictLabel(v)}</td>`;
+  const info = verdictInfo(v);
+  const cls = info.unknown ? "UNRECOGNISED" : v;
+  const tip = extraTip ? `${info.tip}\n\n${extraTip}` : info.tip;
+  return `<td class="v-${cls}" title="${escapeHtml(tip)}">${escapeHtml(info.label)}</td>`;
 }
 function verdictBadge(v) {
   v = v || "NO_DATA";
-  const cls = v === "PRESERVED" ? "ok" : v === "VIOLATED" ? "err"
-            : v === "INSUFFICIENT_DATA" ? "warn" : "na";
-  return `<span class="badge ${cls}">${verdictLabel(v)}</span>`;
+  const info = verdictInfo(v);
+  return `<span class="badge ${info.badge}" title="${escapeHtml(info.tip)}">${escapeHtml(info.label)}</span>`;
+}
+
+// The heatmap legend. Rendered from the same table as the cells, so a verdict
+// can never appear in the grid without appearing here.
+function verdictLegend() {
+  return `<div class="legend">` +
+    VERDICT_ORDER.filter(v => v !== "PARSE_ERROR")
+      .map(v => `${verdictBadge(v)}`).join("") +
+    `<span>Only ${verdictBadge("PRESERVED")} and ${verdictBadge("VIOLATED")} enter the violation rate.</span></div>`;
 }
 
 // ── Pull verdicts from a scenario's latest run ───────────────────────────────
@@ -642,28 +702,51 @@ function latestVerdicts(sc) {
   return out;
 }
 
+// The "why" behind each NOT_APPLICABLE cell, so the heatmap tooltip can say
+// which fault class ruled the invariant out and on what grounds.
+function naReasons(sc) {
+  const data = DATA.scenarios[sc];
+  if (!data) return {};
+  const run = latestRun(sc);
+  const ir = data.runs[run] && data.runs[run].invariant_report;
+  if (!ir || !ir.invariants) return {};
+  const out = {};
+  for (const inv of ir.invariants) {
+    if (inv.verdict === "NOT_APPLICABLE" && inv.not_applicable) {
+      out[inv.invariant] = `${inv.not_applicable.fault_class || "?"}: ${inv.not_applicable.reason || ""}`
+        + (inv.measured_verdict ? `\n(measured verdict, kept for the record: ${inv.measured_verdict})` : "");
+    }
+  }
+  return out;
+}
+
 // ── Overview view ────────────────────────────────────────────────────────────
 function renderOverview() {
   const main = document.getElementById("main");
   const present = Object.keys(DATA.scenarios);
   const all = Object.keys(CATALOG);
 
-  let totalP = 0, totalV = 0, totalI = 0, totalD = 0;
+  // Counted per verdict, from the same table the cells are rendered from, so
+  // a verdict the template does not know about shows up in `tally` under its
+  // own name instead of being absorbed by one of the buckets below.
+  const tally = {};
   for (const sc of present) {
     const v = latestVerdicts(sc);
     if (!v) continue;
-    for (const k of Object.keys(v)) {
-      if (v[k] === "PRESERVED") totalP++;
-      else if (v[k] === "VIOLATED") totalV++;
-      else if (v[k] === "INSUFFICIENT_DATA") totalI++;
-      else if (v[k] === "DETECTOR_INVALID") totalD++;
-    }
+    for (const k of Object.keys(v)) tally[v[k]] = (tally[v[k]] || 0) + 1;
   }
-  // totalD is deliberately outside `total`: a detector disqualified at
-  // baseline measured nothing, and folding it into a violation rate is how
-  // the May 2026 sweep reported a 45% violation rate built largely on
-  // artifacts.
-  const total = totalP + totalV + totalI;
+  const n = (k) => tally[k] || 0;
+  const totalP = n("PRESERVED"), totalV = n("VIOLATED");
+  const totalI = n("INSUFFICIENT_DATA"), totalD = n("DETECTOR_INVALID");
+  const totalNA = n("NOT_APPLICABLE");
+  const unrecognised = Object.keys(tally).filter(k => !VERDICTS[k]);
+  // The denominator, and only the denominator. INSUFFICIENT_DATA measured
+  // nothing; DETECTOR_INVALID measured the detector, not the cluster;
+  // NOT_APPLICABLE is an invariant this fault class cannot break and used to
+  // be reported PRESERVED. Folding any of them in is how the May 2026 sweep
+  // reported a 45% violation rate built largely on artifacts.
+  const counted = totalP + totalV;
+  const rate = counted > 0 ? Math.round(totalV * 100 / counted) : null;
 
   let html = `
     <h2>Overview</h2>
@@ -683,9 +766,24 @@ function renderOverview() {
       <div class="card"><div class="n" style="color:var(--ok)">${totalP}</div><div class="lbl">invariants preserved</div></div>
       <div class="card"><div class="n" style="color:var(--err)">${totalV}</div><div class="lbl">invariants violated</div></div>
       <div class="card"><div class="n" style="color:var(--warn)">${totalI}</div><div class="lbl">insufficient data</div></div>
+      <div class="card"><div class="n" style="color:var(--fg-dim)">${totalNA}</div><div class="lbl">not applicable</div></div>
+      <div class="card"><div class="n" style="color:var(--accent)">${totalD}</div><div class="lbl">detectors invalidated</div></div>
+      <div class="card"><div class="n">${rate === null ? "&mdash;" : rate + "%"}</div><div class="lbl">violation rate &middot; ${totalV}/${counted}</div></div>
     </div>
+    <p class="ref-intro" style="margin-top:14px">
+      The violation rate is <b>${totalV} of ${counted}</b> — cells whose verdict is
+      PRESERVED or VIOLATED. ${totalI} INSUFFICIENT_DATA, ${totalNA} NOT_APPLICABLE and
+      ${totalD} DETECTOR_INVALID cells are excluded and shown above on their own:
+      one measured nothing, one is an invariant this fault class cannot break, and
+      one is a detector that failed its baseline calibration. Runs whose fault did
+      nothing (FAULT_INEFFECTIVE) are excluded whole.
+    </p>
+    ${unrecognised.length ? `<div class="stale-notice"><b>Unrecognised verdicts in the data:</b>
+      ${unrecognised.map(escapeHtml).join(", ")}. They are rendered verbatim in the grid below;
+      add them to the <code>VERDICTS</code> table in <code>scripts/report-template.html</code>.</div>` : ""}
 
     <h3>Invariant heatmap (latest run per scenario)</h3>
+    ${verdictLegend()}
   `;
 
   html += `<table class="heatmap"><thead><tr><th></th>`;
@@ -697,13 +795,14 @@ function renderOverview() {
 
   for (const sc of all) {
     const v = latestVerdicts(sc) || {};
+    const why = naReasons(sc);
     const has = !!DATA.scenarios[sc];
     const labelCell = has
       ? `<td class="scenario"><a href="#/scenario/${sc}">${sc.toUpperCase()}</a> <span style="color:var(--fg-faint);font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`
       : `<td class="scenario" style="color:var(--fg-faint)">${sc.toUpperCase()} <span style="font-weight:400">${escapeHtml(CATALOG[sc].name)}</span></td>`;
     html += `<tr>${labelCell}`;
     for (const inv of INVARIANT_IDS) {
-      html += verdictCell(v[inv]);
+      html += verdictCell(v[inv], why[inv]);
     }
     html += `</tr>`;
   }
@@ -719,6 +818,45 @@ function renderOverview() {
   }
 
   main.innerHTML = html;
+}
+
+// The two fields M4 attaches to every VIOLATED verdict. duration_s is null
+// whenever the 1 Hz trace that a duration needs was not recorded — rendered as
+// "not measured" with the checker's own reason, never as 0, because 0 would
+// assert the violation had no extent.
+function violationTiming(inv) {
+  if (inv.verdict !== "VIOLATED") return "";
+  const bits = [];
+  if (inv.first_violation_ts) {
+    bits.push(`first violation <b>${escapeHtml(String(inv.first_violation_ts))}</b>` +
+      (inv.first_violation_snapshot ? ` (${escapeHtml(String(inv.first_violation_snapshot))})` : ""));
+  } else if (inv.first_violation_ts_note) {
+    bits.push(`first violation <b>&mdash;</b>`);
+  }
+  const d = inv.duration || {};
+  if (inv.duration_s !== undefined && inv.duration_s !== null) {
+    bits.push(`duration <b>${inv.duration_s}s</b>` +
+      (d.is_lower_bound ? " (lower bound)" : "") +
+      (d.censored ? " (censored)" : ""));
+  } else if (inv.duration_s === null) {
+    bits.push(`duration <b>not measured</b>`);
+  }
+  if (!bits.length) return "";
+  const tip = [inv.first_violation_ts_note, d.reason, d.source && `source: ${d.source}`,
+               d.covers && `covers: ${d.covers}`, d.not_covered && `not covered: ${d.not_covered}`]
+              .filter(Boolean).join("\n");
+  return `<span class="dur" title="${escapeHtml(tip)}">${bits.join(" &middot; ")}</span>`;
+}
+
+// A NOT_APPLICABLE verdict must say why, and must keep the verdict it would
+// have had — otherwise "not applicable" is indistinguishable from a shrug.
+function notApplicableWhy(inv) {
+  if (inv.verdict !== "NOT_APPLICABLE" || !inv.not_applicable) return "";
+  const na = inv.not_applicable;
+  return `<div class="na-why">Not applicable to <code>${escapeHtml(na.fault_class || "?")}</code>: ` +
+    `${escapeHtml(na.reason || "")}` +
+    (inv.measured_verdict ? ` <span style="color:var(--fg-faint)">(measured verdict, kept for the record: ${escapeHtml(inv.measured_verdict)})</span>` : "") +
+    `</div>`;
 }
 
 // ── Scenario view ────────────────────────────────────────────────────────────
@@ -776,12 +914,29 @@ function renderScenario() {
     html += `<p class="empty">Invariant report failed to parse: ${escapeHtml(ir._parse_error)}</p>`;
   } else {
     if (ir.summary) {
+      // Every bucket the checker emits, each shown on its own. `evaluable` is
+      // the only population a rate may be computed over.
+      const su = ir.summary;
+      const evaluable = su.evaluable !== undefined
+        ? su.evaluable : (su.preserved || 0) + (su.violated || 0);
       html += `<div class="badges">
-        <span class="badge ok">${ir.summary.preserved || 0} preserved</span>
-        <span class="badge err">${ir.summary.violated || 0} violated</span>
-        <span class="badge warn">${ir.summary.insufficient_data || 0} insufficient</span>
+        <span class="badge ok">${su.preserved || 0} preserved</span>
+        <span class="badge err">${su.violated || 0} violated</span>
+        <span class="badge warn">${su.insufficient_data || 0} insufficient</span>
+        <span class="badge inapplicable" title="Invariants this fault class cannot break. Excluded from the rate; not counted as preserved.">${su.not_applicable || 0} not applicable</span>
+        <span class="badge info" title="Invariants already violated in the baseline snapshot — disqualified detectors, not findings.">${su.detector_invalid || 0} detector invalid</span>
+        <span class="badge">evaluable: ${evaluable}</span>
         <span class="badge">snapshots: ${ir.snapshots_evaluated || 0}</span>
       </div>`;
+      if (ir.fault_class) {
+        html += `<div class="kv"><div class="k">Fault class</div><div class="v">
+          <code>${escapeHtml(ir.fault_class)}</code>
+          <span style="color:var(--fg-faint)">(${escapeHtml(ir.fault_class_source || "unknown source")})</span>
+        </div></div>`;
+      }
+      if (ir.run_validity && ir.run_validity !== "OK") {
+        html += `<div class="badges"><span class="badge na" title="The run's own efficacy assertion failed — the fault produced no observable change, so these verdicts describe an undisturbed cluster.">run validity: ${escapeHtml(ir.run_validity)}</span></div>`;
+      }
     }
     if (ir.divergence_timing) {
       const t = ir.divergence_timing;
@@ -798,11 +953,19 @@ function renderScenario() {
           <div class="name">${escapeHtml(def ? def.name.toLowerCase() : (inv.name || ""))}</div>
           <div class="grow"></div>
           ${verdictBadge(inv.verdict)}
+          ${violationTiming(inv)}
         </div>
-        ${def ? `<div class="desc">${escapeHtml(def.description)}</div>` : ""}`;
+        ${def ? `<div class="desc">${escapeHtml(def.description)}</div>` : ""}
+        ${notApplicableWhy(inv)}`;
       if ((inv.violations && inv.violations.length) || inv.note) {
         html += `<pre>${escapeHtml(JSON.stringify({
           violation_count: inv.violation_count,
+          first_violation_snapshot: inv.first_violation_snapshot,
+          first_violation_ts: inv.first_violation_ts,
+          duration_s: inv.duration_s,
+          duration: inv.duration,
+          measured_verdict: inv.measured_verdict,
+          not_applicable: inv.not_applicable,
           violations: inv.violations,
           note: inv.note,
           distinct_holders: inv.distinct_holders,
@@ -918,7 +1081,9 @@ function renderReference() {
     </div>
 
     <h3 id="invariants">Invariants (paper §4)</h3>
-    <p class="ref-intro">The five invariants below are evaluated against each snapshot of a scenario run. A scenario's verdict is the conjunction across all its snapshots: <span class="badge ok">PRESERVED</span> if the invariant held in every snapshot, <span class="badge err">VIOLATED</span> if it failed in at least one, and <span class="badge warn">INSUFFICIENT_DATA</span> if there were too few snapshots to evaluate (only relevant for I4 outside S6).</p>
+    <p class="ref-intro">The five invariants below are evaluated against each snapshot of a scenario run. A scenario's verdict is the conjunction across all its snapshots: <span class="badge ok">PRESERVED</span> if the invariant held in every snapshot, <span class="badge err">VIOLATED</span> if it failed in at least one.</p>
+    <p class="ref-intro">Four further verdicts exist so that "held" is not asked to carry work it cannot do. <span class="badge warn">INSUFFICIENT_DATA</span> — the run carries no evidence either way (too few snapshots, or the fields the check reads were never collected). <span class="badge inapplicable">N/A</span> — this fault class cannot produce the state the invariant forbids, so the cell is a question that was never asked; these used to be reported PRESERVED, which inflated the preserved column. <span class="badge info">INVALID</span> — the invariant was already violated in the baseline snapshot, so the detector failed its calibration and the verdict describes the detector, not the cluster. <span class="badge na">NO FAULT</span> — the run's own efficacy assertion failed, so every verdict in it describes an undisturbed cluster. Only PRESERVED and VIOLATED enter the violation rate; the other four are counted and published separately.</p>
+    <p class="ref-intro">Every VIOLATED verdict carries <code>first_violation_ts</code> (the timestamp of the first snapshot the violation was observed in) and <code>duration_s</code>. <code>duration_s</code> is measured on the 1 Hz observer trace, on its monotonic <code>t_rel_ms</code> axis, with the same censoring rules the observer-disagreement analysis uses: an episode still open when a truncated trace ends is excluded and reported as censored, one still open at the end of a complete trace is counted as a lower bound. Where no trace was recorded — every run archived before the trace existed — <code>duration_s</code> is <code>null</code> with a reason, never <code>0</code>.</p>
   `;
   for (const [iid, inv] of Object.entries(INVARIANTS)) {
     const isExtension = inv.origin === "extension";

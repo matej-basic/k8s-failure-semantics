@@ -27,7 +27,8 @@ collect_verdicts() {
       # the same thing (S5 and S6 sat in the May 2026 heatmap as NO_DATA rows
       # beside real verdicts, and I4 went unevaluated suite-wide as a result).
       row=$(jq -n --arg sc "$sc" \
-        '{scenario: $sc, run_validity: "NOT_RUN", fault_efficacy: null,
+        '{scenario: $sc, run_validity: "NOT_RUN", fault_class: null, fault_efficacy: null,
+          not_applicable: {},
           I1: "NO_DATA", I2: "NO_DATA", I3: "NO_DATA", I4: "NO_DATA", I5: "NO_DATA", I6: "NO_DATA", I9: "NO_DATA", I10: "NO_DATA"}')
     else
       # Build the row by indexing each invariant we know about. Using //
@@ -39,6 +40,15 @@ collect_verdicts() {
         {
           scenario: $sc,
           run_validity: (.run_validity // "UNKNOWN"),
+          fault_class: (.fault_class // null),
+          fault_class_source: (.fault_class_source // null),
+          # Why each NOT_APPLICABLE cell is not applicable, keyed by invariant,
+          # so the heatmap can say "this fault cannot break this invariant"
+          # instead of leaving a blank the reader fills in with "preserved".
+          not_applicable:
+            ($inv | map(select(.verdict == "NOT_APPLICABLE")
+                        | {(.invariant): (.not_applicable.reason // "not applicable to this fault class")})
+                  | add // {}),
           fault_efficacy: (if .fault_efficacy
                            then {verdict: .fault_efficacy.verdict,
                                  fired: (.fault_efficacy.fired // []),
@@ -55,7 +65,7 @@ collect_verdicts() {
         }
       ' "$report" 2>/dev/null || \
       jq -n --arg sc "$sc" \
-        '{scenario: $sc, run_validity: "PARSE_ERROR", fault_efficacy: null, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
+        '{scenario: $sc, run_validity: "PARSE_ERROR", fault_class: null, fault_efficacy: null, not_applicable: {}, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
     fi
 
     out=$(echo "$out" | jq --argjson row "$row" '. + [$row]')
@@ -177,18 +187,47 @@ TERMINATION=$(collect_termination_timing)
 
 # Overall statistics.
 #
-# Counted over runs whose fault actually did something: a run labelled
-# FAULT_INEFFECTIVE measured an undisturbed cluster, so its verdicts describe
-# nothing and must not enter the rate. DETECTOR_INVALID verdicts are counted
-# separately for the same reason — they are disqualified detectors, not
-# findings, and folding them into the denominator is how the May 2026 sweep
-# arrived at a 45% violation rate built largely on artifacts.
+# REVIEW.md M4: "The current summary.violation_rate_pct: 45 mixes real
+# findings, artifacts and inapplicable checks into one number." The fix is a
+# single, stated denominator, and everything it excludes counted and published
+# beside it rather than quietly dropped:
+#
+#   DENOMINATOR = cells whose verdict is PRESERVED or VIOLATED, taken from runs
+#                 whose fault demonstrably did something.
+#
+#   excluded, and why
+#     FAULT_INEFFECTIVE   the run measured an undisturbed cluster, so every one
+#                         of its verdicts describes nothing. Excluded whole-run.
+#     NOT_RUN             the scenario produced no report at all.
+#     DETECTOR_INVALID    the invariant was already violated at baseline; that
+#                         is a disqualified detector, not a finding.
+#     NOT_APPLICABLE      this fault cannot produce the state the invariant
+#                         forbids, so the cell is a question never asked.
+#                         Counting it as PRESERVED is what inflated the
+#                         preserved column and deflated the rate.
+#     INSUFFICIENT_DATA   the run carries no evidence either way.
+#
+# Each exclusion is reported as its own count, so the rate can be recomputed by
+# hand from the published numbers.
 VALID_VERDICTS=$(echo "$VERDICTS" | jq '[.[] | select((.run_validity // "UNKNOWN") != "FAULT_INEFFECTIVE" and (.run_validity // "UNKNOWN") != "NOT_RUN")]')
-TOTAL_PRESERVED=$(echo "$VALID_VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "PRESERVED")] | length')
-TOTAL_VIOLATED=$(echo "$VALID_VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "VIOLATED")] | length')
-TOTAL_INVALID=$(echo "$VERDICTS" | jq '[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10 | select(. == "DETECTOR_INVALID")] | length')
+CELLS='[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10]'
+
+TOTAL_PRESERVED=$(echo "$VALID_VERDICTS" | jq "$CELLS"' | map(select(. == "PRESERVED")) | length')
+TOTAL_VIOLATED=$(echo "$VALID_VERDICTS"  | jq "$CELLS"' | map(select(. == "VIOLATED")) | length')
+TOTAL_INSUFFICIENT=$(echo "$VALID_VERDICTS" | jq "$CELLS"' | map(select(. == "INSUFFICIENT_DATA")) | length')
+# The three exclusions are counted over EVERY row, not just the valid ones, so
+# the published numbers add up to the full grid.
+TOTAL_INVALID=$(echo "$VERDICTS" | jq "$CELLS"' | map(select(. == "DETECTOR_INVALID")) | length')
+TOTAL_NA=$(echo "$VERDICTS"      | jq "$CELLS"' | map(select(. == "NOT_APPLICABLE")) | length')
+CELLS_TOTAL=$(echo "$VERDICTS"   | jq "$CELLS"' | length')
+CELLS_INEFFECTIVE_RUNS=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length * 8')
 RUNS_INEFFECTIVE=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length')
 RUNS_NOT_RUN=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "NOT_RUN")] | length')
+# Which invariant x fault-class cells were ruled out, so a reader can audit the
+# applicability table from the aggregate alone.
+NA_BREAKDOWN=$(echo "$VERDICTS" | jq -c '
+  [ .[] | . as $r | (.not_applicable // {}) | to_entries[]
+    | {scenario: $r.scenario, fault_class: $r.fault_class, invariant: .key, reason: .value} ]')
 
 jq -n \
   --argjson verdicts "$VERDICTS" \
@@ -198,7 +237,12 @@ jq -n \
   --argjson termination "$TERMINATION" \
   --argjson preserved "$TOTAL_PRESERVED" \
   --argjson violated "$TOTAL_VIOLATED" \
+  --argjson insufficient "$TOTAL_INSUFFICIENT" \
   --argjson invalid "$TOTAL_INVALID" \
+  --argjson notapplicable "$TOTAL_NA" \
+  --argjson na_breakdown "$NA_BREAKDOWN" \
+  --argjson cells_total "$CELLS_TOTAL" \
+  --argjson cells_ineffective "$CELLS_INEFFECTIVE_RUNS" \
   --argjson ineffective "$RUNS_INEFFECTIVE" \
   --argjson notrun "$RUNS_NOT_RUN" \
   '{
@@ -208,12 +252,32 @@ jq -n \
       total_preserved: $preserved,
       total_violated: $violated,
       detectors_invalidated: $invalid,
+      not_applicable: $notapplicable,
+      insufficient_data: $insufficient,
       runs_fault_ineffective: $ineffective,
       scenarios_not_run: $notrun,
       violation_rate_pct: (if ($preserved + $violated) > 0
         then ($violated * 100 / ($preserved + $violated) | round)
         else 0 end),
-      counting_note: "Rates cover runs whose fault produced an observable change. DETECTOR_INVALID verdicts (invariants already violated at baseline) and FAULT_INEFFECTIVE runs are reported separately and excluded from the denominator."
+      # The denominator, spelled out. cells_total is the full grid
+      # (scenarios x invariants); every exclusion below is subtracted from it
+      # and what remains is what the rate is computed over, so the number can
+      # be re-derived by hand and cannot quietly change meaning again.
+      denominator: {
+        definition: "invariant cells whose verdict is PRESERVED or VIOLATED, from runs whose fault produced an observable change",
+        cells_total: $cells_total,
+        counted: ($preserved + $violated),
+        excluded: {
+          insufficient_data: $insufficient,
+          detector_invalid: $invalid,
+          not_applicable: $notapplicable,
+          cells_in_fault_ineffective_runs: $cells_ineffective,
+          cells_in_scenarios_not_run: ($notrun * 8)
+        },
+        excludes_note: "INSUFFICIENT_DATA measured nothing. DETECTOR_INVALID measured the detector (the invariant was already violated at baseline). NOT_APPLICABLE is an invariant this fault class cannot break, previously reported PRESERVED, which inflated the preserved column. FAULT_INEFFECTIVE runs measured an undisturbed cluster and are excluded whole."
+      },
+      not_applicable_breakdown: $na_breakdown,
+      counting_note: "One rate, one population. Rates cover runs whose fault produced an observable change, over cells that were actually evaluable. DETECTOR_INVALID, NOT_APPLICABLE, INSUFFICIENT_DATA and FAULT_INEFFECTIVE runs are each counted separately above and none of them enters the denominator."
     },
     invariant_heatmap: $verdicts,
     divergence_timing: $timing,

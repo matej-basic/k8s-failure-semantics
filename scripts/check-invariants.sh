@@ -66,6 +66,201 @@ snap_field() {
   jq -r "$query" "$file" 2>/dev/null || echo "null"
 }
 
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# ── Fault class ────────────────────────────────────────────────────────────────
+# Which fault this run injected. Primary source is the scenario's own
+# scenario_meta.json (.fault_type), written by roles/fault-inject and by the
+# nine gray-failure scenarios directly.
+#
+# S27 writes fault_type "clock_skew" plus a variant, while the efficacy
+# defaults table names the negative variant "clock_skew_negative"; the two are
+# reconciled here so the applicability table can be keyed on one vocabulary.
+#
+# FALLBACK_FAULT_CLASS covers runs recorded before scenario_meta.json existed —
+# which is every run in results/. The mapping is scenario_id -> fault class and
+# is taken from the fault each playbook actually injects, so an archived run is
+# judged by the same table as a fresh one. The report always says which source
+# was used; a run whose class cannot be resolved gets "unknown", and "unknown"
+# has no rows in the applicability table, so nothing is ever marked
+# NOT_APPLICABLE on a guess.
+FALLBACK_FAULT_CLASS='
+s1|network_partition
+s2|network_asymmetric
+s3|etcd_latency
+s4|clock_skew
+s5|network_partition
+s6|network_asymmetric
+s8|composed_latency_partition
+s11|kubelet_api_partition
+s12|network_flap
+s14|api_watch_lag
+s15|pod_delete
+s17|etcd_compact
+s18|memory_pressure
+s19|etcd_quorum_split
+s20|pod_network_partition
+s21|vrrp_vip_split
+s22|process_freeze
+s23|etcd_nospace
+s24|admission_webhook_timeout
+s25|apf_priority_starvation
+s26|node_object_deleted
+s27|clock_skew_negative
+s28|etcd_stale_member
+'
+
+FAULT_CLASS="unknown"
+FAULT_CLASS_SOURCE="unresolved"
+
+resolve_fault_class() {
+  local meta="$RESULTS_DIR/scenario_meta.json"
+  local ft variant sid
+
+  if [ -f "$meta" ]; then
+    ft=$(jq -r '.fault_type // empty' "$meta" 2>/dev/null || echo "")
+    variant=$(jq -r '.variant // empty' "$meta" 2>/dev/null || echo "")
+    if [ -n "$ft" ]; then
+      if [ "$ft" = "clock_skew" ] && [ "$variant" = "negative" ]; then
+        ft="clock_skew_negative"
+      fi
+      FAULT_CLASS="$ft"
+      FAULT_CLASS_SOURCE="scenario_meta.json"
+      return
+    fi
+  fi
+
+  sid=$(snap_field "$(snapshots | sed -n 1p)" '.scenario_id // empty')
+  # S6 writes sub-run ids ("s6_run3"), and any repeat harness that does the
+  # same convention would too. The fault class is identical across iterations
+  # of one scenario, so strip a trailing _run<N> before looking the row up.
+  sid=$(printf '%s' "$sid" | sed 's/_run[0-9][0-9]*$//')
+  if [ -n "$sid" ] && [ "$sid" != "null" ]; then
+    ft=$(printf '%s\n' "$FALLBACK_FAULT_CLASS" | awk -F'|' -v s="$sid" '$1 == s { print $2; exit }')
+    if [ -n "$ft" ]; then
+      FAULT_CLASS="$ft"
+      FAULT_CLASS_SOURCE="scenario_id_fallback"
+      return
+    fi
+  fi
+}
+
+# ── NOT_APPLICABLE: invariant x fault class ────────────────────────────────────
+# REVIEW.md M4. Some invariants cannot be broken by some faults — not because
+# the cluster held them, but because the fault's mechanism never reaches the
+# subsystem the invariant observes. Reporting those cells PRESERVED counts a
+# question that was never asked as a question that was answered, and that is
+# what inflates the preserved column and, through it, the violation rate's
+# denominator.
+#
+# The admission rule, applied to every row below and to nothing else:
+#
+#   An invariant is NOT_APPLICABLE to a fault class when the fault cannot, even
+#   in principle, produce the state the invariant forbids, because the
+#   subsystem the invariant reads is outside the fault's blast radius.
+#
+# It is deliberately narrower than "we did not expect this one to fire". An
+# invariant that could have fired and did not is a genuine PRESERVED and stays
+# one. Where a fault's reach depends on a variant or a target the meta file
+# does not pin down, the cell is left applicable — a missing NOT_APPLICABLE
+# costs one over-counted PRESERVED, a wrong one silently discards a finding.
+#
+# Format: fault_class|invariant|reason
+NOT_APPLICABLE_MAP='
+kubelet_api_partition|I6|blocks the worker kubelet from the API servers; the observer reads etcd revisions directly from the etcd members over an untouched network, so no read of an older state is reachable
+kubelet_api_partition|I9|etcd membership, peer traffic and client certificates are untouched — only a worker-to-apiserver path is dropped
+memory_pressure|I6|memory is consumed on a worker node; the etcd members and the observer path to them are untouched
+memory_pressure|I9|the fault never reaches an etcd member, so members cannot drop below quorum or split their leader view
+pod_delete|I3|deleting one application pod cannot change any Node Ready condition or NoExecute taint, so the control plane never withdraws vouching for a node
+pod_delete|I6|a single object delete advances the revision; it cannot make the observer read an older one
+pod_delete|I9|etcd membership is untouched by an application-object delete
+api_watch_lag|I6|a delay on the controller node watch stream does not touch the observer etcd read path
+api_watch_lag|I9|etcd membership is untouched; only one client watch stream is delayed
+pod_network_partition|I3|the management network is deliberately left intact so the kubelet keeps heartbeating; the node stays Ready by construction and the control plane never withdraws vouching
+pod_network_partition|I6|only the pod CIDR is dropped; etcd traffic runs on the untouched management network
+pod_network_partition|I9|etcd peers and clients are on the management network the fault leaves alone
+vrrp_vip_split|I6|VRRP advertisements are blocked between keepalived peers; etcd peer and client traffic is untouched
+vrrp_vip_split|I9|blocking the VRRP protocol cannot change etcd membership, leadership or raft term
+process_freeze|I6|SIGSTOP is delivered to containerd or the kubelet on a worker; no etcd member is touched
+process_freeze|I9|the frozen unit is on a worker, so etcd membership and quorum cannot be affected
+admission_webhook_timeout|I6|packets to a webhook endpoint are dropped inside the API server admission path; the observer etcd read path is untouched
+admission_webhook_timeout|I9|admission never reaches etcd membership; the members answer endpoint status directly
+apf_priority_starvation|I6|APF shapes queues inside the API server; the etcd revision is read with etcdctl straight from the members, bypassing the API server entirely
+apf_priority_starvation|I9|the flood cannot starve etcdctl endpoint status, which never traverses the API server
+node_object_deleted|I6|deleting a Node object is an ordinary write that advances the revision; it cannot lower it
+node_object_deleted|I9|an API delete cannot change etcd membership or leadership
+clock_skew|I6|etcd revisions are a logical counter; moving a wall clock cannot make a revision decrease
+clock_skew_negative|I6|etcd revisions are a logical counter; moving a wall clock backwards cannot make a revision decrease
+etcd_nospace|I1|every write is rejected cluster-wide while the NOSPACE alarm is armed, so no controller can create a second copy of an existing pod identity
+'
+
+na_reason() {  # $1 = invariant id -> prints the reason, or nothing
+  printf '%s\n' "$NOT_APPLICABLE_MAP" \
+    | awk -F'|' -v fc="$FAULT_CLASS" -v inv="$1" '$1 == fc && $2 == inv { print $3; exit }'
+}
+
+# Rewrite a verdict to NOT_APPLICABLE when the table says the invariant cannot
+# be broken by this fault class. Applied AFTER the calibration gate, so a
+# detector that was also disqualified at baseline keeps that record in
+# measured_verdict and in the calibration block — no evidence is discarded,
+# the cell is only removed from the counted population.
+apply_na() {  # $1 = invariant id, $2 = invariant JSON
+  local inv="$1" full="$2" reason
+  reason=$(na_reason "$inv")
+  if [ -z "$reason" ]; then
+    printf '%s' "$full"
+    return
+  fi
+  printf '%s' "$full" | jq -c --arg fc "$FAULT_CLASS" --arg src "$FAULT_CLASS_SOURCE" --arg why "$reason" '
+    . + { verdict: "NOT_APPLICABLE",
+          measured_verdict: .verdict,
+          not_applicable: {
+            fault_class: $fc,
+            fault_class_source: $src,
+            reason: $why,
+            note: "The invariant was evaluated and its measured verdict is kept, but this fault cannot produce the state the invariant forbids, so the cell is excluded from the preserved/violated population instead of being counted as evidence of preservation."
+          } }'
+}
+
+# Attach the two fields M4 asks for to every VIOLATED verdict.
+#
+#   first_violation_ts / first_violation_snapshot come from the FIRST element of
+#   .violations, which every check appends in chronological snapshot order (the
+#   ordering fix at the top of this file is what makes "first" mean first).
+#   Checks whose violation has no single snapshot locus say so rather than
+#   inventing one.
+#
+#   duration_s comes from scripts/violation-duration.sh, which reads the M1 1 Hz
+#   trace and reuses M2's censoring rules. It is null with a reason whenever the
+#   trace is absent — never 0. See that file for the per-invariant sources.
+annotate_violated() {  # $1 = invariant id, $2 = invariant JSON
+  local inv="$1" full="$2" verdict duration
+  verdict=$(printf '%s' "$full" | jq -r '.verdict // ""' 2>/dev/null || echo "")
+  [ "$verdict" = "VIOLATED" ] || { printf '%s' "$full"; return; }
+
+  duration=$(bash "$SELF_DIR/violation-duration.sh" "$RESULTS_DIR" "$inv" 2>/dev/null)
+  [ -n "$duration" ] || duration='{"duration_s": null, "source": "none", "reason": "violation-duration.sh produced no output"}'
+
+  printf '%s' "$full" | jq -c --argjson dur "$duration" '
+    ( [ (.violations // [])[] | select((.ts // null) != null) ] | first ) as $first
+    | . + { first_violation_snapshot: ($first.snapshot // null),
+            first_violation_ts: ($first.ts // null),
+            first_violation_ts_note:
+              (if $first == null
+               then "no snapshot locus: this check does not attribute its violation to a single snapshot"
+               else null end),
+            duration_s: ($dur.duration_s // null),
+            duration: $dur }'
+}
+
+# Order matters: annotate first, then re-label. A cell the table calls
+# NOT_APPLICABLE whose measured verdict is VIOLATED keeps its first_violation_ts
+# and its duration inside measured_verdict/violations, which is exactly the
+# evidence that would prove the table row wrong.
+finalize() {  # $1 = invariant id, $2 = invariant JSON
+  apply_na "$1" "$(annotate_violated "$1" "$2")"
+}
+
 # ── I1: Exclusive authority ────────────────────────────────────────────────────
 # Violation: the same pod identity (namespace/podName) has a CONTAINER_RUNNING
 # container on more than one node at the same instant.
@@ -631,7 +826,12 @@ check_i10() {
   elif [ "$new_count" = "0" ]; then
     echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"PRESERVED\", \"post_fault_snapshots\": ${#post_snaps[@]}, \"first\": \"$first_label\", \"last\": \"$last_label\", \"new_warning_pairs\": 0}"
   else
-    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"VIOLATED\", \"post_fault_snapshots\": ${#post_snaps[@]}, \"first\": \"$first_label\", \"last\": \"$last_label\", \"new_warning_pairs\": $new_count, \"examples\": $(echo "$new_pairs" | jq '.[0:5]')}"
+    # The violations array carries the one snapshot this check can attribute
+    # its finding to — the last post-fault snapshot, where the new warning
+    # pairs were observed. It exists so the M4 first_violation_ts annotation
+    # and divergence_timing have a locus to read; before this, an I10 violation
+    # was invisible to both.
+    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"VIOLATED\", \"post_fault_snapshots\": ${#post_snaps[@]}, \"first\": \"$first_label\", \"last\": \"$last_label\", \"new_warning_pairs\": $new_count, \"examples\": $(echo "$new_pairs" | jq '.[0:5]'), \"violations\": [{\"snapshot\": \"$last_label\", \"ts\": \"$last_ts\", \"new_warning_pairs\": $new_count, \"observed_between\": \"$first_label\"}]}"
   fi
 }
 
@@ -720,6 +920,108 @@ divergence_timing() {
 # invariant verdicts — it labels the run so the aggregate can exclude it
 # instead of quietly counting it.
 
+# ── Scenario-supplied efficacy evidence ───────────────────────────────────────
+# Five of the nine gray-failure scenarios cannot certify their own efficacy from
+# snapshot_*.json, and that is not an oversight: leaving the snapshot schema
+# unchanged is what makes a fault gray. Their proof lives in a file the scenario
+# writes into its own results directory, so the signals below are computed from
+# those files instead of from the snapshots.
+#
+# Every row names a real file and a real field. Nothing here is inferred from a
+# field that does not exist: naming an unknown signal in `require` forces
+# FAULT_INEFFECTIVE on every run (the jq does `($sig[.]) // false`), which is
+# the D2 defect this suite already paid for once, and a signal that reads a
+# field nobody writes would be the same defect with more steps.
+#
+# Format: signal::evidence glob[,baseline file]::jq predicate::what it means
+#
+# The field separator is `::`, not `|`, because jq predicates are full of
+# pipes and a `|`-delimited table silently truncates every predicate at its
+# first one — which reads exactly like a signal that never fires.
+#
+# The predicate is evaluated per matched file with `jq -e`; several matches are
+# ORed, so a glob means "any of these files shows it". A row with a baseline
+# file gets it as $base (null when absent), which is how the contrast signals
+# refuse to fire on a cluster that already looked like that before the fault.
+EVIDENCE_SIGNALS='
+target_process_frozen::s22_process_identity.json::((.frozen_check // "") | test("proc_state=[Tt]"))::the SIGSTOPped unit main PID was observed in kernel state T/t on the target
+cluster_writes_rejected::rw_contrast_nospace_*.json,rw_contrast_pre_fault.json::(((. | map(select(.write.ok == false)) | length) > 0) and (($base | type) == "array") and ((($base | map(select(.write.ok == false))) | length) == 0))::at least one API server rejected a write while the alarm was armed, and none did at baseline
+admission_rejected::admission_comparison.json::((.contrast.configmap_created.fail == false) or (.contrast.pod_created.fail == false))::the intercepted CREATE was rejected under failurePolicy=Fail
+apf_starvation_observed::apf_evidence.json::((([ .per_worker_tallies[]?[]?.http_429 ] | add) // 0) > 0)::the flooded low-priority client accrued 429s, so APF actively shed load
+vip_holders_multiple::vip_split_summary.json::((.split_observed == true) or ((.max_simultaneous_vip_holders // 0) > 1))::two control-plane nodes held the API VIP at the same instant
+target_node_dataplane_lost::dataplane_during_fault.json,dataplane_pre_fault.json::((([ .per_pod_reachability[]? | select(.httpCode != 200) ] | length) > 0) and (($base | type) == "object") and (([ $base.per_pod_reachability[]? ] | length) > 0) and (([ $base.per_pod_reachability[]? | select(.httpCode != 200) ] | length) == 0))::pods on the target node answered at baseline and stopped answering during the fault
+clock_offset_applied::clock_skew_efficacy.json::(([ .targets[]? | select(.held == true) ] | length) > 0)::the requested offset was still measured on a target mid-window
+node_identity_recreated::node_identity_transition.json::(.uid_changed == true)::the Node object came back under the same name with a different uid
+'
+
+# Evaluate every row against this run's results directory. A signal whose
+# evidence file is not there is FALSE with reason "evidence_absent" — never
+# silently false: the reason travels with the value into the report, and into
+# missing_required_detail when a scenario required it.
+evidence_signals() {
+  local out='{}'
+  local line signal spec pred meaning glob basefile basearg matched value reason files f rc
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    signal=$(printf '%s' "$line"  | awk -F'::' '{ print $1 }')
+    spec=$(printf '%s' "$line"    | awk -F'::' '{ print $2 }')
+    pred=$(printf '%s' "$line"    | awk -F'::' '{ print $3 }')
+    meaning=$(printf '%s' "$line" | awk -F'::' '{ print $4 }')
+    [ -n "$signal" ] || continue
+
+    glob=$(printf '%s' "$spec"     | awk -F, '{ print $1 }')
+    basefile=$(printf '%s' "$spec" | awk -F, '{ print $2 }')
+
+    basearg='null'
+    if [ -n "$basefile" ] && [ -f "$RESULTS_DIR/$basefile" ]; then
+      basearg=$(jq -c . "$RESULTS_DIR/$basefile" 2>/dev/null || echo 'null')
+    fi
+
+    files=""
+    for f in "$RESULTS_DIR"/$glob; do
+      [ -f "$f" ] || continue
+      files="$files $f"
+    done
+
+    if [ -z "$files" ]; then
+      value=false
+      reason="evidence_absent: no file matching $glob in this results dir"
+      matched='[]'
+    else
+      value=false
+      reason="predicate false in every matched evidence file"
+      matched=$(for f in $files; do basename "$f"; done | jq -R . | jq -cs .)
+      for f in $files; do
+        rc=0
+        jq -e --argjson base "$basearg" "$pred" "$f" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          value=true
+          reason="predicate true in $(basename "$f")"
+          break
+        fi
+      done
+    fi
+
+    # `|| true` plus the emptiness guard: under `set -e` a jq that chokes on one
+    # row would abort the whole checker, and losing every verdict because one
+    # evidence table row is malformed is not an acceptable failure mode.
+    out=$(printf '%s' "$out" | jq -c \
+      --arg sig "$signal" --arg glob "$glob" --arg base "$basefile" \
+      --arg pred "$pred" --arg meaning "$meaning" --arg reason "$reason" \
+      --argjson matched "$matched" --argjson value "$value" \
+      '. + { ($sig): { value: $value, evidence_glob: $glob,
+                       baseline_file: (if $base == "" then null else $base end),
+                       matched_files: $matched, predicate: $pred,
+                       means: $meaning, reason: $reason } }' 2>/dev/null || true)
+    [ -n "$out" ] || out='{}'
+  done <<EOF
+$(printf '%s\n' "$EVIDENCE_SIGNALS")
+EOF
+
+  printf '%s' "$out"
+}
+
 fault_efficacy() {
   local files
   files=$(snapshots)
@@ -734,13 +1036,23 @@ fault_efficacy() {
 
   local required='[]'
   local target='""'
+  local proposed='[]'
   if [ -f "$RESULTS_DIR/scenario_meta.json" ]; then
     required=$(jq -c '[.efficacy.require[]?]' "$RESULTS_DIR/scenario_meta.json" 2>/dev/null || echo '[]')
     target=$(jq -c '.efficacy.target_node // ""' "$RESULTS_DIR/scenario_meta.json" 2>/dev/null || echo '""')
+    # Both spellings seen in the tree: S23 nests it under .efficacy, S25 names
+    # the same idea .new_signal.name at the top level.
+    proposed=$(jq -c '[ (.efficacy.require_proposed[]?), (.new_signal.name? | select(. != null)) ] | unique' \
+                 "$RESULTS_DIR/scenario_meta.json" 2>/dev/null || echo '[]')
   fi
 
+  local evidence
+  evidence=$(evidence_signals)
+  [ -n "$evidence" ] || evidence='{}'
+
   # shellcheck disable=SC2086
-  jq -s --argjson required "$required" --argjson target "$target" '
+  jq -s --argjson required "$required" --argjson target "$target" \
+        --argjson evidence "$evidence" --argjson proposed "$proposed" '
     def ready_map:
       [ (.control_plane.node_conditions // [])[]
         | { key: .name,
@@ -791,22 +1103,92 @@ fault_efficacy() {
            else (([ $rest[]
                     | select((. | ready_map)[$target] != ($base | ready_map)[$target]) ]
                   | length) > 0)
-           end)
+           end),
+
+        # ── Signals added for the gray-failure scenarios ──────────────────
+        #
+        # etcd_alarm_armed needs no new collection at all: `etcdctl endpoint
+        # status` already returns .Status.errors per member, and an armed
+        # NOSPACE alarm appears there as the string "alarm:NOSPACE". Required
+        # to be absent at baseline, so a cluster that arrived already alarmed
+        # cannot certify a run that did not arm anything.
+        etcd_alarm_armed:
+          ((([ $base | .etcd.member_status[]?.Status.errors[]?
+               | select(type == "string") | select(test("alarm:NOSPACE"; "i")) ] | length) == 0)
+           and (([ $rest[] | .etcd.member_status[]?.Status.errors[]?
+                   | select(type == "string") | select(test("alarm:NOSPACE"; "i")) ] | length) > 0)),
+
+        # Same node name, different object. The snapshot path below is the one
+        # that would work if node_conditions[] ever carried .uid; it does NOT
+        # today (metrics-collect projects name/conditions/taints/unschedulable,
+        # and M2 added observers, not node uids), so on current data it is
+        # always false and the signal is decided by S26 own
+        # node_identity_transition.json, merged in below. Written this way so
+        # the signal starts using the snapshot the moment the field appears,
+        # without a second edit here.
+        node_identity_recreated:
+          (([ $base.control_plane.node_conditions[]? | select(.uid != null) ]) as $b
+           | if ($b | length) == 0 then false
+             else (([ $rest[] | .control_plane.node_conditions[]? | select(.uid != null)
+                      | . as $n | $b[] | select(.name == $n.name and .uid != $n.uid) ]
+                    | length) > 0)
+             end)
       }
-    | . as $sig
+
+    # Merge the scenario-supplied evidence signals on top. OR, not overwrite:
+    # a signal computable from both sources fires if either source saw it, and
+    # the per-signal provenance stays visible in .evidence.
+    | . as $snapsig
+    | (reduce ($evidence | to_entries[]) as $e ($snapsig;
+         .[$e.key] = ((.[$e.key] // false) or ($e.value.value // false)))) as $sig
+
     | ([ $sig | to_entries[] | select(.value) | .key ]) as $fired
     | ([ $required[] | select((($sig[.]) // false) | not) ]) as $missing
+    # `$sig | has(.)` would test $sig against ITSELF — inside `A | has(.)` the
+    # argument is evaluated with A as input, not with the outer `.`. Bind the
+    # name first.
+    | ([ $required[] | . as $s | select(($sig | has($s)) | not) ]) as $unknown
     | {
         signals: $sig,
         fired: $fired,
         required: $required,
         missing_required: $missing,
+        # Why each missing signal is missing. A required signal that is not a
+        # defined signal name at all is a different fault from one that was
+        # computed and came back false, and folding the two together is how a
+        # typo becomes a permanent FAULT_INEFFECTIVE nobody notices.
+        missing_required_detail:
+          [ $missing[] | . as $s
+            | { signal: $s,
+                defined: ($sig | has($s)),
+                source: (if ($evidence | has($s)) then "scenario evidence file"
+                         elif ($sig | has($s)) then "snapshot series"
+                         else "UNDEFINED — no such signal in check-invariants.sh" end),
+                reason: (($evidence[$s].reason) //
+                         (if ($sig | has($s)) then "computed from the snapshot series and came back false"
+                          else "signal name is not defined by this checker" end)) } ],
+        unknown_required_signals: $unknown,
+        evidence: $evidence,
+        # Advisory only. S21, S23 and S27 name the signals that would let them
+        # self-certify in `require_proposed` rather than `require`, because at
+        # the time they were written those signals did not exist and putting an
+        # undefined name in `require` forces INEFFECTIVE. They exist now, so
+        # this block reports whether they would have been satisfied — it does
+        # NOT change the verdict, because `require` is the scenario own
+        # declaration and rewriting it from here would make the checker decide
+        # what the scenario asserted.
+        require_proposed: $proposed,
+        require_proposed_satisfied:
+          (if ($proposed | length) == 0 then null
+           else (([ $proposed[] | select((($sig[.]) // false) | not) ] | length) == 0)
+           end),
+        require_proposed_missing: [ $proposed[] | select((($sig[.]) // false) | not) ],
         verdict:
           (if ($required | length) > 0
            then (if ($missing | length) == 0 then "EFFECTIVE" else "INEFFECTIVE" end)
            else (if ($fired | length) > 0 then "EFFECTIVE" else "INEFFECTIVE" end)
            end),
-        note: "EFFECTIVE = the fault produced at least one observable change against the baseline snapshot. INEFFECTIVE = the run measured an undisturbed cluster, so its invariant verdicts describe nothing."
+        note: "EFFECTIVE = the fault produced at least one observable change against the baseline snapshot, or the signals the scenario required were all observed. INEFFECTIVE = the run measured an undisturbed cluster, so its invariant verdicts describe nothing."
       }
   ' $files
 }
@@ -858,14 +1240,19 @@ apply_gate() {
   fi
 }
 
-I1=$(apply_gate "$(check_i1)" "$CAL_I1")
-I2=$(apply_gate "$(check_i2)" "$CAL_I2")
-I3=$(apply_gate "$(check_i3)" "$CAL_I3")
-I4=$(check_i4)
-I5=$(apply_gate "$(check_i5)" "$CAL_I5")
-I6=$(check_i6)
-I9=$(apply_gate "$(check_i9)" "$CAL_I9")
-I10=$(check_i10)
+# Resolved before the verdicts are finalised: the applicability table is keyed
+# on it. It reads the baseline snapshot, so it must run after snapshots() is
+# usable and before finalize().
+resolve_fault_class
+
+I1=$(finalize I1 "$(apply_gate "$(check_i1)" "$CAL_I1")")
+I2=$(finalize I2 "$(apply_gate "$(check_i2)" "$CAL_I2")")
+I3=$(finalize I3 "$(apply_gate "$(check_i3)" "$CAL_I3")")
+I4=$(finalize I4 "$(check_i4)")
+I5=$(finalize I5 "$(apply_gate "$(check_i5)" "$CAL_I5")")
+I6=$(finalize I6 "$(check_i6)")
+I9=$(finalize I9 "$(apply_gate "$(check_i9)" "$CAL_I9")")
+I10=$(finalize I10 "$(check_i10)")
 
 EFFICACY=$(fault_efficacy)
 TIMING=$(divergence_timing "$I1" "$I2" "$I3" "$I4" "$I5" "$I6" "$I9" "$I10")
@@ -873,6 +1260,8 @@ TIMING=$(divergence_timing "$I1" "$I2" "$I3" "$I4" "$I5" "$I6" "$I9" "$I10")
 jq -n \
   --arg scenario "$SCENARIO_ID" \
   --arg run "$RUN_ID" \
+  --arg fault_class "$FAULT_CLASS" \
+  --arg fault_class_source "$FAULT_CLASS_SOURCE" \
   --argjson snap_count "$SNAP_COUNT" \
   --argjson i1 "$I1" \
   --argjson i2 "$I2" \
@@ -888,6 +1277,8 @@ jq -n \
    {
     scenario_id: $scenario,
     run_id: $run,
+    fault_class: $fault_class,
+    fault_class_source: $fault_class_source,
     snapshots_evaluated: $snap_count,
     run_validity: (if $efficacy.verdict == "INEFFECTIVE"
                    then "FAULT_INEFFECTIVE" else "OK" end),
@@ -897,7 +1288,17 @@ jq -n \
       preserved:         ($all | map(select(.verdict == "PRESERVED")) | length),
       violated:          ($all | map(select(.verdict == "VIOLATED")) | length),
       insufficient_data: ($all | map(select(.verdict == "INSUFFICIENT_DATA")) | length),
-      detector_invalid:  ($all | map(select(.verdict == "DETECTOR_INVALID")) | length)
+      detector_invalid:  ($all | map(select(.verdict == "DETECTOR_INVALID")) | length),
+      not_applicable:    ($all | map(select(.verdict == "NOT_APPLICABLE")) | length),
+      # The population a rate may be computed over. PRESERVED + VIOLATED and
+      # nothing else: INSUFFICIENT_DATA measured nothing, DETECTOR_INVALID
+      # measured the detector, NOT_APPLICABLE asked a question this fault
+      # cannot answer, and a FAULT_INEFFECTIVE run measured an undisturbed
+      # cluster. aggregate-results.sh uses the same denominator.
+      evaluable: ($all | map(select(.verdict == "PRESERVED" or .verdict == "VIOLATED")) | length),
+      verdict_vocabulary: ["PRESERVED", "VIOLATED", "INSUFFICIENT_DATA",
+                           "NOT_APPLICABLE", "DETECTOR_INVALID", "FAULT_INEFFECTIVE"],
+      counting_note: "FAULT_INEFFECTIVE is a run-level verdict (run_validity), not a per-invariant one: when a fault did nothing, every invariant verdict in the run describes an undisturbed cluster, so the run is excluded whole."
     },
     divergence_timing: $timing
   }'
