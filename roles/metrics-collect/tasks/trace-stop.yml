@@ -140,6 +140,130 @@
       ignore_errors: yes
       ignore_unreachable: yes
 
+    # ── In-cluster informer observer (REVIEW.md M2) ───────────────────────────
+
+    - name: Trace — capture the informer's last view before removing it
+      # The final line is worth keeping: it is the informer's answer at the end
+      # of the observation window, after the last snapshot has been taken.
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        T={{ observer_informer_timeout | default(6) }}
+        kubectl --request-timeout="${T}s" -n {{ observer_informer_namespace }} \
+          logs 'job/{{ informer_object_name }}' --tail=200 2>/dev/null || true
+      register: informer_tail
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      changed_when: false
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — save the informer tail alongside the results
+      copy:
+        dest: "{{ results_dir }}/informer_tail.jsonl"
+        content: "{{ informer_tail.stdout | default('', true) }}\n"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+
+    - name: Trace — remove the in-cluster informer
+      # Mechanism 3 of the four in templates/informer.yml.j2. It is the fastest
+      # of them, not the one being relied on: activeDeadlineSeconds and
+      # ttlSecondsAfterFinished remove the Job with no Ansible involvement at
+      # all, and the next run's reap-on-start removes the RBAC objects, so a
+      # scenario that never reaches this task still cannot leave a running
+      # informer behind.
+      #
+      # --wait=false so a partitioned control plane cannot block the teardown
+      # that follows this play.
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        SEL='app={{ observer_informer_name }}'
+        T={{ observer_informer_timeout | default(6) }}
+        kubectl --request-timeout="${T}s" -n {{ observer_informer_namespace }} \
+          delete job,serviceaccount -l "$SEL" --ignore-not-found --wait=false 2>/dev/null || true
+        kubectl --request-timeout="${T}s" \
+          delete clusterrole,clusterrolebinding -l "$SEL" --ignore-not-found --wait=false 2>/dev/null || true
+        LEFT=$(kubectl --request-timeout="${T}s" -n {{ observer_informer_namespace }} \
+                 get job -l "$SEL" -o name 2>/dev/null | wc -l)
+        echo "INFORMER_JOBS_REMAINING=${LEFT:-unknown}"
+      register: informer_delete
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      changed_when: false
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — remove the rendered informer manifest from the node
+      file:
+        path: "{{ trace_remote_dir }}/{{ informer_object_name }}.yml"
+        state: absent
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — shout if the informer could not be confirmed removed
+      # The reap-on-start of the NEXT run is the backstop, and the Job's own
+      # activeDeadlineSeconds / ttlSecondsAfterFinished are the backstop for
+      # that, but an informer whose removal was never confirmed is worth saying
+      # out loud rather than discovering later as a mystery pod in kube-system.
+      debug:
+        msg: >-
+          metrics-collect: could not confirm removal of the in-cluster informer
+          '{{ informer_object_name }}' in {{ observer_informer_namespace }}.
+          It is still bounded by activeDeadlineSeconds
+          ({{ observer_informer_max_seconds | int }}s) and deleted by the TTL
+          controller {{ observer_informer_ttl_seconds | int }}s after that, and
+          the next run's reap-on-start sweeps anything left — but check
+          `kubectl -n {{ observer_informer_namespace }} get job,pod -l app={{ observer_informer_name }}`.
+      when:
+        - observer_informer_enabled | bool
+        - (informer_delete.rc | default(1)) != 0
+      run_once: true
+
+    # ── Maximum disagreement duration (REVIEW.md M2, second output) ───────────
+    # Derived on the observer from the 1 Hz trace that was just fetched, for the
+    # same reason the per-snapshot matrix is derived there: it must not depend on
+    # a cluster node still being reachable, and a partition is exactly when the
+    # answer matters. Non-fatal — a scenario's fault teardown runs after this.
+
+    - name: Trace — compute the maximum observer-disagreement duration
+      command: >-
+        {{ role_path }}/../../scripts/observer-disagreement-duration.sh
+        --output {{ results_dir }}/disagreement_duration.json
+        {{ results_dir }}
+      register: disagreement_duration
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Trace — report the disagreement durations
+      # map('string') before join: a question with no measured episode carries
+      # max_disagreement_ms: null, and joining a list containing None raises in
+      # Jinja. A null here is the normal, correct value for "they never
+      # disagreed" and must not turn a report into an error.
+      debug:
+        msg: >-
+          metrics-collect: max observer-disagreement duration per question —
+          {{ ((disagreement_duration.stdout | default('{}', true) | from_json).questions | default([]))
+             | map(attribute='question') | map('string') | list | join(' / ') }}
+          =
+          {{ ((disagreement_duration.stdout | default('{}', true) | from_json).questions | default([]))
+             | map(attribute='max_disagreement_ms') | map('string') | list | join(' / ') }}
+          ms (verdicts
+          {{ ((disagreement_duration.stdout | default('{}', true) | from_json).questions | default([]))
+             | map(attribute='verdict') | map('string') | list | join(' / ') }})
+      when: (disagreement_duration.rc | default(1)) == 0
+      run_once: true
+      ignore_errors: yes
+
     - name: Trace — record the stop verdict alongside the results
       copy:
         dest: "{{ results_dir }}/trace_stop.json"

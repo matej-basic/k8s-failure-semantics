@@ -1,0 +1,209 @@
+# roles/metrics-collect/templates/informer.yml.j2
+# Rendered onto {{ trace_k8s_host }} by tasks/trace-start.yml and applied there.
+#
+# The `informer:in-cluster` observer of REVIEW.md M2. It answers the same three
+# questions as every other observer, but it is the only one that asks them the
+# way an in-cluster controller does: with a projected ServiceAccount token,
+# through the kubernetes.default.svc ClusterIP, so KUBE-PROXY — not the
+# operator — decides which API server answers. During a scenario that partitions
+# one control-plane node, that choice is not the operator's to make, and the
+# answer it produces is the one a real workload would have got.
+#
+# It prints ONE JSON line per interval on stdout; tasks/snapshot.yml reads the
+# last line with `kubectl logs --tail=1`. Nothing is written to the cluster.
+#
+# ── Why this cannot become a permanent resident ───────────────────────────────
+# Four independent mechanisms, only two of which involve Ansible at all:
+#
+#   1. activeDeadlineSeconds — the JOB CONTROLLER terminates it after
+#      {{ observer_informer_max_seconds | int }}s, the recorder's own deadline.
+#      No Ansible involved: this holds if the run is aborted, if the host is
+#      partitioned, if the operator hits Ctrl-C.
+#   2. ttlSecondsAfterFinished — the TTL controller then DELETES the Job and
+#      its pod {{ observer_informer_ttl_seconds | int }}s later. Also no Ansible
+#      involved.
+#   3. tasks/trace-stop.yml deletes every object here explicitly.
+#   4. tasks/trace-start.yml reaps anything labelled app={{ observer_informer_name }}
+#      from an earlier run BEFORE creating this one, so at most one run's
+#      residue can exist at any moment and the next run removes it. This is the
+#      same reap-on-start mechanism the trace recorder uses, and for the same
+#      reason: it does not depend on the previous run's teardown having happened.
+#
+# The ServiceAccount, ClusterRole and ClusterRoleBinding are read-only and
+# cannot be garbage-collected by ownerReferences (a cluster-scoped object
+# cannot be owned by a namespaced Job), so mechanisms 3 and 4 are what remove
+# them. They grant get/list/watch on three resources and nothing else.
+#
+# ── Why it never perturbs the thing being measured ────────────────────────────
+# It runs in kube-system, not in {{ observer_question_namespace }}, so it is
+# outside the pod set I1/I3 group over. Its nodeSelector pins it to a
+# control-plane node, so it can never take a worker's scheduling slot, change
+# what lands on the fault target, or add a container to the crictl ground truth
+# on a worker.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ informer_object_name }}
+  namespace: {{ observer_informer_namespace }}
+  labels:
+    app: {{ observer_informer_name }}
+    scenario: "{{ scenario_id }}"
+    run: "{{ run_id | replace('_', '-') | lower }}"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ informer_object_name }}
+  labels:
+    app: {{ observer_informer_name }}
+    scenario: "{{ scenario_id }}"
+    run: "{{ run_id | replace('_', '-') | lower }}"
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ informer_object_name }}
+  labels:
+    app: {{ observer_informer_name }}
+    scenario: "{{ scenario_id }}"
+    run: "{{ run_id | replace('_', '-') | lower }}"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ informer_object_name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ informer_object_name }}
+    namespace: {{ observer_informer_namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ informer_object_name }}
+  namespace: {{ observer_informer_namespace }}
+  labels:
+    app: {{ observer_informer_name }}
+    scenario: "{{ scenario_id }}"
+    run: "{{ run_id | replace('_', '-') | lower }}"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ observer_informer_max_seconds | int }}
+  ttlSecondsAfterFinished: {{ observer_informer_ttl_seconds | int }}
+  template:
+    metadata:
+      labels:
+        app: {{ observer_informer_name }}
+        scenario: "{{ scenario_id }}"
+        run: "{{ run_id | replace('_', '-') | lower }}"
+    spec:
+      serviceAccountName: {{ informer_object_name }}
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: informer
+          image: {{ observer_informer_image }}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          env:
+            # kubectl caches API discovery under $KUBECACHEDIR; without a
+            # writable one this image (which runs as uid 1001 with a read-only
+            # HOME) re-fetches /api and /apis on EVERY call, which does not fit
+            # inside the sub-second per-read budget below.
+            - { name: HOME,        value: /tmp }
+            - { name: KUBECACHEDIR, value: /tmp/.kube/cache }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              NODE='{{ observer_question_node }}'
+              POD='{{ observer_question_pod }}'
+              SVC='{{ observer_question_service }}'
+              NS='{{ observer_question_namespace }}'
+              INTERVAL={{ observer_informer_interval | int }}
+
+              # Every read is bounded twice and both bounds are shorter than
+              # the loop interval: kubectl's own --request-timeout, and
+              # timeout(1) around the process for the case where it hangs before
+              # arming that. Three SEQUENTIAL reads at
+              # {{ '%.2f' | format(observer_informer_interval | float * 0.30) }}s
+              # each sum to
+              # {{ '%.2f' | format(observer_informer_interval | float * 0.90) }}s,
+              # inside the {{ observer_informer_interval | int }}s tick, so a
+              # blackholed API server slows a line down, it never wedges the
+              # loop or lets one read starve the other two.
+              RT='{{ "%.2f" | format(observer_informer_interval | float * 0.28) }}'
+              HT='{{ "%.2f" | format(observer_informer_interval | float * 0.30) }}'
+              if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=1; else HAVE_TIMEOUT=0; fi
+              K() {
+                if [ "$HAVE_TIMEOUT" = "1" ]; then
+                  timeout -k 0.2 "$HT" kubectl --request-timeout="${RT}s" "$@" 2>&1
+                else
+                  kubectl --request-timeout="${RT}s" "$@" 2>&1
+                fi
+              }
+
+              esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+              ans()    { printf '{"state":"answered","answer":"%s","reason":null}' "$(esc "$1")"; }
+              unread() { printf '{"state":"unreadable","answer":null,"reason":"%s"}' "$1"; }
+
+              while : ; do
+                TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+                MS=$(date -u +%s%3N)
+
+                OUT=$(K get node "$NODE" -o jsonpath='{.metadata.resourceVersion}|{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'); RC=$?
+                RV_NODE=""
+                if [ "$RC" = "0" ]; then
+                  RV_NODE=${OUT%%|*}; V=${OUT#*|}
+                  if [ -n "$V" ]; then A1=$(ans "$V"); else A1=$(ans Missing); fi
+                elif printf '%s' "$OUT" | grep -q 'NotFound'; then
+                  A1=$(ans Absent)
+                else
+                  A1=$(unread informer_node_read_failed)
+                fi
+
+                OUT=$(K get pod "$POD" -n "$NS" -o jsonpath='{.metadata.resourceVersion}|{.spec.nodeName}'); RC=$?
+                RV_POD=""
+                if [ "$RC" = "0" ]; then
+                  RV_POD=${OUT%%|*}; V=${OUT#*|}
+                  if [ -n "$V" ]; then A2=$(ans "$V"); else A2=$(ans '<unscheduled>'); fi
+                elif printf '%s' "$OUT" | grep -q 'NotFound'; then
+                  A2=$(ans '<absent>')
+                else
+                  A2=$(unread informer_pod_read_failed)
+                fi
+
+                OUT=$(K get endpoints "$SVC" -n "$NS" -o jsonpath='{.metadata.resourceVersion}|{range .subsets[*].addresses[*]}{.ip},{end}'); RC=$?
+                RV_EPS=""
+                if [ "$RC" = "0" ]; then
+                  RV_EPS=${OUT%%|*}; V=${OUT#*|}
+                  # Same canonical form as every other observer: ascending,
+                  # comma-joined, ready addresses only.
+                  V=$(printf '%s' "$V" | tr ',' '\n' | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
+                  if [ -n "$V" ]; then A3=$(ans "$V"); else A3=$(ans '<empty>'); fi
+                elif printf '%s' "$OUT" | grep -q 'NotFound'; then
+                  A3=$(ans '<absent>')
+                else
+                  A3=$(unread informer_endpoints_read_failed)
+                fi
+
+                printf '{"ts":"%s","ts_epoch_ms":%s,"source":"https://kubernetes.default.svc","read_mode":"in_cluster_serviceaccount_linearizable","resource_versions":{"node":"%s","pod":"%s","endpoints":"%s"},"answers":{"node_ready":%s,"stateful_pod_node":%s,"stateless_endpoint_set":%s}}\n' \
+                  "$TS" "$MS" "$RV_NODE" "$RV_POD" "$RV_EPS" "$A1" "$A2" "$A3"
+
+                sleep "$INTERVAL"
+              done

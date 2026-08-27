@@ -64,6 +64,7 @@ HARD_TIMEOUT={{ '%.2f' | format(trace_stream_interval | float * 0.9) }}
 
 WORKDIR="$(dirname "$OUT")/work-${STREAM}"
 mkdir -p "$WORKDIR" || exit 1
+chmod 700 "$WORKDIR" 2>/dev/null
 : > "$OUT" || exit 1
 
 echo $$ > "$PIDFILE"
@@ -83,6 +84,62 @@ trap cleanup EXIT
 # worth-knowing fact.
 STOP=0
 trap 'STOP=1' TERM INT HUP
+
+# ── Per-API-server observer sampling (REVIEW.md M2) ───────────────────────────
+# The M1 recorder samples ONE API server, so no record of it can show two
+# observers disagreeing — and "for how long did they disagree" is precisely the
+# question the trace exists to answer. Every tick the k8s stream therefore also
+# asks EACH API server, on its own address so the keepalived VIP cannot silently
+# redirect the question, the same three questions tasks/snapshot.yml asks:
+#
+#   node_ready              /api/v1/nodes/{{ observer_question_node }}
+#   stateful_pod_node       /api/v1/namespaces/{{ observer_question_namespace }}/pods/{{ observer_question_pod }}
+#   stateless_endpoint_set  /api/v1/namespaces/{{ observer_question_namespace }}/endpoints/{{ observer_question_service }}
+#
+# Single objects, not collections: the questions are about three named objects,
+# and a per-node GET is a few KB where `get nodes` is tens.
+#
+# curl, not kubectl. Nine concurrent kubectl processes per second would cost
+# several hundred MB of RSS on this host every tick; nine curls cost a few MB.
+# The client certificate is extracted ONCE from admin.conf into $WORKDIR, which
+# is mode 0700 under a 0700 parent and removed by the exit trap. If extraction
+# fails the block is skipped entirely and every record carries
+# "observers": null with "observers" in .errors — never a fabricated answer.
+#
+# HTTP status is the discriminator, and it is what keeps a failed read from
+# looking like an answer:
+#   200  -> answered
+#   404  -> answered ("Absent" / "<absent>") — a real observation that the
+#           object is not there
+#   anything else, 000 included -> unreadable, with the code in the reason.
+
+OBS_ENABLED={{ (trace_observers_enabled | default(true) | bool) | ternary(1, 0) }}
+OBS_HOSTS=({% for h in groups['control_plane'] %}'{{ h }}' {% endfor %})
+OBS_ADDRS=({% for h in groups['control_plane'] %}'{{ hostvars[h].ansible_host }}' {% endfor %})
+Q_NODE='{{ observer_question_node }}'
+Q_POD='{{ observer_question_pod }}'
+Q_SVC='{{ observer_question_service }}'
+Q_NS='{{ observer_question_namespace }}'
+
+OBS_CRT="$WORKDIR/admin.crt"
+OBS_KEY="$WORKDIR/admin.key"
+OBS_CA="$WORKDIR/ca.crt"
+OBS_READY=0
+if [ "$OBS_ENABLED" = "1" ] && [ "$STREAM" = "k8s" ]; then
+  ( umask 077
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf config view --raw \
+      -o jsonpath='{.users[0].user.client-certificate-data}' 2>/dev/null \
+      | base64 -d > "$OBS_CRT" 2>/dev/null
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf config view --raw \
+      -o jsonpath='{.users[0].user.client-key-data}' 2>/dev/null \
+      | base64 -d > "$OBS_KEY" 2>/dev/null
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf config view --raw \
+      -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' 2>/dev/null \
+      | base64 -d > "$OBS_CA" 2>/dev/null )
+  if [ -s "$OBS_CRT" ] && [ -s "$OBS_KEY" ] && [ -s "$OBS_CA" ]; then
+    OBS_READY=1
+  fi
+fi
 
 # ── Clocks ────────────────────────────────────────────────────────────────────
 # mono_ms is monotonic (seconds since boot, 10 ms resolution) and is the ONLY
@@ -131,10 +188,113 @@ kc() {
   timeout -k 0.2 "$HARD_TIMEOUT" kubectl --request-timeout="${REQ_TIMEOUT}s" "$@"
 }
 
+# One observer's three answers, built by a single jq pass over the three bodies
+# it just fetched. --rawfile (not --slurpfile) so a truncated or empty body is a
+# string jq can decline to parse rather than an error that kills the record.
+obs_one() {  # $1 = observer id, $2 = file base
+  local id="$1" base="$2"
+  # Create only what is MISSING. curl already wrote the bodies that arrived; a
+  # blind `: >` here would truncate them and turn every answer into unreadable.
+  [ -f "$base.node.body" ] || : > "$base.node.body"
+  [ -f "$base.pod.body"  ] || : > "$base.pod.body"
+  [ -f "$base.eps.body"  ] || : > "$base.eps.body"
+  jq -cn \
+    --arg obs "$id" \
+    --arg ncode "$(cat "$base.node.code" 2>/dev/null || echo 000)" \
+    --arg pcode "$(cat "$base.pod.code"  2>/dev/null || echo 000)" \
+    --arg ecode "$(cat "$base.eps.code"  2>/dev/null || echo 000)" \
+    --rawfile nb "$base.node.body" \
+    --rawfile pb "$base.pod.body" \
+    --rawfile eb "$base.eps.body" \
+    'def ans($a): {state:"answered",answer:($a|tostring),reason:null};
+     def unread($r): {state:"unreadable",answer:null,reason:$r};
+     # A 200 whose body will not parse is a FAILED READ, not an answer, and it
+     # is labelled body_unparseable rather than http_200 so the two are never
+     # confused when reading a trace back.
+     def why($code; $doc): if $code == "200" and $doc == null then "body_unparseable"
+                           else "http_" + $code end;
+     ($nb | fromjson? // null) as $n
+     | ($pb | fromjson? // null) as $p
+     | ($eb | fromjson? // null) as $e
+     | { observer: $obs,
+         http: { node: $ncode, pod: $pcode, endpoints: $ecode },
+         resource_version: ($n.metadata.resourceVersion // null),
+         answers: {
+           node_ready:
+             (if $ncode == "200" and $n != null
+                then ans(([$n.status.conditions[]? | select(.type == "Ready") | .status][0]) // "Missing")
+              elif $ncode == "404" then ans("Absent")
+              else unread(why($ncode; $n)) end),
+           stateful_pod_node:
+             (if $pcode == "200" and $p != null
+                then ans($p.spec.nodeName // "<unscheduled>")
+              elif $pcode == "404" then ans("<absent>")
+              else unread(why($pcode; $p)) end),
+           stateless_endpoint_set:
+             (if $ecode == "200" and $e != null
+                then ([$e.subsets[]?.addresses[]?.ip] | unique | sort) as $ips
+                     | (if ($ips | length) == 0 then ans("<empty>") else ans($ips | join(",")) end)
+              elif $ecode == "404" then ans("<absent>")
+              else unread(why($ecode; $e)) end) } }' \
+    2>/dev/null || printf '{"observer":"%s","http":null,"resource_version":null,"answers":null}' "$id"
+}
+
+# Deliberately split in two. launch_observers fires all nine requests as
+# background jobs and returns immediately; the caller starts them BEFORE its own
+# reads and lets the single `wait` in sample_k8s cover both sets. Running the
+# two batches in sequence would make a tick cost 2 x HARD_TIMEOUT whenever
+# anything is blackholed — i.e. it would halve the trace resolution during
+# exactly the faults the trace exists to resolve.
+launch_observers() {
+  local d="$WORKDIR/obs"
+  mkdir -p "$d" 2>/dev/null
+  rm -f "$d"/*.body "$d"/*.code 2>/dev/null
+
+  # Shell length expansions are wrapped in Jinja raw blocks throughout this
+  # file: a dollar-brace-hash sequence opens a Jinja COMMENT.
+  local n={% raw %}${#OBS_ADDRS[@]}{% endraw %} i base addr
+  for (( i = 0; i < n; i++ )); do
+    addr="${OBS_ADDRS[$i]}"
+    base="$d/$i"
+    ( ocurl "https://$addr:6443/api/v1/nodes/$Q_NODE"                       "$base.node" ) &
+    ( ocurl "https://$addr:6443/api/v1/namespaces/$Q_NS/pods/$Q_POD"        "$base.pod"  ) &
+    ( ocurl "https://$addr:6443/api/v1/namespaces/$Q_NS/endpoints/$Q_SVC"   "$base.eps"  ) &
+  done
+}
+
+collect_observers() {
+  local d="$WORKDIR/obs"
+  local n={% raw %}${#OBS_ADDRS[@]}{% endraw %} i out="" one
+  for (( i = 0; i < n; i++ )); do
+    one=$(obs_one "apiserver:${OBS_HOSTS[$i]}" "$d/$i")
+    out="${out}${out:+,}${one}"
+  done
+  printf '[%s]' "$out"
+}
+
+# Writes the body to $2.body and the HTTP status to $2.code. 000 means no reply
+# reached us at all — a timeout, a refused connection, a TLS failure — and it is
+# recorded as such rather than as an empty answer.
+ocurl() {
+  local url="$1" base="$2" code=""
+  code=$(timeout -k 0.2 "$HARD_TIMEOUT" curl -s --max-time "$REQ_TIMEOUT" \
+           --cert "$OBS_CRT" --key "$OBS_KEY" --cacert "$OBS_CA" \
+           -o "$base.body" -w '%{http_code}' "$url" 2>/dev/null) || code=""
+  printf '%s' "${code:-000}" > "$base.code"
+}
+
 sample_k8s() {
   local d="$WORKDIR"
   ERRS=""
   rm -f "$d/nodes.json" "$d/leases.json" "$d/eps.json" "$d/pg.json"
+
+  # Fired FIRST so the nine per-API-server requests overlap the four reads
+  # below and the whole tick costs one HARD_TIMEOUT, not two. The single `wait`
+  # after the reads covers both sets.
+  local obs="null" obs_launched=0
+  if [ "$OBS_ENABLED" = "1" ]; then
+    if [ "$OBS_READY" = "1" ]; then launch_observers; obs_launched=1; else note_err observers; fi
+  fi
 
   # Four independent reads fired concurrently. Independent so that one failing
   # sub-query nulls only its own field instead of blanking the whole record —
@@ -237,8 +397,17 @@ sample_k8s() {
     fi
   fi
 
-  printf '"node_ready":%s,"nodes":%s,"leases":%s,"endpoints":%s,"stateful_pod":%s,"apiserver_resource_version":%s,"errors":[%s]' \
-    "$ready_map" "$nodes" "$leases" "$eps" "$pg" "$rv" "$ERRS"
+  # Per-API-server observer block. Appended AFTER every M1 field, and every M1
+  # field keeps its exact name and meaning, so a record is a strict superset of
+  # the M1 schema and an M1-era consumer is unaffected. Its nine requests
+  # completed in the same `wait` as the four reads above.
+  if [ "$obs_launched" = "1" ]; then
+    obs=$(collect_observers)
+    [ -n "$obs" ] || { obs="null"; note_err observers; }
+  fi
+
+  printf '"node_ready":%s,"nodes":%s,"leases":%s,"endpoints":%s,"stateful_pod":%s,"apiserver_resource_version":%s,"observers":%s,"errors":[%s]' \
+    "$ready_map" "$nodes" "$leases" "$eps" "$pg" "$rv" "$obs" "$ERRS"
 }
 
 # ── etcd stream sampler ───────────────────────────────────────────────────────
@@ -295,7 +464,10 @@ sample_etcd() {
     healthy=$(printf '%s' "$members" | jq -r 'length'                         2>/dev/null || echo 0)
   fi
 
-  printf '"etcd_revision":%s,"members":%s,"healthy_members":%s,"expected_members":%s,"leader_ids":%s,"errors":[%s]' \
+  # "observers": null, not absent — the etcd stream has no per-API-server block
+  # by design, and an explicit null says so rather than leaving a consumer to
+  # guess whether the field was dropped or never collected.
+  printf '"etcd_revision":%s,"members":%s,"healthy_members":%s,"expected_members":%s,"leader_ids":%s,"observers":null,"errors":[%s]' \
     "${rev:-null}" "$members" "${healthy:-0}" "{{ groups['etcd'] | length }}" "${leaders:-null}" "$ERRS"
 }
 
@@ -339,7 +511,7 @@ while : ; do
 
   printf '%s\n' "$line" >> "$OUT"
   lines=$(( lines + 1 ))
-  bytes=$(( bytes + ${#line} + 1 ))
+  bytes=$(( bytes + {% raw %}${#line}{% endraw %} + 1 ))
 
   # Sleep to the next tick boundary that is still in the future. The inner loop
   # is what turns an overrun into a skipped tick instead of accumulating drift.

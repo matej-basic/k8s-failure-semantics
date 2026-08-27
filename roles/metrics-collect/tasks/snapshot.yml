@@ -204,34 +204,252 @@
     export KUBECONFIG=/etc/kubernetes/admin.conf
     SERVER="https://{{ ansible_host }}:6443"
     TIMEOUT="{{ observer_view_timeout | default('5s') }}"
-    rv_quorum=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
-      get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1' 2>/dev/null \
+    HARD="{{ observer_hard_timeout | default(8) }}"
+    NODE='{{ observer_question_node }}'
+    POD='{{ observer_question_pod }}'
+    SVC='{{ observer_question_service }}'
+    NS='{{ observer_question_namespace }}'
+
+    # Two nested bounds on every read, both far shorter than the 30-60 s
+    # snapshot cadence: kubectl's own --request-timeout, and timeout(1) around
+    # the whole process for the case where the client hangs before it arms its
+    # own deadline (TCP connect to a blackholed VIP, a SIGSTOPped peer).
+    kq() { timeout -k 1 "$HARD" kubectl --server="$SERVER" \
+             --request-timeout="$TIMEOUT" "$@" 2>/dev/null; }
+
+    rv_quorum=$(kq get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1' \
       | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || echo "")
-    rv_cache=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
-      get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1&resourceVersion=0' 2>/dev/null \
+    rv_cache=$(kq get --raw '/api/v1/namespaces/kube-system/configmaps?limit=1&resourceVersion=0' \
       | jq -r '.metadata.resourceVersion // empty' 2>/dev/null || echo "")
-    node_ready=$(kubectl --server="$SERVER" --request-timeout="$TIMEOUT" \
-      get nodes -o json 2>/dev/null \
-      | jq -c '[.items[] | {
+
+    # LIST reads, not single-object gets, on purpose. `kubectl get pod X` exits
+    # 1 both when the object is absent and when the connection failed, and the
+    # stderr that separates them is discarded — so a partition would be recorded
+    # as "the pod is gone", which is the exact masquerade this whole block
+    # exists to prevent. A list that PARSES is positive evidence: the object is
+    # either in it or genuinely absent. A list that does not parse is a failed
+    # read and is recorded as one.
+    nodes_json=$(kq get nodes -o json || echo "")
+    pods_json=$(kq get pods -n "$NS" -o json || echo "")
+    eps_json=$(kq get endpoints -n "$NS" -o json || echo "")
+
+    ok_json() { printf '%s' "$1" | jq -e '(.items | type) == "array"' >/dev/null 2>&1; }
+
+    node_ready=""
+    if ok_json "$nodes_json"; then
+      node_ready=$(printf '%s' "$nodes_json" | jq -c '[.items[] | {
             key: .metadata.name,
             value: ([.status.conditions[] | select(.type == "Ready") | .status][0] // "Missing")
           }] | from_entries' 2>/dev/null || echo "")
+    fi
+
+    # ── The three M2 questions, in the canonical answer domains documented in
+    #    roles/metrics-collect/files/disagreement.jq ────────────────────────────
+    UNREAD='{"state":"unreadable","answer":null,"reason":"%s"}'
+
+    if [ -n "$node_ready" ]; then
+      a_node=$(printf '%s' "$node_ready" | jq -c --arg n "$NODE" \
+        'if has($n) then {state:"answered",answer:.[$n],reason:null}
+         else {state:"answered",answer:"Absent",reason:null} end' 2>/dev/null \
+        || printf "$UNREAD" node_list_unparseable)
+    else
+      a_node=$(printf "$UNREAD" node_list_read_failed)
+    fi
+
+    if ok_json "$pods_json"; then
+      a_pod=$(printf '%s' "$pods_json" | jq -c --arg p "$POD" \
+        '([.items[] | select(.metadata.name == $p)][0]) as $x
+         | if $x == null then {state:"answered",answer:"<absent>",reason:null}
+           else {state:"answered",answer:(($x.spec.nodeName // "<unscheduled>")),reason:null} end' \
+        2>/dev/null || printf "$UNREAD" pod_list_unparseable)
+    else
+      a_pod=$(printf "$UNREAD" pod_list_read_failed)
+    fi
+
+    if ok_json "$eps_json"; then
+      a_eps=$(printf '%s' "$eps_json" | jq -c --arg s "$SVC" \
+        '([.items[] | select(.metadata.name == $s)][0]) as $x
+         | if $x == null then {state:"answered",answer:"<absent>",reason:null}
+           else ([$x.subsets[]?.addresses[]?.ip] | unique | sort) as $ips
+                | {state:"answered",
+                   answer:(if ($ips|length) == 0 then "<empty>" else ($ips|join(",")) end),
+                   reason:null} end' \
+        2>/dev/null || printf "$UNREAD" endpoints_list_unparseable)
+    else
+      a_eps=$(printf "$UNREAD" endpoints_list_read_failed)
+    fi
+
+    # Server attribution, reusing S21's idea: every serving certificate in this
+    # cluster carries the VIP and all three control-plane IPs in its SANs, so an
+    # IP SAN cannot say which server answered. The SHA-256 fingerprint can.
+    FP=$(echo | timeout 5 openssl s_client -connect "{{ ansible_host }}:6443" 2>/dev/null \
+         | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')
+
     jq -cn \
       --arg host "{{ inventory_hostname }}" \
       --arg server "$SERVER" \
       --arg q "${rv_quorum:-}" \
       --arg c "${rv_cache:-}" \
+      --arg fp "${FP:-}" \
       --argjson nr "${node_ready:-null}" \
+      --argjson a1 "$a_node" \
+      --argjson a2 "$a_pod" \
+      --argjson a3 "$a_eps" \
       '{
          host: $host,
          server: $server,
          ok: (($q | length) > 0),
          probe_rv_quorum: (if ($q | length) > 0 then $q else null end),
          probe_rv_cache:  (if ($c | length) > 0 then $c else null end),
-         node_ready: $nr
+         node_ready: $nr,
+         cert_fingerprint: (if ($fp | length) > 0 then $fp else null end),
+         answers: { node_ready: $a1,
+                    stateful_pod_node: $a2,
+                    stateless_endpoint_set: $a3 }
        }'
   register: apiserver_view
   when: inventory_hostname in groups['control_plane']
+  ignore_errors: yes
+  ignore_unreachable: yes
+
+# ── etcd quorum observer ──────────────────────────────────────────────────────
+# The one observer in the roster that is not an API server and not node-local:
+# a LINEARIZABLE (`--consistency=l`) read of the registry keys straight out of
+# etcd. During S19 the API servers are pinned to opposite sides of a quorum
+# split; this read is the only answer in the snapshot that the split cannot
+# serve stale, because a minority member cannot complete it at all — it times
+# out, and a timeout is recorded as `unreadable`, never as agreement.
+#
+# It runs on an etcd member because /etc/etcd/pki exists ONLY there.
+#
+# ── Decoding, and its explicit limits ─────────────────────────────────────────
+# Kubernetes stores objects in etcd as PROTOBUF, and this lab has no protobuf
+# decoder on the nodes (no `auger`). What is extracted is therefore the
+# printable-token stream of the value (`tr -c '[:print:]'`), and only the
+# facts that can be read off it UNAMBIGUOUSLY are turned into answers:
+#
+#   node_ready         a NodeCondition encodes type then status as two adjacent
+#                      length-prefixed strings, so the token after the token
+#                      "Ready" IS its status. Accepted only when exactly one
+#                      "Ready" token exists and the following token is one of
+#                      True/False/Unknown. Anything else -> unreadable.
+#   stateful_pod_node  the node name appears verbatim in the PodSpec. Accepted
+#                      only when exactly ONE known node name appears in the
+#                      value. Zero matches is UNREADABLE, not "<unscheduled>":
+#                      absence of evidence must not be reported as an answer.
+#   endpoint set       NOT ANSWERED. `addresses` and `notReadyAddresses` differ
+#                      only by their protobuf field tag, which the printable
+#                      filter destroys, so the ready set cannot be separated
+#                      from the not-ready set. That is a structural limit of
+#                      this decoder, not a failed read, so it is reported as
+#                      not_applicable — and the raw address tokens are kept
+#                      alongside for any future decoder.
+
+- name: Collect the etcd quorum view of the same three questions
+  shell: |
+    set -u
+    export LC_ALL=C
+    T={{ observer_etcd_timeout | default(5) }}
+    NODE='{{ observer_question_node }}'
+    POD='{{ observer_question_pod }}'
+    SVC='{{ observer_question_service }}'
+    NS='{{ observer_question_namespace }}'
+    ALL_NODES='{{ (groups["control_plane"] + groups["workers"]) | join(" ") }}'
+
+    eget() {
+      ETCDCTL_API=3 timeout -k 1 $((T + 2)) etcdctl \
+        --endpoints={{ etcd_endpoints }} \
+        --cacert={{ etcd_cert_dir }}/ca.crt \
+        --cert={{ etcd_cert_dir }}/server.crt \
+        --key={{ etcd_cert_dir }}/server.key \
+        --dial-timeout="${T}s" --command-timeout="${T}s" \
+        --consistency=l \
+        get "$1" -w json 2>/dev/null
+    }
+    kcount() { printf '%s' "$1" | jq -r '.count // 0' 2>/dev/null || echo 0; }
+    toks()   { printf '%s' "$1" | jq -r '.kvs[0].value // empty' 2>/dev/null \
+                 | base64 -d 2>/dev/null | tr -c '[:print:]' '\n' | grep -v '^$'; }
+    unread() { printf '{"state":"unreadable","answer":null,"reason":"%s"}' "$1"; }
+    answer() { printf '{"state":"answered","answer":"%s","reason":null}' "$1"; }
+
+    NJ=$(eget "/registry/minions/$NODE")
+    PJ=$(eget "/registry/pods/$NS/$POD")
+    EJ=$(eget "/registry/services/endpoints/$NS/$SVC")
+
+    HREV=$(printf '%s' "$NJ" | jq -r '.header.revision // empty' 2>/dev/null || echo "")
+    [ -n "$HREV" ] || HREV=$(printf '%s' "$PJ" | jq -r '.header.revision // empty' 2>/dev/null || echo "")
+
+    # Q1 — is the subject node Ready
+    if [ -z "$NJ" ]; then
+      a_node=$(unread etcd_read_failed)
+    elif [ "$(kcount "$NJ")" = "0" ]; then
+      a_node=$(answer Absent)
+    else
+      NT=$(toks "$NJ")
+      nready=$(printf '%s\n' "$NT" | grep -c '^Ready$' || true)
+      st=$(printf '%s\n' "$NT" | awk 'p == "Ready" { print; exit } { p = $0 }')
+      case "${nready}:${st}" in
+        1:True|1:False|1:Unknown) a_node=$(answer "$st") ;;
+        *)                        a_node=$(unread etcd_node_ready_decode_ambiguous) ;;
+      esac
+    fi
+
+    # Q2 — where is the stateful pod
+    if [ -z "$PJ" ]; then
+      a_pod=$(unread etcd_read_failed)
+    elif [ "$(kcount "$PJ")" = "0" ]; then
+      a_pod=$(answer '<absent>')
+    else
+      PT=$(toks "$PJ")
+      # Substring, not whole-token, match. A protobuf field tag byte that
+      # happens to be printable ASCII (the nodeName tag is 0x52, the letter R,
+      # and the tag of whatever field follows it may be printable too) is glued
+      # onto the adjacent string by the printable-run filter, so worker2 can
+      # surface as worker2b. The "exactly one distinct node name" guard below
+      # is what keeps this honest: two matches, or none, are unreadable.
+      hits=""
+      for n in $ALL_NODES; do
+        if printf '%s\n' "$PT" | grep -qF -- "$n"; then hits="$hits $n"; fi
+      done
+      set -- $hits
+      if [ "$#" = "1" ]; then a_pod=$(answer "$1")
+      elif [ "$#" = "0" ]; then a_pod=$(unread etcd_pod_node_not_decodable)
+      else a_pod=$(unread etcd_pod_node_ambiguous); fi
+    fi
+
+    # Q3 — structurally not answerable from this decoder; see the header.
+    if [ -z "$EJ" ]; then
+      a_eps=$(unread etcd_read_failed)
+      raw_ips='[]'
+    elif [ "$(kcount "$EJ")" = "0" ]; then
+      a_eps=$(answer '<absent>')
+      raw_ips='[]'
+    else
+      a_eps='{"state":"not_applicable","answer":null,"reason":"etcd_protobuf_ready_vs_notready_not_separable"}'
+      # -o, not an anchored match, for the same tag-byte-glue reason as above.
+      raw_ips=$(toks "$EJ" \
+        | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' \
+        | sort -u | jq -R . | jq -sc . 2>/dev/null || echo '[]')
+    fi
+
+    jq -cn \
+      --arg ep '{{ etcd_endpoints }}' \
+      --arg rev "${HREV:-}" \
+      --argjson a1 "$a_node" \
+      --argjson a2 "$a_pod" \
+      --argjson a3 "$a_eps" \
+      --argjson raw "${raw_ips:-[]}" \
+      '{ ok: (($rev | length) > 0),
+         endpoints: $ep,
+         consistency: "linearizable",
+         header_revision: (if ($rev | length) > 0 then $rev else null end),
+         raw_endpoint_address_tokens: $raw,
+         answers: { node_ready: $a1,
+                    stateful_pod_node: $a2,
+                    stateless_endpoint_set: $a3 } }'
+  register: etcd_quorum_view
+  delegate_to: "{{ groups['etcd'][0] }}"
+  run_once: true
   ignore_errors: yes
   ignore_unreachable: yes
 
@@ -244,15 +462,129 @@
 # local, leaving the host eligible for the teardown.
 
 - name: Collect kubelet node status from each node
+  # Extended for REVIEW.md M2: this is now the `kubelet:<node>` observer, not
+  # just a resource sample. It answers the same three questions as every other
+  # observer, from the kubelet's OWN port, without going through any API server.
+  #
+  # Credentials. /etc/kubernetes/pki/apiserver-kubelet-client.* is the identity
+  # the API server itself uses against :10250 and is accepted by every kubelet,
+  # but it exists only on control-plane nodes. Workers fall back to the
+  # kubelet's own client certificate. If a kubelet's authorizer refuses that
+  # identity for /pods the read is recorded as unreadable with the HTTP status
+  # in the reason — a 403 is missing data, and it is never allowed to look like
+  # an answer.
+  #
+  # What each question means to a kubelet:
+  #   node_ready              only the kubelet ON the subject node is asked;
+  #                           every other kubelet answers not_applicable. The
+  #                           kubelet has no Node object, so its answer is its
+  #                           /healthz self-declaration — "True" when the
+  #                           syncloop reports healthy. That is an
+  #                           APPROXIMATION of the Ready condition it would
+  #                           post (Ready also folds in runtime, network and
+  #                           PLEG state), and it is the interesting one: during
+  #                           a partition the kubelet still says True while the
+  #                           API server says Unknown.
+  #   stateful_pod_node       answered ONLY when the pod is present here. A
+  #                           node-local observer can witness presence, never
+  #                           absence-elsewhere, so "not here" is
+  #                           not_applicable rather than an answer about where
+  #                           the pod is.
+  #   stateless_endpoint_set  not_applicable — a kubelet has no Service view.
   shell: |
+    set -u
+    T={{ observer_kubelet_timeout | default(5) }}
+    NODE='{{ observer_question_node }}'
+    POD='{{ observer_question_pod }}'
+    NS='{{ observer_question_namespace }}'
+    ME='{{ inventory_hostname }}'
+
+    if [ -r /etc/kubernetes/pki/apiserver-kubelet-client.key ]; then
+      CERT=/etc/kubernetes/pki/apiserver-kubelet-client.crt
+      KEY=/etc/kubernetes/pki/apiserver-kubelet-client.key
+      CREDENTIAL=apiserver-kubelet-client
+    else
+      CERT=/var/lib/kubelet/pki/kubelet-client-current.pem
+      KEY=/var/lib/kubelet/pki/kubelet-client-current.pem
+      CREDENTIAL=kubelet-client-current
+    fi
+
+    W=$(mktemp -d) || W=/tmp
+    trap 'rm -rf "$W"' EXIT
+
     # --max-time is load-bearing: a SIGSTOPped kubelet (S22) still completes
     # the TCP handshake in the kernel and then never answers, so an unbounded
     # curl blocks for the whole freeze. ignore_errors cannot rescue a hang.
-    curl -sk --max-time 5 https://127.0.0.1:10250/stats/summary \
-      --cert /var/lib/kubelet/pki/kubelet-client-current.pem \
-      --key /var/lib/kubelet/pki/kubelet-client-current.pem \
-      2>/dev/null | jq '{node: .node.nodeName, cpu: .node.cpu, memory: .node.memory}' \
-    || echo '{"error": "kubelet_unreachable"}'
+    # timeout(1) is the outer bound for the case where curl itself wedges.
+    kget() {  # $1 = path, $2 = body file; echoes the HTTP status (000 = no reply)
+      timeout -k 1 $((T + 2)) curl -sk --max-time "$T" \
+        --cert "$CERT" --key "$KEY" \
+        -o "$2" -w '%{http_code}' \
+        "https://127.0.0.1:10250$1" 2>/dev/null || printf '000'
+    }
+
+    SUM_CODE=$(kget /stats/summary "$W/sum.json")
+    HZ_CODE=$(kget /healthz "$W/hz.txt")
+    PODS_CODE=$(kget /pods "$W/pods.json")
+
+    SUM=$(jq -c '{node: .node.nodeName, cpu: .node.cpu, memory: .node.memory}' \
+            < "$W/sum.json" 2>/dev/null || echo null)
+    HZ=$(tr -d '[:space:]' < "$W/hz.txt" 2>/dev/null || echo "")
+
+    unread() { printf '{"state":"unreadable","answer":null,"reason":"%s"}' "$1"; }
+    na()     { printf '{"state":"not_applicable","answer":null,"reason":"%s"}' "$1"; }
+    answer() { printf '{"state":"answered","answer":"%s","reason":null}' "$1"; }
+
+    if [ "$ME" != "$NODE" ]; then
+      a_node=$(na question_targets_another_node)
+    elif [ "$HZ_CODE" = "200" ] && [ "$HZ" = "ok" ]; then
+      a_node=$(answer True)
+    elif [ "$HZ_CODE" = "200" ]; then
+      a_node=$(answer False)
+    else
+      a_node=$(unread "kubelet_healthz_http_${HZ_CODE}")
+    fi
+
+    if [ "$PODS_CODE" != "200" ]; then
+      a_pod=$(unread "kubelet_pods_http_${PODS_CODE}")
+      LOCAL='null'
+    elif ! jq -e '(.items | type) == "array"' < "$W/pods.json" >/dev/null 2>&1; then
+      a_pod=$(unread kubelet_pods_unparseable)
+      LOCAL='null'
+    else
+      LOCAL=$(jq -c '[.items[] | {name: .metadata.name,
+                                  namespace: .metadata.namespace,
+                                  node: .spec.nodeName,
+                                  phase: .status.phase}]' \
+                < "$W/pods.json" 2>/dev/null || echo null)
+      if jq -e --arg p "$POD" --arg n "$NS" \
+           'any(.items[]?; .metadata.name == $p and .metadata.namespace == $n)' \
+           < "$W/pods.json" >/dev/null 2>&1; then
+        a_pod=$(answer "$ME")
+      else
+        a_pod=$(na pod_not_on_this_node)
+      fi
+    fi
+
+    a_eps=$(na kubelet_has_no_service_view)
+
+    jq -cn \
+      --argjson sum "${SUM:-null}" \
+      --argjson local "${LOCAL:-null}" \
+      --arg cred "$CREDENTIAL" \
+      --arg hz "${HZ:-}" \
+      --arg hzc "$HZ_CODE" --arg pc "$PODS_CODE" --arg sc "$SUM_CODE" \
+      --argjson a1 "$a_node" --argjson a2 "$a_pod" --argjson a3 "$a_eps" \
+      '($sum // {}) + {
+         credential: $cred,
+         healthz: (if ($hz | length) > 0 then $hz else null end),
+         http: { summary: $sc, healthz: $hzc, pods: $pc },
+         local_pods: $local,
+         answers: { node_ready: $a1,
+                    stateful_pod_node: $a2,
+                    stateless_endpoint_set: $a3 }
+       }
+       | (if $sum == null then . + {error: "kubelet_unreachable"} else . end)'
   register: kubelet_local_status
   when: inventory_hostname in groups['workers'] or inventory_hostname in groups['control_plane']
   ignore_errors: yes
@@ -302,27 +634,166 @@
 # change of vantage point is visible in the data rather than silent.
 
 - name: Probe service reachability from inside the cluster
+  # Extended for REVIEW.md M2: this is now the `client:in-cluster-probe`
+  # observer. The HTTP code is kept exactly as it was (check-invariants.sh I2
+  # reads .external_probe.httpCode), and the probe additionally answers the
+  # endpoint-set question from the KUBE-PROXY DATAPLANE on this host rather
+  # than from any API server.
+  #
+  # That is the point of having it in the roster: every other endpoint answer
+  # in the snapshot is an API read, so they can only disagree with each other
+  # about what the control plane BELIEVES. The nat table is what a client's
+  # connection is actually load-balanced across, and S20 exists precisely to
+  # produce the case where the two differ — endpoints published and Ready while
+  # no client can reach them.
+  #
+  # Reading it is deliberately conservative:
+  #   no KUBE-SVC chains at all      -> unreadable (kube-proxy not in iptables
+  #                                     mode, or iptables-save failed). Never
+  #                                     "<absent>", which would read as a
+  #                                     positive observation that the Service
+  #                                     has no backends.
+  #   chains exist, none for the svc -> answered "<absent>"
+  #   chains for the svc, no DNAT    -> answered "<empty>"
   shell: |
     set -u
     export KUBECONFIG=/etc/kubernetes/admin.conf
-    SVC_IP=$(kubectl get svc {{ stateless_app_name }} -n {{ stateful_app_namespace }} \
+    T={{ observer_probe_timeout | default(3) }}
+    SVC='{{ observer_question_service }}'
+    NS='{{ observer_question_namespace }}'
+
+    unread() { printf '{"state":"unreadable","answer":null,"reason":"%s"}' "$1"; }
+    na()     { printf '{"state":"not_applicable","answer":null,"reason":"%s"}' "$1"; }
+    answer() { printf '{"state":"answered","answer":"%s","reason":null}' "$1"; }
+
+    SVC_IP=$(timeout -k 1 $((T + 2)) kubectl get svc "$SVC" -n "$NS" \
       -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+
     if [ -z "$SVC_IP" ]; then
-      echo '{"service": "{{ stateless_app_name }}", "clusterIP": null, "httpCode": null, "probe_source": "in_cluster", "error": "no_clusterIP"}'
-      exit 0
-    fi
-    code=$(curl -sk --max-time 3 "http://$SVC_IP/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "")
-    if [ -z "$code" ]; then
-      code_json=null
+      CLUSTER_IP=null
+      CODE_JSON=null
+      ERRFIELD='"error": "no_clusterIP",'
     else
-      # curl writes 000 on a failed connection; strip the leading zeros so the
-      # value is valid JSON (and a real, countable failure rather than null).
-      code_json=$((10#$code))
+      CLUSTER_IP="\"$SVC_IP\""
+      ERRFIELD=""
+      code=$(curl -sk --max-time "$T" "http://$SVC_IP/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "")
+      if [ -z "$code" ]; then
+        CODE_JSON=null
+      else
+        # curl writes 000 on a failed connection; strip the leading zeros so the
+        # value is valid JSON (and a real, countable failure rather than null).
+        CODE_JSON=$((10#$code))
+      fi
     fi
-    echo "{\"service\": \"{{ stateless_app_name }}\", \"clusterIP\": \"$SVC_IP\", \"httpCode\": $code_json, \"probe_source\": \"in_cluster\"}"
+
+    a_node=$(na client_has_no_node_condition_view)
+    a_pod=$(na client_has_no_pod_placement_view)
+
+    if [ '{{ observer_dataplane_endpoints | default(true) | bool | ternary(1, 0) }}' != '1' ]; then
+      a_eps=$(na dataplane_endpoint_read_disabled)
+      DP='[]'
+    else
+      NAT=$(timeout -k 1 $((T + 2)) iptables-save -t nat 2>/dev/null || echo "")
+      if ! printf '%s' "$NAT" | grep -q 'KUBE-SVC-'; then
+        a_eps=$(unread kube_proxy_iptables_unavailable)
+        DP='[]'
+      elif ! printf '%s' "$NAT" | grep -q -- "$NS/$SVC"; then
+        a_eps=$(answer '<absent>')
+        DP='[]'
+      else
+        IPS=$(printf '%s' "$NAT" \
+          | awk -v pat="$NS/$SVC" 'index($0, pat) > 0 && index($0, "--to-destination") > 0 {
+                for (i = 1; i <= NF; i++)
+                  if ($i == "--to-destination") { split($(i + 1), a, ":"); print a[1] }
+              }' \
+          | sort -u)
+        DP=$(printf '%s\n' "$IPS" | grep -v '^$' | jq -R . | jq -sc . 2>/dev/null || echo '[]')
+        if [ -z "$IPS" ]; then
+          a_eps=$(answer '<empty>')
+        else
+          a_eps=$(answer "$(printf '%s' "$IPS" | tr '\n' ',' | sed 's/,$//')")
+        fi
+      fi
+    fi
+
+    jq -cn \
+      --arg svc "$SVC" \
+      --argjson clusterip "$CLUSTER_IP" \
+      --argjson code "$CODE_JSON" \
+      --argjson dp "${DP:-[]}" \
+      --argjson a1 "$a_node" --argjson a2 "$a_pod" --argjson a3 "$a_eps" \
+      '{ service: $svc,
+         clusterIP: $clusterip,
+         httpCode: $code,
+         probe_source: "in_cluster",
+         dataplane_endpoints: $dp,
+         answers: { node_ready: $a1,
+                    stateful_pod_node: $a2,
+                    stateless_endpoint_set: $a3 } }
+       | (if $clusterip == null then . + {error: "no_clusterIP"} else . end)'
   register: service_probe
   delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
   run_once: true
+  ignore_errors: yes
+  ignore_unreachable: yes
+
+# ── In-cluster informer observer ──────────────────────────────────────────────
+# The informer is a Job created by tasks/trace-start.yml and destroyed by
+# tasks/trace-stop.yml; see the lifecycle note in inventory/group_vars/all.yml.
+# It is the only observer in the roster that reaches the control plane the way
+# an in-cluster controller does — through the kubernetes.default.svc ClusterIP,
+# so kube-proxy, not the operator, chooses which API server answers.
+#
+# Reading it is a plain `kubectl logs --tail=1`, which means a snapshot taken
+# while the informer does not exist (any scenario that never starts the trace)
+# records state:"unreadable", reason:"informer_absent". That is missing data
+# and is scored as missing data; it never becomes agreement.
+#
+# A line older than observer_informer_max_age_ms is also unreadable: the
+# informer is MEANT to lag (that lag is a measurement), but a line minutes old
+# is a dead pod, not a lag, and believing it would silently pin an observer to
+# a stale answer for the rest of the run.
+
+- name: Collect the in-cluster informer's view
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    T={{ observer_informer_timeout | default(6) }}
+    JOB='{{ informer_object_name }}'
+    NSI='{{ observer_informer_namespace }}'
+    MAXAGE={{ observer_informer_max_age_ms | default(15000) }}
+
+    LINE=$(timeout -k 1 "$T" kubectl -n "$NSI" logs "job/$JOB" --tail=1 \
+             --request-timeout="${T}s" 2>/dev/null | tail -1 || echo "")
+
+    if [ -z "$LINE" ]; then
+      printf '{"ok":false,"reason":"informer_absent","source":null,"job":"%s"}' "$JOB"
+      exit 0
+    fi
+    if ! printf '%s' "$LINE" | jq -e 'type == "object" and has("answers")' >/dev/null 2>&1; then
+      printf '{"ok":false,"reason":"informer_line_unparseable","source":null,"job":"%s"}' "$JOB"
+      exit 0
+    fi
+
+    NOW=$(date -u +%s%3N)
+    printf '%s' "$LINE" | jq -c \
+      --argjson now "$NOW" --argjson maxage "$MAXAGE" --arg job "$JOB" \
+      '((.ts_epoch_ms // null) as $t
+        | (if $t == null then null else ($now - $t) end)) as $age
+       | { ok: (($age != null) and ($age <= $maxage)),
+           reason: (if $age == null then "informer_line_untimestamped"
+                    elif $age > $maxage then "informer_stale"
+                    else null end),
+           source: (.source // null),
+           job: $job,
+           read_mode: (.read_mode // null),
+           resource_versions: (.resource_versions // null),
+           cache_age_ms: $age,
+           answers: .answers }'
+  register: informer_view
+  delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+  run_once: true
+  when: observer_informer_enabled | default(true) | bool
   ignore_errors: yes
   ignore_unreachable: yes
 
@@ -348,9 +819,32 @@
   run_once: true
 
 - name: Assemble per-API-server observer views
+  # A control-plane node whose view task produced nothing — unreachable host,
+  # a shell that died mid-write — used to be REJECTED from .observers[] and
+  # simply vanish from the snapshot. That shrinks the observer roster exactly
+  # when a partition removes an observer, and a smaller roster of observers
+  # that all agree reads as consensus. It is the single most dangerous shape
+  # this data can take, so a missing view is materialised as an explicit
+  # ok:false, answers:null entry instead: the roster is the same size in every
+  # snapshot of a run, and the missing observer is visibly missing.
+  #
+  # ok:false and answers:null are what files/disagreement.jq turns into three
+  # `unreadable` answers, which are excluded from every pairwise comparison.
+  # check-invariants.sh's I5 already selects `.ok == true`, so it is unaffected.
   set_fact:
     observer_views: "{{ observer_views | default([]) + [
-      hostvars[item]['apiserver_view']['stdout'] | default('') | trim
+      (hostvars[item]['apiserver_view']['stdout'] | default('') | trim)
+      if ((hostvars[item]['apiserver_view']['stdout'] | default('') | trim) | length) > 0
+      else ({
+        'host': item,
+        'server': 'https://' ~ hostvars[item]['ansible_host'] ~ ':6443',
+        'ok': false,
+        'probe_rv_quorum': none,
+        'probe_rv_cache': none,
+        'node_ready': none,
+        'cert_fingerprint': none,
+        'answers': none
+      } | to_json)
     ] }}"
   loop: "{{ groups['control_plane'] }}"
   delegate_to: "{{ groups['observer'][0] }}"
@@ -382,14 +876,78 @@
         "etcd": {
           "member_status": {{ etcd_status.stdout | default('null', true) }},
           "current_revision": {{ etcd_revision.stdout | default('null', true) }},
-          "expected_members": {{ groups['etcd'] | length }}
+          "expected_members": {{ groups['etcd'] | length }},
+          "quorum_read": {{ etcd_quorum_view.stdout | default('null', true) }}
         },
         "control_plane": {{ cp_state.stdout | default('null', true) }},
         "nodes": {{ node_snapshots | to_json }},
         "observers": [ {{ observer_views | default([]) | reject('equalto', '') | join(', ') }} ],
-        "external_probe": {{ service_probe.stdout | default('null', true) }}
+        "external_probe": {{ service_probe.stdout | default('null', true) }},
+        "informer": {{ informer_view.stdout | default('null', true) }}
       }
   delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+
+# ── Derive the pairwise disagreement matrix ───────────────────────────────────
+# REVIEW.md M2's first output. Everything above COLLECTS; this step only
+# DERIVES, from the snapshot that was just written, and splices the result back
+# into the same file so there is exactly one artefact per snapshot and no
+# second source of truth for M4 to reconcile.
+#
+# Two members are added and nothing is changed or removed:
+#   .observer_answers  the flat observer roster with every observer's answer to
+#                      every question, each tagged answered / unreadable /
+#                      not_applicable;
+#   .disagreement      schema "observer-disagreement/v1" — the pairwise matrix,
+#                      per-question counts and a per-snapshot summary.
+# The full contract, including the canonical answer domains and the rule that
+# only answered/answered pairs are ever comparable, is documented at the top of
+# files/disagreement.jq.
+#
+# It runs on the observer (the macOS control machine), which has jq and is the
+# only host guaranteed to be reachable — the derivation must not fail because a
+# cluster node is partitioned, since a partition is exactly when the matrix is
+# worth having. Written to a temp file and moved into place so an interrupted
+# run cannot leave a half-written snapshot behind.
+#
+# It never fails the play: a scenario that produced a snapshot but no matrix is
+# strictly better than a scenario that aborted at metrics collection with its
+# fault still injected.
+
+- name: Derive the pairwise observer disagreement matrix for this snapshot
+  shell: |
+    set -u
+    SNAP='{{ results_dir }}/snapshot_{{ snapshot_label }}.json'
+    TMP="$SNAP.tmp.$$"
+    if jq -f '{{ role_path }}/files/disagreement.jq' \
+         --arg subject_node '{{ observer_question_node }}' \
+         --arg subject_pod '{{ observer_question_pod }}' \
+         --arg subject_service '{{ observer_question_service }}' \
+         "$SNAP" > "$TMP" 2>/dev/null && [ -s "$TMP" ]; then
+      mv "$TMP" "$SNAP"
+      echo DERIVED
+    else
+      rm -f "$TMP"
+      echo NOT_DERIVED
+      exit 1
+    fi
+  register: disagreement_derive
+  delegate_to: "{{ groups['observer'][0] }}"
+  run_once: true
+  changed_when: false
+  ignore_errors: yes
+
+- name: Report that the disagreement matrix could not be derived
+  # Loud, but not fatal — see above. A missing .disagreement in a snapshot is
+  # unambiguous to a consumer; a snapshot silently replaced by an empty file
+  # would not be.
+  debug:
+    msg: >-
+      metrics-collect: could not derive the disagreement matrix for
+      snapshot '{{ snapshot_label }}'. The snapshot itself is intact and still
+      carries every observer's raw answers; only .observer_answers and
+      .disagreement are missing.
+  when: (disagreement_derive.rc | default(1)) != 0
   run_once: true
 
 - name: Append snapshot label to run index

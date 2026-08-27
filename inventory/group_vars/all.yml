@@ -144,3 +144,124 @@ stateless_app_name: nginx-stateless
 stateless_app_replicas: 3
 stateful_app_name: postgres-stateful
 stateful_app_namespace: default
+
+# ── Explicit observer set (REVIEW.md M2) ──────────────────────────────────────
+# The paper is titled *Observer-Relative Failures*, but until now almost every
+# measurement came from ONE API server (metrics_cp_host, cp2) plus node-local
+# crictl: the observer-relativity was asserted, not measured. metrics-collect
+# now asks the SAME three questions of EVERY observer at each snapshot and
+# derives a pairwise disagreement matrix from the answers
+# (roles/metrics-collect/files/disagreement.jq), and the 1 Hz recorder asks the
+# three API servers the same three questions every tick so a disagreement can
+# be reported as a DURATION rather than as a snapshot-grid boolean
+# (scripts/observer-disagreement-duration.sh).
+#
+# Observers: apiserver:cp1/cp2/cp3 (addressed on their own IPs, never through
+# the VIP), etcd:quorum (linearizable etcdctl get on the registry keys),
+# kubelet:<node> (:10250), cri:<node> (crictl), informer:in-cluster and
+# client:in-cluster-probe.
+#
+# The three questions, and their canonical answer domains, are documented in
+# roles/metrics-collect/files/disagreement.jq. Changing a subject below changes
+# what is asked; it does not change the schema.
+
+observer_question_node: worker1
+observer_question_pod: "{{ stateful_app_name }}-0"
+observer_question_service: "{{ stateless_app_name }}"
+observer_question_namespace: "{{ stateful_app_namespace }}"
+
+# Every observer query is bounded twice: a client-side deadline and an external
+# timeout(1). Both are far shorter than the snapshot cadence (30-60 s), because
+# S22 deliberately SIGSTOPs a kubelet and a frozen kubelet completes the TCP
+# handshake in the kernel and then never answers — an unbounded read would
+# stall the whole snapshot, and ignore_errors cannot rescue a hang.
+observer_view_timeout: 5s    # kubectl --request-timeout for the API-server views
+observer_hard_timeout: 8     # s, timeout(1) around each API-server view command
+observer_kubelet_timeout: 5  # s, curl --max-time against :10250
+observer_etcd_timeout: 5     # s, etcdctl dial/command timeout for the quorum read
+observer_informer_timeout: 6 # s, kubectl logs against the informer pod
+observer_probe_timeout: 3    # s, curl --max-time for the in-cluster HTTP probe
+
+# The client observer answers "what is the endpoint set of nginx-stateless" from
+# the kube-proxy DATAPLANE on the probe host (the KUBE-SVC / KUBE-SEP chains in
+# the nat table), not from the API server. That is the set a client's connection
+# can actually land on, and it is the one endpoint view in the roster that is
+# not an API read. Set false to skip it; the client observer then answers
+# not_applicable for that question rather than guessing.
+observer_dataplane_endpoints: true
+
+# ── In-cluster informer observer ──────────────────────────────────────────────
+# A Job in kube-system that reads nodes / the stateful pod / the service
+# endpoints from INSIDE the cluster: a projected ServiceAccount token, through
+# the kubernetes.default.svc ClusterIP, so KUBE-PROXY — not the operator —
+# decides which API server answers. That is the property that makes it a
+# distinct observer, and no other entry in the roster exercises that path: the
+# per-API-server views are pinned to one node's address each, and the snapshot's
+# bundled read is pinned to metrics_cp_host.
+#
+# It issues ordinary (linearizable) reads with `kubectl -o jsonpath`, not
+# resourceVersion=0 watch-cache reads: the image carries no jq, and parsing
+# `get --raw` bodies with sed would be brittle in exactly the failure modes this
+# observer exists to survive. Watch-cache lag is already measured directly, per
+# API server, by .observers[].probe_rv_cache in the snapshot. Each line records
+# the resourceVersion of all three objects, so the informer's own lag against
+# the API-server views remains computable.
+#
+# It prints one JSON line per interval; snapshots read the last line with
+# `kubectl logs --tail=1`.
+#
+# LIFECYCLE — the pod is created ONLY by tasks/trace-start.yml and removed by
+# tasks/trace-stop.yml, and it cannot outlive its scenario even if the stop
+# never runs:
+#   1. reap-on-start deletes any informer left by an earlier run before this
+#      one is created (same mechanism the trace recorder uses);
+#   2. activeDeadlineSeconds (observer_informer_max_seconds) makes the cluster
+#      itself terminate the Job;
+#   3. ttlSecondsAfterFinished makes the TTL controller DELETE the Job and its
+#      pod afterwards, with no Ansible involvement at all;
+#   4. tasks/trace-stop.yml deletes it explicitly.
+# Set false to never create it; the informer observer then reports
+# state:"unreadable", reason:"informer_absent" in every snapshot, which is
+# honest missing data rather than silent agreement.
+observer_informer_enabled: true
+observer_informer_namespace: kube-system
+observer_informer_name: "k8s-obs-informer"
+# Already used in-cluster by scenarios/s5 and scenarios/s14, so it is a known
+# pullable image on this lab rather than a new dependency.
+observer_informer_image: bitnami/kubectl:1.29
+# Seconds between the informer's own sampling loops. Deliberately slower than
+# the 1 Hz trace: the informer is consulted by snapshots (every 30-60 s), not
+# per tick, and each of its three reads is bounded at 0.30 x this so all three
+# fit inside one interval even when every one of them times out.
+observer_informer_interval: 3
+observer_informer_ttl_seconds: 120
+observer_informer_max_seconds: "{{ trace_max_seconds }}"
+# Seconds a logged informer line may be older than the snapshot before it is
+# reported as unreadable(informer_stale) instead of being believed. Generous
+# next to the 1 s interval: the informer is meant to be a LAGGING observer and
+# its lag is a measurement, but a line minutes old is a dead pod, not a lag.
+observer_informer_max_age_ms: 15000
+# Seconds trace-start waits for the informer pod to become Ready before giving
+# up. Non-fatal either way: an informer that never came up is recorded as
+# unreadable, not as agreement.
+observer_informer_ready_timeout: 60
+# Every Kubernetes object the informer needs is named this way, so the reap in
+# trace-start, the delete in trace-stop and the `kubectl logs job/...` in
+# snapshot.yml all address the same name without re-deriving it. run_id carries
+# an underscore, which is not legal in a DNS-1123 name, hence the replace.
+informer_object_name: "{{ observer_informer_name }}-{{ scenario_id }}-{{ run_id | replace('_', '-') | lower }}"
+
+# ── Per-API-server sampling inside the 1 Hz trace ─────────────────────────────
+# The M1 recorder samples ONE API server, so its records cannot show two
+# observers disagreeing. With this enabled the k8s stream additionally asks each
+# API server the three M2 questions every tick and appends an "observers" array
+# to each record; every pre-existing field keeps its exact name and meaning, so
+# the M1 schema is a subset and old consumers are unaffected.
+#
+# The queries are issued with curl and client certificates extracted once from
+# admin.conf into the recorder's 0700 working directory (removed by its exit
+# trap) rather than with kubectl: at 1 Hz, nine concurrent kubectl processes
+# would cost several hundred MB of RSS on the recorder's host every second,
+# while nine curls cost a few MB. Each is bounded by --max-time at 0.8 x the
+# tick and by timeout(1) at 0.9 x the tick, exactly like every other sub-query.
+trace_observers_enabled: true

@@ -210,6 +210,92 @@
              | map(attribute='item.stream') | list }}
       run_once: true
 
+    # ── In-cluster informer observer (REVIEW.md M2) ───────────────────────────
+    # Created HERE and nowhere else, and torn down by tasks/trace-stop.yml.
+    #
+    # It is deliberately tied to the trace rather than to the snapshot: the
+    # snapshot path has no counterpart to a create, so a snapshot that created
+    # this Job would have nothing that removes it. The trace has a matched
+    # start/stop pair, a reap-on-start sweep and a hard deadline, so the
+    # informer inherits all four of the guarantees the recorder already has —
+    # see templates/informer.yml.j2 for the full lifecycle argument.
+    #
+    # Consequence, stated plainly: a scenario that never starts the trace has no
+    # informer, and its snapshots record that observer as
+    # state:"unreadable", reason:"informer_absent". That is missing data and it
+    # is scored as missing data. It is never scored as agreement.
+
+    - name: Trace — reap any informer left by an earlier run
+      # Before creating this run's, exactly as the recorder sweep above does,
+      # and for the same reason: it does not depend on the earlier run's stop
+      # having executed. Cluster-scoped RBAC cannot be owned by a namespaced
+      # Job, so ownerReferences cannot do this — a label selector can.
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        SEL='app={{ observer_informer_name }}'
+        T={{ observer_informer_timeout | default(6) }}
+        kubectl --request-timeout="${T}s" -n {{ observer_informer_namespace }} \
+          delete job,serviceaccount -l "$SEL" --ignore-not-found --wait=false 2>/dev/null || true
+        kubectl --request-timeout="${T}s" \
+          delete clusterrole,clusterrolebinding -l "$SEL" --ignore-not-found --wait=false 2>/dev/null || true
+        echo REAPED
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      changed_when: false
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — render the in-cluster informer manifest
+      template:
+        src: informer.yml.j2
+        dest: "{{ trace_remote_dir }}/{{ informer_object_name }}.yml"
+        mode: '0600'
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      when: observer_informer_enabled | bool
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — create the in-cluster informer
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        T={{ observer_informer_timeout | default(6) }}
+        kubectl --request-timeout="${T}s" apply -f '{{ trace_remote_dir }}/{{ informer_object_name }}.yml'
+      register: informer_create
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      changed_when: false
+      when: observer_informer_enabled | bool
+      # Never fatal. The informer is one observer of many; a scenario that
+      # cannot create it is worth running with that observer marked unreadable,
+      # and is certainly not worth aborting with a fault already injected.
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — wait for the informer to start producing lines
+      # Bounded and non-fatal. If it never becomes Ready the snapshots record
+      # informer_absent, which is the correct reading.
+      shell: |
+        set -u
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl -n {{ observer_informer_namespace }} \
+          wait --for=condition=Ready pod \
+          -l job-name='{{ informer_object_name }}' \
+          --timeout={{ observer_informer_ready_timeout | default(60) }}s 2>/dev/null \
+          && echo READY || echo NOT_READY
+      register: informer_ready
+      delegate_to: "{{ trace_k8s_host }}"
+      run_once: true
+      changed_when: false
+      when:
+        - observer_informer_enabled | bool
+        - (informer_create.rc | default(1)) == 0
+      ignore_errors: yes
+      ignore_unreachable: yes
+
     - name: Trace — ensure the results directory exists on the observer
       file:
         path: "{{ results_dir }}"
@@ -229,6 +315,15 @@
             "scenario_id": "{{ scenario_id }}",
             "run_id": "{{ run_id }}",
             "trace_enabled": true,
+            "informer": {
+              "enabled": {{ (observer_informer_enabled | bool) | ternary('true', 'false') }},
+              "object_name": "{{ informer_object_name }}",
+              "namespace": "{{ observer_informer_namespace }}",
+              "created": {{ ((observer_informer_enabled | bool) and (informer_create.rc | default(1)) == 0) | ternary('true', 'false') }},
+              "ready": {{ ('READY' in (informer_ready.stdout | default(''))) | ternary('true', 'false') }},
+              "active_deadline_seconds": {{ observer_informer_max_seconds | int }},
+              "ttl_seconds_after_finished": {{ observer_informer_ttl_seconds | int }}
+            },
             "started_at": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
             "max_seconds": {{ trace_max_seconds | int }},
             "max_lines": {{ trace_max_lines | int }},
