@@ -71,7 +71,7 @@ resource "vsphere_folder" "vms" {
 # you run Ansible from your own machine against these VMs.
 #
 #   role           name        mgmt + pod octet   vCPU   RAM      disk
-#   control_plane  cp1..cp3     50 51 52           4      8 GB     60 GB
+#   control_plane  cp1..cp3     49 51 52           4      8 GB     60 GB
 #   workers        worker1..3   53 54 55           4      8 GB     60 GB
 #   etcd           etcd1..5     56 57 58 60 61     2      4 GB     40 GB
 #
@@ -82,12 +82,18 @@ resource "vsphere_folder" "vms" {
 # systemd flag (roles/k8s-install) — already iterates groups['etcd'], so
 # this map is the only place the member count is set.
 #
+# cp1 takes octet 49, not 50: 10.0.0.50 is already held by an unrelated VM
+# on the management network (the lab's Plex host), so the range has a hole
+# at .50 as well as at .59. The pod network (192.168.200.0/24) is used by
+# this cluster alone, so .49 there is free either way — the octet is kept
+# identical on both NICs to preserve the one-octet-per-host convention.
+#
 # Each VM gets the same host octet on both the management and pod networks.
 # ---------------------------------------------------------------------------
 
 locals {
   vm_specs = {
-    cp1     = { role = "control_plane", octet = 50, num_cpus = 4, memory = 8192, disk_size = 60 }
+    cp1     = { role = "control_plane", octet = 49, num_cpus = 4, memory = 8192, disk_size = 60 }
     cp2     = { role = "control_plane", octet = 51, num_cpus = 4, memory = 8192, disk_size = 60 }
     cp3     = { role = "control_plane", octet = 52, num_cpus = 4, memory = 8192, disk_size = 60 }
     worker1 = { role = "workers", octet = 53, num_cpus = 4, memory = 8192, disk_size = 60 }

@@ -12,7 +12,7 @@ and Ansible from your own machine.
 
 | Group         | VMs        | vCPU | RAM  | Disk  | Mgmt IP             |
 |---------------|------------|------|------|-------|---------------------|
-| control_plane | cp1–cp3    | 4    | 8 GB | 60 GB | 10.0.0.50–52        |
+| control_plane | cp1–cp3    | 4    | 8 GB | 60 GB | 10.0.0.49, .51–52   |
 | workers       | worker1–3  | 4    | 8 GB | 60 GB | 10.0.0.53–55        |
 | etcd          | etcd1–5    | 2    | 4 GB | 40 GB | 10.0.0.56–58, 60–61 |
 

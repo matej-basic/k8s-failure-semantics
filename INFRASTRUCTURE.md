@@ -12,7 +12,7 @@ the deploy flow.
 
 | Hostname | Role                    | vCPU | RAM  | Disk  | Mgmt IP   |
 |----------|-------------------------|------|------|-------|-----------|
-| cp1      | Control plane node 1    | 4    | 8 GB | 60 GB | 10.0.0.50 |
+| cp1      | Control plane node 1    | 4    | 8 GB | 60 GB | 10.0.0.49 |
 | cp2      | Control plane node 2    | 4    | 8 GB | 60 GB | 10.0.0.51 |
 | cp3      | Control plane node 3    | 4    | 8 GB | 60 GB | 10.0.0.52 |
 | worker1  | Worker node 1           | 4    | 8 GB | 60 GB | 10.0.0.53 |
@@ -62,7 +62,7 @@ Management network (first NIC). Each VM gets the same host octet on the pod
 network (`192.168.200.x`):
 
 ```
-cp1      10.0.0.50      worker1  10.0.0.53      etcd1  10.0.0.56
+cp1      10.0.0.49      worker1  10.0.0.53      etcd1  10.0.0.56
 cp2      10.0.0.51      worker2  10.0.0.54      etcd2  10.0.0.57
 cp3      10.0.0.52      worker3  10.0.0.55      etcd3  10.0.0.58
                                                 etcd4  10.0.0.60
