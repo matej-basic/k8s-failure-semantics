@@ -1,0 +1,204 @@
+---
+# roles/metrics-collect/tasks/trace-stop.yml
+# Stops the continuous recorder and brings its JSONL back to the observer.
+#
+#     - include_role: { name: metrics-collect }
+#       vars: { metrics_mode: trace-stop }
+#
+# Idempotent by construction. Every step is a no-op against a host with no
+# recorder on it: pkill matches nothing, the verification passes, and the fetch
+# is fail_on_missing:no. Calling trace-stop twice, or calling it in a scenario
+# that never called trace-start, is harmless — which matters, because the whole
+# point of a stop is that it can be put in an `always:` block or repeated
+# defensively without anyone having to reason about whether it already ran.
+#
+# It is deliberately NOT the only thing standing between a recorder and the next
+# scenario. See the five mechanisms documented at the top of trace-start.yml:
+# the recorder's own monotonic deadline, the timeout(1) wrapper, the
+# scenario-scoped output path and the reap-on-start sweep all hold even if this
+# file never executes — a partitioned host has no stop.
+
+- name: Trace — resolve this run's stream layout
+  set_fact:
+    trace_streams_resolved: "{{ trace_streams }}"
+  run_once: true
+
+- name: Trace — stop block
+  when: trace_enabled | bool
+  block:
+
+    - name: Trace — signal, escalate and verify that no recorder survives
+      # TERM first: the recorder handles it by finishing the record it is on and
+      # writing its footer, so a clean stop leaves a trace that is provably
+      # complete. bash defers the handler until the in-flight `sleep` returns,
+      # hence up to trace_etcd_interval of patience before escalating — 15 s is
+      # comfortably more than the 5 s etcd tick.
+      #
+      # Then SIGKILL, which cannot be caught, blocked or ignored. The final
+      # pgrep is the verification the task exits non-zero on: after a SIGKILL
+      # and a settle, a surviving match means an uninterruptible process, and
+      # that is worth shouting about rather than assuming away.
+      #
+      # 'k8s-failure-trace-recor[d]er' — bracketed so this shell's own command
+      # line does not match the pattern and kill the task running it.
+      shell: |
+        set -u
+        PAT='k8s-failure-trace-recor[d]er'
+        if ! pgrep -f "$PAT" >/dev/null 2>&1; then
+          echo "NONE_RUNNING"
+          exit 0
+        fi
+        pkill -TERM -f "$PAT" 2>/dev/null || true
+        i=0
+        while [ $i -lt 15 ]; do
+          pgrep -f "$PAT" >/dev/null 2>&1 || break
+          sleep 1
+          i=$((i + 1))
+        done
+        if pgrep -f "$PAT" >/dev/null 2>&1; then
+          pkill -KILL -f "$PAT" 2>/dev/null || true
+          sleep 2
+          if pgrep -f "$PAT" >/dev/null 2>&1; then
+            echo "SURVIVED_SIGKILL"
+            pgrep -af "$PAT" 2>/dev/null || true
+            exit 1
+          fi
+          echo "STOPPED_BY_SIGKILL"
+          exit 0
+        fi
+        echo "STOPPED_BY_SIGTERM"
+      register: trace_stop
+      loop: "{{ trace_streams_resolved | map(attribute='host') | unique | list }}"
+      loop_control: { label: "{{ item }}" }
+      delegate_to: "{{ item }}"
+      run_once: true
+      changed_when: false
+      # Never abort the scenario from here. A scenario's teardown play — the one
+      # that removes iptables DROP rules — usually runs AFTER metrics collection,
+      # and a failure here that skipped it would leave the fault in place and
+      # poison every scenario that follows. The survivor is reported loudly, the
+      # verdict is written to trace_stop.json, and trace_stop_strict is there for
+      # an operator who genuinely wants the run to stop.
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — ensure the results directory exists on the observer
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Trace — fetch each stream's JSONL back to the observer
+      # flat: yes so the file lands at exactly results_dir/<outfile> instead of
+      # under fetch's default per-host tree — the snapshots sit there as plain
+      # names and the trace should read the same way.
+      fetch:
+        src: "{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ item.stream }}.jsonl"
+        dest: "{{ results_dir }}/{{ item.outfile }}"
+        flat: yes
+        fail_on_missing: no
+        validate_checksum: no
+      register: trace_fetch
+      loop: "{{ trace_streams_resolved }}"
+      loop_control: { label: "{{ item.stream }} on {{ item.host }}" }
+      delegate_to: "{{ item.host }}"
+      run_once: true
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — fetch each recorder's own stderr log
+      # Small by design: the recorder sends every sub-query's stderr to
+      # /dev/null and writes nothing itself, so this file is empty on a healthy
+      # run and holds the reason on an unhealthy one.
+      fetch:
+        src: "{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ item.stream }}.log"
+        dest: "{{ results_dir }}/trace_{{ item.stream }}.log"
+        flat: yes
+        fail_on_missing: no
+        validate_checksum: no
+      loop: "{{ trace_streams_resolved }}"
+      loop_control: { label: "{{ item.stream }} on {{ item.host }}" }
+      delegate_to: "{{ item.host }}"
+      run_once: true
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — remove the remote JSONL now that it is safely on the observer
+      # Only for streams whose fetch reported success, so a failed fetch leaves
+      # the evidence on the node to be collected by hand. The cap on file size
+      # is trace_max_bytes, so even if every one of these leaks the node's
+      # exposure is bounded and lives under /var/tmp.
+      file:
+        path: "{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ item.item.stream }}.jsonl"
+        state: absent
+      loop: "{{ trace_fetch.results | default([]) | selectattr('dest', 'defined') | list }}"
+      loop_control: { label: "{{ item.item.stream }}" }
+      delegate_to: "{{ item.item.host }}"
+      run_once: true
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — record the stop verdict alongside the results
+      copy:
+        dest: "{{ results_dir }}/trace_stop.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "run_id": "{{ run_id }}",
+            "stopped_at": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "all_recorders_stopped": {{ ((trace_stop_survivors | length) == 0 and (trace_stop_unverified | length) == 0) | ternary('true', 'false') }},
+            "survivor_hosts": {{ trace_stop_survivors | to_json }},
+            "unverified_hosts": {{ trace_stop_unverified | to_json }},
+            "hosts": [
+              {% for r in (trace_stop.results | default([])) %}
+              {
+                "host": "{{ r.item }}",
+                "reachable": {{ (r.unreachable | default(false)) | ternary('false', 'true') }},
+                "verdict": "{{ (r.stdout | default('UNREACHABLE', true)).splitlines() | first | default('UNREACHABLE', true) }}"
+              }{{ "," if not loop.last else "" }}
+              {% endfor %}
+            ]
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Trace — shout if any recorder survived SIGKILL
+      debug:
+        msg: >-
+          metrics-collect: a trace recorder SURVIVED SIGKILL on
+          {{ trace_stop_survivors | join(', ') }}.
+          Its own monotonic deadline ({{ trace_max_seconds | int }}s) and the
+          timeout(1) wrapper still bound it, and the next scenario's
+          reap-on-start will sweep it, but investigate before trusting the next
+          run's trace.
+      when: (trace_stop_survivors | length) > 0
+      run_once: true
+
+    - name: Trace — abort the run because a recorder could not be stopped
+      # Off by default: see the reasoning on ignore_errors above — a scenario's
+      # fault teardown normally runs after this and must stay reachable. Set
+      # trace_stop_strict=true for a run where an unstoppable recorder should
+      # halt everything.
+      fail:
+        msg: >-
+          trace_stop_strict is set and a trace recorder survived SIGKILL on
+          {{ trace_stop_survivors | join(', ') }}.
+      when:
+        - trace_stop_strict | bool
+        - (trace_stop_survivors | length) > 0
+      run_once: true
+
+  vars:
+    # Survivors are hosts whose stop shell printed SURVIVED_SIGKILL. An
+    # unreachable host is NOT a survivor — nothing was observed there either
+    # way — and lands in trace_stop.json as reachable:false instead; its
+    # recorder is left to the monotonic deadline and the timeout(1) wrapper.
+    trace_stop_survivors: "{{ trace_stop.results | default([]) | selectattr('stdout', 'defined') | selectattr('stdout', 'search', 'SURVIVED_SIGKILL') | map(attribute='item') | list }}"
+    # Hosts the stop could not reach at all. Not survivors — nothing was seen
+    # there either way — but not clear either, so all_recorders_stopped is
+    # false and the analysis knows this run's trace teardown is unconfirmed.
+    # Whatever is on such a host is left to the recorder's own monotonic
+    # deadline, the timeout(1) wrapper, and the next scenario's reap-on-start.
+    trace_stop_unverified: "{{ trace_stop.results | default([]) | rejectattr('stdout', 'defined') | map(attribute='item') | list }}"

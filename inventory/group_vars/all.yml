@@ -22,6 +22,97 @@ observation_window: 120     # seconds we collect metrics after fault removal
 convergence_timeout: 300    # seconds we wait for semantic convergence
 poll_interval: 5            # seconds between observer state snapshots
 
+# ── Continuous trace recorder ─────────────────────────────────────────────────
+# REVIEW.md M1: the snapshots above are 30-60 s apart, but the mechanisms the
+# paper is about are faster than that — 15 s lease duration, 10 s lease renewal,
+# ~40 s node-monitor grace, sub-second endpoint and kube-proxy propagation. A
+# 30 s sampler cannot resolve a 15 s lease transition, so divergence onset and
+# duration were quantised to the snapshot grid. metrics-collect therefore also
+# runs a continuous recorder (metrics_mode: trace-start / trace-stop) that
+# writes timestamped JSONL for the whole scenario, so a verdict can be a
+# duration ("I1 violated for 143 s, t+62 -> t+205") instead of a boolean.
+#
+# The recorder is ADDITIVE. Setting trace_enabled: false disables it completely
+# and leaves the snapshot path — and therefore every existing scenario — exactly
+# as it was.
+
+trace_enabled: true
+
+# Seconds between samples of the Kubernetes stream. 1 Hz is chosen against the
+# 10 s lease renewal: it resolves a missed renewal within one renewal period.
+# Every kubectl call the recorder makes is bounded at 0.8 x this (client) and
+# 0.9 x this (external timeout(1)), so raising this loosens the timeouts with
+# it and lowering it below 1 tightens them proportionally.
+trace_interval: 1
+
+# Seconds between samples of the etcd stream, which is deliberately slower.
+# `etcdctl endpoint status` contacts all five members in one call, and a
+# partitioned member burns its dial timeout before the others are reported — a
+# sub-second budget shared across five endpoints would report an empty cluster
+# during exactly the scenarios (S19, S28) that need it most. REVIEW.md M1 asks
+# for a *periodic* etcd revision, not a 1 Hz one.
+trace_etcd_interval: 5
+
+# Slack added to fault_duration + observation_window to form the recorder's hard
+# deadline. It has to cover the whole scenario, not just the fault window: a
+# scenario's pauses, its snapshots (~20 SSH sessions each) and its teardown all
+# sit inside the trace. The longest scenario in the suite, S2, spends 480 s in
+# pauses and roughly 800 s wall-clock end to end; with S2's own 60 s / 120 s
+# timing this default gives it 1080 s. Raise it per-scenario if a scenario grows
+# past that — a trace that hits its deadline stops early and says so in its
+# footer (exit_reason: deadline_reached), it does not fail the run.
+trace_margin: 900
+
+# The hard wall-clock deadline itself, baked into the recorder at launch and
+# measured on the monotonic clock. Overridable per scenario.
+trace_max_seconds: "{{ (fault_duration | int) + (observation_window | int) + (trace_margin | int) }}"
+
+# Output bounds, enforced by the recorder as it writes so a long or wedged run
+# cannot fill a node's disk. 5000 records is ~83 minutes at 1 Hz — far beyond
+# any scenario, so in practice the deadline always trips first and the line cap
+# is the backstop for a mis-set trace_max_seconds. 32 MiB is the real ceiling:
+# a k8s record is ~2-4 KB (6 nodes, ~20 leases, an endpoint set), so a normal
+# 10-minute scenario produces roughly 1.5-2.5 MB.
+trace_max_lines: 5000
+trace_max_bytes: 33554432
+
+# Where recorders live on the cluster nodes before their output is fetched back
+# to the observer. /var/tmp rather than /tmp so a tmpfs /tmp cannot charge the
+# trace against RAM, and so the file survives for hand-collection if a fetch
+# fails.
+trace_remote_dir: /var/tmp/k8s-trace
+
+# false: a recorder that survives SIGKILL is reported loudly and written to
+# trace_stop.json, but does not fail the play. This is the safe default because
+# a scenario's fault-teardown play runs AFTER metrics collection, and a failure
+# here that skipped it would leave iptables DROP rules in place and poison every
+# scenario after it. Set true for a run where an unstoppable recorder should
+# halt everything.
+trace_stop_strict: false
+
+# Which host carries which stream.
+#   k8s  — cp2 by default, following the metrics_cp_host convention used by the
+#          snapshot path: cp1 holds the keepalived VIP and its sshd is bursty
+#          under load, and most scenarios partition cp1 anyway.
+#   etcd — the first etcd member, because the etcd client certificates in
+#          /etc/etcd/pki exist ONLY on etcd nodes.
+# A scenario that partitions cp2 should override metrics_cp_host, exactly as it
+# already must for the snapshots.
+trace_k8s_host: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+trace_etcd_host: "{{ groups['etcd'][0] }}"
+
+# One recorder process per entry. `outfile` is the name the stream lands under
+# in results_dir on the observer.
+trace_streams:
+  - stream: k8s
+    host: "{{ trace_k8s_host }}"
+    interval: "{{ trace_interval }}"
+    outfile: trace.jsonl
+  - stream: etcd
+    host: "{{ trace_etcd_host }}"
+    interval: "{{ trace_etcd_interval }}"
+    outfile: trace_etcd.jsonl
+
 # ── Container tooling ─────────────────────────────────────────────────────────
 # crictl (cri-tools) — CRI debug client used by metrics-collect for node-local
 # container truth. Compatible across adjacent k8s minors; v1.31 talks to the

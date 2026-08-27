@@ -1,0 +1,362 @@
+#!/bin/bash
+# roles/metrics-collect/templates/trace-recorder.sh.j2
+# Rendered per stream by roles/metrics-collect/tasks/trace-start.yml.
+#
+# Continuous high-resolution observer recorder (REVIEW.md M1). Runs detached on
+# ONE host and appends one JSON object per sample to a JSONL file. Everything
+# that governs its lifetime — deadline, caps, timeouts, output path — is baked
+# in HERE at render time; the running process reads no configuration and takes
+# no arguments, so it cannot be talked into running longer than it was born to.
+#
+# The marker string k8s-failure-trace-recorder appears in this script's path and
+# therefore in the recorder's argv; that is how trace-stop.yml finds it. Every
+# pgrep/pkill pattern that hunts for it is written 'k8s-failure-trace-recor[d]er'
+# so the hunting shell's own command line does not match the pattern and kill
+# itself.
+#
+# stream:   {{ trace_stream }}
+# host:     {{ trace_source_host }}
+# scenario: {{ scenario_id }} / run {{ run_id }}
+
+set -u
+
+# ── Identity, baked in ────────────────────────────────────────────────────────
+STREAM='{{ trace_stream }}'
+SOURCE_HOST='{{ trace_source_host }}'
+SCENARIO_ID='{{ scenario_id }}'
+RUN_ID='{{ run_id }}'
+OUT='{{ trace_stream_out }}'
+PIDFILE='{{ trace_stream_pidfile }}'
+
+# ── Lifetime and size bounds, baked in ────────────────────────────────────────
+# INTERVAL      seconds between ticks
+# MAX_SECONDS   hard wall-clock deadline; the loop exits when the MONOTONIC
+#               clock says this much time has elapsed since launch. Measured
+#               off /proc/uptime, not off date(1), so the clock-skew scenarios
+#               (S4, S23, S27) cannot push the deadline into the future by
+#               moving the wall clock backwards.
+# MAX_LINES     hard cap on records written.
+# MAX_BYTES     hard cap on bytes written, counted as we go (no stat(2) per
+#               sample). Whichever cap trips first ends the recording; the
+#               recorder exits cleanly and the file it leaves behind is valid
+#               JSONL, just short — with exit_reason in the footer saying so.
+INTERVAL={{ trace_stream_interval | int }}
+MAX_SECONDS={{ trace_max_seconds | int }}
+MAX_LINES={{ trace_max_lines | int }}
+MAX_BYTES={{ trace_max_bytes | int }}
+
+# ── Per-call timeouts, baked in ───────────────────────────────────────────────
+# Two nested bounds on every kubectl/etcdctl call, both STRICTLY SHORTER than
+# the sample interval:
+#   REQ_TIMEOUT   client-side (kubectl --request-timeout / etcdctl
+#                 --dial-timeout + --command-timeout) = 0.8 x interval
+#   HARD_TIMEOUT  external timeout(1) around the whole process = 0.9 x interval,
+#                 SIGKILL 0.2 s after that. This is the one that matters: a
+#                 client that hangs before it arms its own deadline (DNS, a TCP
+#                 connect to a blackholed VIP, a SIGSTOPped peer) is still
+#                 reaped from outside. roles/metrics-collect/tasks/snapshot.yml
+#                 carries the scar from the unbounded-curl version of this bug.
+# Sub-queries within one sample run CONCURRENTLY, so the wall-clock cost of a
+# sample is max(HARD_TIMEOUT) and not the sum — one hung query cannot stall the
+# trace or push out the next tick.
+REQ_TIMEOUT={{ '%.2f' | format(trace_stream_interval | float * 0.8) }}
+HARD_TIMEOUT={{ '%.2f' | format(trace_stream_interval | float * 0.9) }}
+
+WORKDIR="$(dirname "$OUT")/work-${STREAM}"
+mkdir -p "$WORKDIR" || exit 1
+: > "$OUT" || exit 1
+
+echo $$ > "$PIDFILE"
+
+cleanup() {
+  rm -rf "$WORKDIR" 2>/dev/null
+  rm -f "$PIDFILE" 2>/dev/null
+}
+trap cleanup EXIT
+
+# A SIGTERM from trace-stop must end the run at a RECORD boundary, so it sets a
+# flag the loop reads rather than exiting from inside the handler. bash defers
+# the handler until the foreground `sleep` returns, so the recorder stops within
+# one interval of the signal — trace-stop waits longer than that before it
+# escalates to SIGKILL. The payoff is that a normal stop still writes the
+# footer record; a trace with NO footer was killed, which is a different and
+# worth-knowing fact.
+STOP=0
+trap 'STOP=1' TERM INT HUP
+
+# ── Clocks ────────────────────────────────────────────────────────────────────
+# mono_ms is monotonic (seconds since boot, 10 ms resolution) and is the ONLY
+# clock used for scheduling, for the deadline and for t_rel_ms. The wall clock
+# is recorded alongside so records can be correlated with Kubernetes object
+# timestamps, but it never steers the loop.
+mono_ms() { awk '{ printf "%d", $1 * 1000 }' /proc/uptime; }
+wall_ms() { date -u +%s%3N; }
+wall_ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+
+START_MONO=$(mono_ms)
+START_WALL=$(wall_ms)
+DEADLINE_MONO=$(( START_MONO + MAX_SECONDS * 1000 ))
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# jqf FILE FILTER — apply FILTER to FILE; echo compact JSON, or the literal
+# `null` if the file is absent/empty or jq cannot parse it, returning non-zero
+# in that case. Never emits partial output: jq's stdout is captured whole and
+# thrown away unless jq exited 0.
+jqf() {
+  local f="$1" filter="$2" out=""
+  if [ -s "$f" ]; then
+    out=$(jq -c "$filter" < "$f" 2>/dev/null) || out=""
+  fi
+  if [ -z "$out" ]; then
+    printf 'null'
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
+# The samplers run inside a command substitution, i.e. a subshell, so the error
+# list has to travel out with the payload rather than in a variable the parent
+# could read. Each sampler therefore emits its own "errors" member as the last
+# field of the payload it prints.
+note_err() { ERRS="${ERRS}${ERRS:+,}\"$1\""; }
+
+# ── Kubernetes stream sampler ─────────────────────────────────────────────────
+
+KUBECONFIG=/etc/kubernetes/admin.conf
+export KUBECONFIG
+
+kc() {
+  timeout -k 0.2 "$HARD_TIMEOUT" kubectl --request-timeout="${REQ_TIMEOUT}s" "$@"
+}
+
+sample_k8s() {
+  local d="$WORKDIR"
+  ERRS=""
+  rm -f "$d/nodes.json" "$d/leases.json" "$d/eps.json" "$d/pg.json"
+
+  # Four independent reads fired concurrently. Independent so that one failing
+  # sub-query nulls only its own field instead of blanking the whole record —
+  # the same degradation contract tasks/snapshot.yml uses.
+  ( kc get nodes -o json                                                              > "$d/nodes.json"  2>/dev/null ) &
+  ( kc get leases --all-namespaces -o json                                            > "$d/leases.json" 2>/dev/null ) &
+  ( kc get endpoints {{ stateless_app_name }} -n {{ stateful_app_namespace }} -o json > "$d/eps.json"    2>/dev/null ) &
+  ( kc get pod {{ stateful_app_name }}-0 -n {{ stateful_app_namespace }} -o json      > "$d/pg.json"     2>/dev/null ) &
+  wait
+
+  local nodes ready_map leases eps pg rv
+  nodes=$(jqf "$d/nodes.json" '
+    [ .items[] | . as $n
+      | ([$n.status.conditions[]? | select(.type == "Ready")][0]) as $r
+      | { name: $n.metadata.name,
+          ready: ($r.status // "Missing"),
+          reason: ($r.reason // null),
+          last_transition: ($r.lastTransitionTime // null),
+          last_heartbeat: ($r.lastHeartbeatTime // null),
+          unschedulable: ($n.spec.unschedulable // false),
+          taints: [ $n.spec.taints[]? | (.key + ":" + (.effect // "")) ] } ]') \
+    || note_err nodes
+
+  # A flat name -> Ready map. Redundant with .nodes, deliberately: it is the
+  # field a duration analysis reads once per record, and computing it here
+  # saves the consumer re-deriving it several hundred times per scenario.
+  ready_map=$(jqf "$d/nodes.json" '
+    [ .items[] | { key: .metadata.name,
+                   value: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing") } ]
+    | from_entries')
+
+  # resourceVersion of a linearizable (quorum) list read. On this API server
+  # that number IS the etcd revision at the instant of the read, so the k8s
+  # stream gets a revision axis without needing etcd client certificates —
+  # which exist only on the etcd nodes. Authoritative per-member revisions come
+  # from the etcd stream.
+  rv=$(jqf "$d/nodes.json" '.metadata.resourceVersion // null')
+
+  # renew_age_ms is the whole reason for sampling leases at 1 Hz: a lease with
+  # leaseDurationSeconds 15 whose renewTime is 22 s old is an EXPIRED lease
+  # being observed, and a 30 s sampler can never see one. renewTime is a
+  # MicroTime ("...T10:11:12.123456Z") which jq's fromdateiso8601 refuses, so
+  # the fractional part is stripped before parsing, and try/catch keeps an
+  # unparseable value from nulling the whole lease object.
+  leases=$(jqf "$d/leases.json" '
+    def age($t): if $t == null then null
+                 else (try ((now - (($t | sub("\\.[0-9]+"; "")) | fromdateiso8601)) * 1000 | floor)
+                       catch null) end;
+    def shape: if . == null then null
+               else { holder: .spec.holderIdentity,
+                      acquire_time: .spec.acquireTime,
+                      renew_time: .spec.renewTime,
+                      lease_duration_seconds: .spec.leaseDurationSeconds,
+                      renew_age_ms: age(.spec.renewTime) } end;
+    { kube_controller_manager:
+        ([ .items[] | select(.metadata.namespace == "kube-system"
+                             and .metadata.name == "kube-controller-manager") ][0] | shape),
+      kube_scheduler:
+        ([ .items[] | select(.metadata.namespace == "kube-system"
+                             and .metadata.name == "kube-scheduler") ][0] | shape),
+      node_leases:
+        ([ .items[] | select(.metadata.namespace == "kube-node-lease")
+           | { key: .metadata.name, value: (. | shape) } ] | from_entries) }') \
+    || note_err leases
+
+  # core/v1 Endpoints, not EndpointSlice, to stay on the same object
+  # tasks/snapshot.yml reads — the two are meant to be comparable.
+  eps=$(jqf "$d/eps.json" '
+    { service: .metadata.name,
+      ready_addresses:
+        [ .subsets[]?.addresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ],
+      not_ready_addresses:
+        [ .subsets[]?.notReadyAddresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ] }
+    | .ready_count     = (.ready_addresses | length)
+    | .not_ready_count = (.not_ready_addresses | length)') \
+    || note_err endpoints
+
+  # found:false is a real observation (the pod object is gone from the API) and
+  # is deliberately distinct from a "stateful_pod" entry in .errors, which means
+  # the read itself failed. kubectl exiting non-zero with an empty body is
+  # ambiguous between NotFound and a timeout — the stderr that would separate
+  # them is discarded — so that case is recorded as found:false with
+  # read_failed:true and a consumer can decide how much to trust it.
+  pg=$(jqf "$d/pg.json" '
+    { found: true,
+      read_failed: false,
+      name: .metadata.name,
+      uid: .metadata.uid,
+      node: (.spec.nodeName // null),
+      phase: (.status.phase // null),
+      deletion_timestamp: (.metadata.deletionTimestamp // null),
+      ready: ([.status.conditions[]? | select(.type == "Ready") | .status][0] // null),
+      restart_count: ([.status.containerStatuses[]?.restartCount] | add // 0) }')
+  if [ "$pg" = "null" ]; then
+    if [ -s "$d/pg.json" ]; then
+      pg='{"found": false, "read_failed": true}'
+      note_err stateful_pod
+    else
+      pg='{"found": false, "read_failed": true}'
+    fi
+  fi
+
+  printf '"node_ready":%s,"nodes":%s,"leases":%s,"endpoints":%s,"stateful_pod":%s,"apiserver_resource_version":%s,"errors":[%s]' \
+    "$ready_map" "$nodes" "$leases" "$eps" "$pg" "$rv" "$ERRS"
+}
+
+# ── etcd stream sampler ───────────────────────────────────────────────────────
+# Runs on an etcd member because /etc/etcd/pki exists ONLY there. Sampled at
+# trace_etcd_interval (5 s by default, not 1 Hz): `endpoint status` contacts all
+# five members in one call and a partitioned member burns the dial timeout
+# before the rest are reported, so a 0.8 s budget shared across five endpoints
+# would report an empty cluster during exactly the scenarios that matter.
+# REVIEW.md M1 asks for a *periodic* etcd revision, not a 1 Hz one.
+
+sample_etcd() {
+  local d="$WORKDIR"
+  ERRS=""
+  rm -f "$d/etcd.json"
+  ETCDCTL_API=3 timeout -k 0.2 "$HARD_TIMEOUT" etcdctl \
+    --endpoints={{ etcd_endpoints }} \
+    --cacert={{ etcd_cert_dir }}/ca.crt \
+    --cert={{ etcd_cert_dir }}/server.crt \
+    --key={{ etcd_cert_dir }}/server.key \
+    --dial-timeout="${REQ_TIMEOUT}s" \
+    --command-timeout="${REQ_TIMEOUT}s" \
+    endpoint status --write-out=json > "$d/etcd.json" 2>/dev/null
+
+  # etcdctl exits non-zero when ANY endpoint fails but still prints the ones
+  # that answered, so the exit code is ignored and the body is what counts.
+  # Members missing from the array are members that did not answer inside the
+  # budget, and that absence is itself the measurement.
+  #
+  # member_id / leader_id are stringified AFTER jq has already parsed them as
+  # doubles, so a 64-bit etcd ID loses its last few digits. That is deliberate
+  # and harmless for what these fields are for: both IDs are mangled by the
+  # same function, so is_leader stays exact and leader_ids still separates one
+  # leader from two. Do not use them as etcd member identifiers.
+  local members rev leaders healthy
+  members=$(jqf "$d/etcd.json" '
+    [ .[] | { endpoint: .Endpoint,
+              member_id: (.Status.header.member_id | tostring),
+              revision: .Status.header.revision,
+              raft_term: .Status.header.raft_term,
+              raft_index: (.Status.raftIndex // null),
+              leader_id: (.Status.leader | tostring),
+              is_leader: ((.Status.leader | tostring) == (.Status.header.member_id | tostring)),
+              db_size: (.Status.dbSize // null),
+              alarms: [ .Status.errors[]? ] } ]') \
+    || note_err etcd
+
+  if [ "$members" = "null" ]; then
+    rev=null; leaders=null; healthy=0
+  else
+    rev=$(printf '%s' "$members"     | jq -c '[.[].revision] | max // null'   2>/dev/null || echo null)
+    # More than one distinct leader_id across the members is a split brain
+    # visible from a single vantage point (S19).
+    leaders=$(printf '%s' "$members" | jq -c '[.[].leader_id] | unique'       2>/dev/null || echo null)
+    healthy=$(printf '%s' "$members" | jq -r 'length'                         2>/dev/null || echo 0)
+  fi
+
+  printf '"etcd_revision":%s,"members":%s,"healthy_members":%s,"expected_members":%s,"leader_ids":%s,"errors":[%s]' \
+    "${rev:-null}" "$members" "${healthy:-0}" "{{ groups['etcd'] | length }}" "${leaders:-null}" "$ERRS"
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+# Tick-aligned, not sleep(INTERVAL)-chained: every tick is scheduled against
+# START_MONO + n*INTERVAL, so a slow sample steals time from its own tick and
+# not from every tick after it. If a sample overruns its tick entirely the
+# affected tick is SKIPPED rather than emitted late — .seq is the tick index,
+# so a gap in .seq is itself the record that the recorder could not keep up.
+
+lines=0
+bytes=0
+exit_reason=stopped_by_signal
+
+while : ; do
+  now=$(mono_ms)
+
+  if [ "$STOP" -ne 0 ];              then exit_reason=stopped_by_signal; break; fi
+  if [ "$now"   -ge "$DEADLINE_MONO" ]; then exit_reason=deadline_reached;  break; fi
+  if [ "$lines" -ge "$MAX_LINES" ];     then exit_reason=max_lines_reached; break; fi
+  if [ "$bytes" -ge "$MAX_BYTES" ];     then exit_reason=max_bytes_reached; break; fi
+
+  tick=$(( (now - START_MONO) / (INTERVAL * 1000) ))
+
+  ts=$(wall_ts)
+  wms=$(wall_ms)
+  payload=""
+  case "$STREAM" in
+    k8s)  payload=$(sample_k8s)  ;;
+    etcd) payload=$(sample_etcd) ;;
+  esac
+
+  done_mono=$(mono_ms)
+  rel=$(( now - START_MONO ))
+  # Positive when the wall clock has run ahead of elapsed monotonic time since
+  # launch — i.e. the size of any clock jump this host has taken mid-run. A
+  # flat 0 (give or take a few ms) means the wall clock is honest.
+  skew=$(( (wms - START_WALL) - rel ))
+
+  line="{\"stream\":\"${STREAM}\",\"scenario_id\":\"${SCENARIO_ID}\",\"run_id\":\"${RUN_ID}\",\"source_host\":\"${SOURCE_HOST}\",\"seq\":${tick},\"ts\":\"${ts}\",\"ts_epoch_ms\":${wms},\"t_rel_ms\":${rel},\"sample_ms\":$(( done_mono - now )),\"clock_offset_ms\":${skew},${payload}}"
+
+  printf '%s\n' "$line" >> "$OUT"
+  lines=$(( lines + 1 ))
+  bytes=$(( bytes + ${#line} + 1 ))
+
+  # Sleep to the next tick boundary that is still in the future. The inner loop
+  # is what turns an overrun into a skipped tick instead of accumulating drift.
+  after=$(mono_ms)
+  next=$(( START_MONO + (tick + 1) * INTERVAL * 1000 ))
+  while [ "$next" -le "$after" ]; do next=$(( next + INTERVAL * 1000 )); done
+  sleep "$(awk -v m=$(( next - after )) 'BEGIN { printf "%.3f", m / 1000 }')"
+done
+
+# Footer: same envelope, stream name suffixed "-end". A trace with NO footer was
+# SIGKILLed or died, which is exactly the difference between a truncated trace
+# and a complete one — and it is the difference a duration verdict must not get
+# wrong, because a trace that stops early looks identical to a violation that
+# never ended.
+printf '{"stream":"%s-end","scenario_id":"%s","run_id":"%s","source_host":"%s","seq":-1,"ts":"%s","ts_epoch_ms":%s,"t_rel_ms":%s,"records":%s,"bytes":%s,"exit_reason":"%s","interval_s":%s,"max_seconds":%s,"max_lines":%s,"max_bytes":%s}\n' \
+  "$STREAM" "$SCENARIO_ID" "$RUN_ID" "$SOURCE_HOST" "$(wall_ts)" "$(wall_ms)" \
+  "$(( $(mono_ms) - START_MONO ))" "$lines" "$bytes" "$exit_reason" \
+  "$INTERVAL" "$MAX_SECONDS" "$MAX_LINES" "$MAX_BYTES" >> "$OUT"
+
+exit 0

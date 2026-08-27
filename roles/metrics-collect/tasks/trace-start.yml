@@ -1,0 +1,264 @@
+---
+# roles/metrics-collect/tasks/trace-start.yml
+# Starts the continuous ~1 Hz observer recorder (REVIEW.md M1).
+#
+#     - include_role: { name: metrics-collect }
+#       vars: { metrics_mode: trace-start }
+#
+# One detached recorder process per stream, on one host each:
+#
+#   k8s   on metrics_cp_host (cp2 by default — cp1 holds the VIP and is bursty
+#         under SSH load, the same reason tasks/snapshot.yml delegates there)
+#         at trace_interval (1 s): node Ready conditions, the
+#         controller-manager / scheduler / node leases, the nginx-stateless
+#         endpoint set, postgres-stateful-0, and the API server's list
+#         resourceVersion.
+#
+#   etcd  on groups['etcd'][0], at trace_etcd_interval (5 s): per-member
+#         revision, raft term, leader and alarms. It runs there and not on the
+#         control plane because /etc/etcd/pki exists ONLY on etcd nodes.
+#
+# ── How this cannot outlive its scenario ──────────────────────────────────────
+# Five independent mechanisms, in order of when they fire:
+#
+#   1. REAP-ON-START (below). Before anything is launched, every host that will
+#      carry a recorder is swept for recorders left over from an EARLIER
+#      scenario, TERM then KILL, verified. This is the mechanism that actually
+#      protects a later scenario's data, because it does not depend on the
+#      earlier scenario's teardown having run at all.
+#   2. SCOPED OUTPUT PATH. Files are named {scenario_id}_{run_id}_{stream}.jsonl
+#      and only ever fetched by the scenario that owns the name. An orphan from
+#      S2 writes to S2's file; it cannot contaminate S3's trace even in the
+#      window before S3 reaps it. Cross-scenario corruption is structurally
+#      impossible, not merely unlikely.
+#   3. THE RECORDER'S OWN DEADLINE, baked into the rendered script at launch:
+#      trace_max_seconds (fault_duration + observation_window + trace_margin),
+#      measured on the MONOTONIC clock so the clock-skew scenarios cannot push
+#      it out. It also stops at trace_max_lines / trace_max_bytes.
+#   4. timeout(1) AROUND THE RECORDER, at deadline + 60 s, SIGKILL 30 s later.
+#      Independent of the script's own loop logic: if the loop is wedged (a
+#      hung `sleep`, a bash bug, an edited script) the kernel still ends it.
+#   5. THE EXPLICIT STOP, tasks/trace-stop.yml, which TERMs, waits, KILLs and
+#      then VERIFIES that no matching process survives.
+#
+# Mechanisms 3 and 4 are what cover the case the stop cannot: a host that is
+# unreachable at teardown time (partitioned, or the run aborted). Nothing in
+# this role relies on Ansible getting a chance to clean up.
+
+- name: Trace — resolve this run's stream layout
+  # Materialised as a fact so trace-start and trace-stop iterate over exactly
+  # the same list, and so the resolved host names land in trace_meta.json
+  # rather than being re-derived at read time.
+  set_fact:
+    trace_streams_resolved: "{{ trace_streams }}"
+  run_once: true
+
+- name: Trace — announce that tracing is disabled for this run
+  debug:
+    msg: "metrics-collect: trace_enabled is false — no continuous recorder started."
+  when: not (trace_enabled | bool)
+  run_once: true
+
+- name: Trace — start block
+  when: trace_enabled | bool
+  block:
+
+    - name: Trace — ensure the recorder working directory exists on each stream host
+      file:
+        path: "{{ trace_remote_dir }}"
+        state: directory
+        mode: '0700'
+      loop: "{{ trace_streams_resolved }}"
+      loop_control: { label: "{{ item.stream }} on {{ item.host }}" }
+      delegate_to: "{{ item.host }}"
+      run_once: true
+
+    - name: Trace — reap any recorder left over from an earlier scenario
+      # Mechanism 1. Runs BEFORE launch, unconditionally, on every stream host.
+      # Even if a previous scenario's stop never ran (aborted play, unreachable
+      # host, operator Ctrl-C), the next scenario cannot start while a stale
+      # recorder is still hammering the API server.
+      #
+      # The pattern is written 'k8s-failure-trace-recor[d]er' on purpose: this
+      # very shell's command line contains the pattern text, and an unbracketed
+      # pattern would match it, so pkill would kill the task that is running it.
+      # The bracketed form does not match itself.
+      shell: |
+        set -u
+        PAT='k8s-failure-trace-recor[d]er'
+        pkill -TERM -f "$PAT" 2>/dev/null || true
+        i=0
+        while [ $i -lt 8 ]; do
+          pgrep -f "$PAT" >/dev/null 2>&1 || break
+          sleep 1
+          i=$((i + 1))
+        done
+        if pgrep -f "$PAT" >/dev/null 2>&1; then
+          pkill -KILL -f "$PAT" 2>/dev/null || true
+          sleep 2
+        fi
+        if pgrep -f "$PAT" >/dev/null 2>&1; then
+          echo "STALE_RECORDER_SURVIVED_SIGKILL"
+          exit 1
+        fi
+        echo "CLEAR"
+      register: trace_reap
+      loop: "{{ trace_streams_resolved | map(attribute='host') | unique | list }}"
+      loop_control: { label: "{{ item }}" }
+      delegate_to: "{{ item }}"
+      run_once: true
+      changed_when: false
+      # A host that cannot be reached to be swept is a host that also cannot be
+      # given a new recorder, so the launch below simply fails there too and the
+      # run continues without that stream. It is never a reason to abort a
+      # scenario.
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — shout if a stale recorder could not be swept
+      # ignore_errors above keeps the sweep from aborting a scenario, but a
+      # recorder that shrugged off SIGKILL must not pass silently: it is the
+      # one failure mode that can contaminate a later run's API-server load,
+      # and it is the reason the output path is scenario-scoped in the first
+      # place.
+      debug:
+        msg: >-
+          metrics-collect: a STALE trace recorder survived SIGKILL on
+          {{ trace_reap.results | default([]) | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'search', 'STALE_RECORDER_SURVIVED_SIGKILL')
+             | map(attribute='item') | list | join(', ') }}
+          — this run's trace will coexist with it. Investigate before trusting
+          either trace.
+      when: >-
+        {{ (trace_reap.results | default([]) | selectattr('stdout', 'defined')
+            | selectattr('stdout', 'search', 'STALE_RECORDER_SURVIVED_SIGKILL')
+            | list | length) > 0 }}
+      run_once: true
+
+    - name: Trace — render the recorder for each stream
+      # Every knob is baked in at render time. The launched process reads no
+      # configuration and accepts no arguments, so its lifetime is fixed the
+      # moment this task runs.
+      template:
+        src: trace-recorder.sh.j2
+        dest: "{{ trace_remote_dir }}/k8s-failure-trace-recorder-{{ item.stream }}.sh"
+        mode: '0700'
+      vars:
+        trace_stream: "{{ item.stream }}"
+        trace_source_host: "{{ item.host }}"
+        trace_stream_interval: "{{ item.interval }}"
+        trace_stream_out: "{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ item.stream }}.jsonl"
+        trace_stream_pidfile: "{{ trace_remote_dir }}/{{ item.stream }}.pid"
+      loop: "{{ trace_streams_resolved }}"
+      loop_control: { label: "{{ item.stream }} on {{ item.host }}" }
+      delegate_to: "{{ item.host }}"
+      run_once: true
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — launch each recorder detached, under an external deadline
+      # setsid --fork puts the recorder in its own session, so it survives both
+      # the closing SSH channel and any sudo/pam_systemd session cleanup that
+      # would otherwise sweep the process group. nohup covers the SIGHUP.
+      # All three descriptors are redirected — without that the SSH channel
+      # never closes and Ansible blocks here for the whole scenario.
+      #
+      # timeout(1) is mechanism 4: deadline + 60 s of grace so the recorder's
+      # own (mechanism 3) deadline and footer normally win the race, then
+      # SIGKILL 30 s after that.
+      shell: |
+        set -u
+        SCRIPT='{{ trace_remote_dir }}/k8s-failure-trace-recorder-{{ item.stream }}.sh'
+        LOG='{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ item.stream }}.log'
+        : > "$LOG"
+        nohup setsid --fork \
+          timeout --kill-after=30 {{ (trace_max_seconds | int) + 60 }} \
+          bash "$SCRIPT" </dev/null >>"$LOG" 2>&1 &
+        sleep 1
+        if pgrep -f 'k8s-failure-trace-recor[d]er-{{ item.stream }}\.sh' >/dev/null 2>&1; then
+          echo "STARTED"
+        else
+          echo "NOT_RUNNING"
+          tail -5 "$LOG" 2>/dev/null
+          exit 1
+        fi
+      register: trace_launch
+      loop: "{{ trace_streams_resolved }}"
+      loop_control: { label: "{{ item.stream }} on {{ item.host }}" }
+      delegate_to: "{{ item.host }}"
+      run_once: true
+      changed_when: false
+      # A recorder that fails to start must not abort the scenario. The trace is
+      # additive; the snapshots are the load-bearing measurement and they are
+      # untouched by anything in this file. The failure is recorded in
+      # trace_meta.json instead, so the analysis can tell "no divergence" from
+      # "no recording".
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Trace — determine which streams actually came up
+      # selectattr('rc', 'defined') drops entries for a host that was
+      # unreachable: those results carry no rc at all, and map(attribute='rc')
+      # over them would raise inside the trace_meta.json template — turning a
+      # missing stream into a failed scenario, which is the opposite of what
+      # this role promises.
+      set_fact:
+        trace_started_streams: >-
+          {{ trace_launch.results | default([])
+             | selectattr('rc', 'defined')
+             | selectattr('rc', 'equalto', 0)
+             | map(attribute='item.stream') | list }}
+      run_once: true
+
+    - name: Trace — ensure the results directory exists on the observer
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Trace — record the recorder configuration alongside the results
+      # Written at START, not at stop, so it exists even if the run is aborted
+      # mid-scenario and the stop never happens. Consumers use .streams[].started
+      # to distinguish an absent trace file from an empty one.
+      copy:
+        dest: "{{ results_dir }}/trace_meta.json"
+        content: |
+          {
+            "scenario_id": "{{ scenario_id }}",
+            "run_id": "{{ run_id }}",
+            "trace_enabled": true,
+            "started_at": "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}",
+            "max_seconds": {{ trace_max_seconds | int }},
+            "max_lines": {{ trace_max_lines | int }},
+            "max_bytes": {{ trace_max_bytes | int }},
+            "external_deadline_seconds": {{ (trace_max_seconds | int) + 60 }},
+            "deadline_basis": "fault_duration({{ fault_duration | int }}) + observation_window({{ observation_window | int }}) + trace_margin({{ trace_margin | int }})",
+            "streams": [
+              {% for s in trace_streams_resolved %}
+              {
+                "stream": "{{ s.stream }}",
+                "host": "{{ s.host }}",
+                "interval_s": {{ s.interval | int }},
+                "request_timeout_s": {{ '%.2f' | format(s.interval | float * 0.8) }},
+                "hard_call_timeout_s": {{ '%.2f' | format(s.interval | float * 0.9) }},
+                "remote_path": "{{ trace_remote_dir }}/{{ scenario_id }}_{{ run_id }}_{{ s.stream }}.jsonl",
+                "local_file": "{{ s.outfile }}",
+                "started": {{ (s.stream in trace_started_streams) | ternary('true', 'false') }}
+              }{{ "," if not loop.last else "" }}
+              {% endfor %}
+            ]
+          }
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+
+    - name: Trace — report what is now recording
+      debug:
+        msg: >-
+          metrics-collect trace started on
+          {{ trace_started_streams | join(', ') | default('(none)', true) }}
+          — hard deadline {{ trace_max_seconds | int }}s,
+          external deadline {{ (trace_max_seconds | int) + 60 }}s,
+          caps {{ trace_max_lines | int }} lines / {{ trace_max_bytes | int }} bytes.
+      run_once: true
