@@ -92,6 +92,17 @@ octets in the `vm_specs` map if your network differs.
 - High-availability control plane: three API servers behind a keepalived
   virtual IP (`10.0.0.59`)
 
+Observation is taken from inside the lab, by `roles/metrics-collect`: the three
+API servers addressed at their own IPs rather than through the VIP, a
+linearizable etcd read, each kubelet at `:10250`, each node's CRI, an
+in-cluster HTTP probe of the stateless service, and — only while a trace is
+running — an informer Job in `kube-system` pinned to a control-plane node so it
+cannot take a worker slot. The workstation is **not** an observation point:
+ClusterIP CIDRs are not routable from it, which is what invalidated the earlier
+external probe. The 1 Hz trace recorder writes under `/var/tmp/k8s-trace` on
+cp2 and etcd1; no scenario starts it yet, so the informer is never created
+either. See the trace section of [`README.md`](README.md).
+
 ## Gray-failure scenarios (S20-S28)
 
 Added from `REVIEW.md` section 3. The original library covers clean crash-stop
@@ -122,6 +133,13 @@ Notes that matter before running these:
   they cannot yet certify their own efficacy through `check-invariants.sh` and
   carry scenario-local evidence files instead. The signals that would close
   that gap are listed in each scenario's header comment.
+- **The scenario IDs are not dense.** There is no S7, S9, S10, S13 or S16 —
+  the suite is 23 scenarios, S1–S28 with five holes that predate this
+  repository's first commit and are not explained anywhere in it. See
+  [Why the numbering has gaps](README.md#why-the-numbering-has-gaps) in
+  `README.md`; the same section covers the missing invariant IDs I7 and I8.
+- **None of S20–S28 has been executed yet.** They are syntax-checked and
+  reasoned about, not exercised.
 
 ## Reset Between Scenarios
 
@@ -138,3 +156,16 @@ check (`playbooks/_health-check.yml`), which clears any residual faults and
 waits for the cluster to settle. A full cluster reset (kubeadm reset + reinit)
 is available via `playbooks/reset-cluster.yml` for cases where a scenario
 leaves the cluster in an irrecoverable state.
+
+The stronger reset is a rollback rather than a teardown: `scripts/snapshot-baseline.sh`
+powers the fleet down, snapshots all 11 VMs **cold** and brings it back up, and
+`scripts/revert-baseline.sh --yes` restores every VM and restarts them in
+dependency order (etcd → control plane → workers, so the datastore has quorum
+before any API server looks for it). Restoring an identical starting state
+beats undoing a fault, because `_health-check.yml` can only remove faults it
+knows about. The snapshots are cold because vCenter has no cross-VM consistency
+group — snapshotting 11 running VMs captures 11 different instants, and a
+5-member etcd cluster restored that way can come back with members at different
+raft log positions. Reverting discards everything on the nodes since the
+snapshot, results included; pull those off with `scripts/aggregate-results.sh`
+first. Both scripts read the vCenter password from `terraform/terraform.tfvars`.
