@@ -37,6 +37,36 @@
       register: r
       until: r.rc == 0
 
+- name: "S6 Run {{ run_number }} — Start the continuous 1 Hz observer trace"
+  # The trace calls go in run-one.yml, not in playbook.yml, because run-one.yml
+  # IS S6's unit of repetition. playbook.yml imports it five times and
+  # scripts/repeat-scenario.sh drives it K times directly; wrapping the trace
+  # around the five imports would produce ONE recorder for the whole study,
+  # whose 1 Hz JSONL would span five faults, five resets and roughly 25 minutes
+  # of pauses — well past trace_max_seconds — and would be attributed to a
+  # single scenario_id. Per-iteration is also what the analysis wants: each
+  # iteration already carries its own scenario_id (s6_run<N>), its own
+  # results_dir (run_results_dir) and therefore its own trace file name, so the
+  # five traces are directly comparable, which is the whole point of S6.
+  #
+  # Started here, before the pre-fault snapshot of THIS iteration.
+  #
+  # results_dir is overridden exactly as the snapshot plays below override it,
+  # so trace_meta.json / trace.jsonl land in results/s6/<run_id>/run_<N>/ and
+  # not in a parallel results/s6_run<N> tree.
+  #
+  # metrics_mode is set in the include's `vars:` and NEVER as a play var — a
+  # play-level metrics_mode would leak into every snapshot call in the play and
+  # silence it. See the header of roles/metrics-collect/tasks/main.yml.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    results_dir: "{{ run_results_dir }}"
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { metrics_mode: trace-start }
+
 - name: "S6 Run {{ run_number }} — Pre-fault snapshot"
   hosts: k8s_cluster:etcd
   gather_facts: no
@@ -107,6 +137,25 @@
     results_dir: "{{ run_results_dir }}"
   roles:
     - role: metrics-collect
+
+- name: "S6 Run {{ run_number }} — Stop the continuous 1 Hz observer trace"
+  # After this iteration's fault has been lifted ("Lift fault" above) and after
+  # its last snapshot (post_recovery), so the trace spans the whole iteration
+  # and a failure in here cannot leave worker1's outbound DROP rules in place.
+  #
+  # Before the final extraction play rather than after it, so one flaky kubectl
+  # on cp1 cannot cost the iteration its trace. If it is skipped anyway, the
+  # recorder still ends on its own monotonic deadline, writes only to this
+  # ITERATION's file name (scenario_id is s6_run<N>), and is reaped by the next
+  # iteration's trace-start.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    results_dir: "{{ run_results_dir }}"
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { metrics_mode: trace-stop }
 
 - name: "S6 Run {{ run_number }} — Extract final state for comparison"
   hosts: "{{ groups['control_plane'][0] }}"

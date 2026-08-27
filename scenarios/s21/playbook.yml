@@ -73,6 +73,34 @@
 #                   it hears nothing and cp1 still owns the address), or to
 #                   ['cp1','cp2'] to split the group 2/1.
 
+- name: S21 — Start the continuous 1 Hz observer trace
+  # REVIEW.md M1/M2/M4 — this play is what makes that measurement chain live.
+  # metrics-collect's snapshot path is a 30-60 s grid, but the mechanisms this
+  # suite studies (15 s lease duration, 10 s renew, ~40 s node-monitor grace,
+  # sub-second endpoint and kube-proxy propagation) are all faster than it. The
+  # continuous ~1 Hz recorder is therefore started HERE, before the baseline
+  # snapshot, so its JSONL spans the whole fault window and opens with a
+  # pre-fault stretch to compare against.
+  #
+  # It is also the only thing that creates the in-cluster informer observer:
+  # without a trace that observer records as informer_absent in every snapshot,
+  # and every VIOLATED verdict comes back with duration_s: null.
+  #
+  # metrics_mode is set in the include's `vars:` and NEVER as a play var — a
+  # play-level metrics_mode would leak into every snapshot call in the play and
+  # silence it. See the header of roles/metrics-collect/tasks/main.yml.
+  #
+  # Purely additive: the recorder is detached, bounded by its own monotonic
+  # deadline and by timeout(1), and reaped on the next scenario's start.
+  # Nothing about this scenario's existing snapshots or fault timing changed.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s21
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { metrics_mode: trace-start }
+
 - name: S21 — Pre-flight baseline, node identity map and probe object
   hosts: k8s_cluster:etcd
   gather_facts: no
@@ -958,6 +986,37 @@
         name: metrics-collect
       vars:
         snapshot_label: post_restore_end
+
+- name: S21 — Stop the continuous 1 Hz observer trace
+  # Placed AFTER this scenario's fault teardown and after its last post-fault
+  # snapshot, and BEFORE the invariant report:
+  #   - after teardown, because a failure inside metrics collection that
+  #     skipped the teardown would leave the fault (iptables DROP rules, tc
+  #     qdiscs, toxics) in place and poison every scenario after this one. A
+  #     lost trace is recoverable; a stranded fault is not.
+  #   - before the invariant report, because trace-stop is what fetches
+  #     trace.jsonl back to the observer and writes disagreement_duration.json,
+  #     and check-invariants.sh reads both to put duration_s and
+  #     first_violation_ts onto the VIOLATED verdicts.
+  #
+  # A trailing play rather than the main play's `always:`: that always restores
+  # the VRRP split unconditionally, but S21's post-restoration snapshots live
+  # in a later play, so only a play after THAT one is both after the last
+  # snapshot and after the restore.
+  #
+  # trace-stop is idempotent and every step of it is non-fatal, so calling it
+  # against a recorder that already hit its own deadline is a no-op. If this
+  # play never runs at all — the run aborted earlier — the recorder still ends
+  # on its monotonic deadline, is killed by its timeout(1) wrapper, only ever
+  # writes to this scenario's own file name, and is reaped by the next
+  # scenario's trace-start.
+  hosts: k8s_cluster:etcd
+  gather_facts: no
+  vars:
+    scenario_id: s21
+  tasks:
+    - include_role: { name: metrics-collect }
+      vars: { metrics_mode: trace-stop }
 
 - name: S21 — Invariant evaluation report
   hosts: "{{ groups['observer'][0] }}"
