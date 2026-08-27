@@ -109,12 +109,36 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
 # cloud-init's `ssh` module regenerates any missing host key on first boot.
 rm -f /etc/ssh/ssh_host_*
 
-# Safety net in case cloud-init is ever disabled in a derived image: make sure
-# sshd can never start without host keys.
+# Host keys MUST exist before anything can start sshd. cloud-init's `ssh`
+# module also generates them, but it runs far too late to be relied on: on
+# the first fleet built from this template cloud-init wrote the keys at
+# 18:13:41.136 and sshd began listening at 18:13:41.626 — a 490 ms margin.
+# Four of eleven clones lost that race, came up with
+# "sshd: no hostkeys available -- exiting", hit the systemd start limit and
+# never retried, leaving connection-refused on port 22.
+#
+# The wiring below is load-bearing and easy to get wrong. An earlier version
+# of this unit used `Before=ssh.service ssh.socket` with
+# `WantedBy=multi-user.target`. That is an ordering CYCLE — multi-user.target
+# is ordered after sockets.target, which is ordered after ssh.socket — and
+# systemd resolves it by deleting the job outright:
+#
+#   ssh.socket: Found ordering cycle on regenerate-ssh-host-keys.service/start
+#   ssh.socket: Job regenerate-ssh-host-keys.service/start deleted to break
+#               ordering cycle starting with ssh.socket/start
+#
+# so the unit silently never ran on any node. DefaultDependencies=no plus
+# WantedBy=sysinit.target puts key generation before sockets.target is even
+# reached, which is early enough to close the race and cycle-free.
+#
+# Do not "simplify" this back to multi-user.target.
 cat > /etc/systemd/system/regenerate-ssh-host-keys.service <<'EOF'
 [Unit]
 Description=Regenerate missing SSH host keys on first boot
-Before=ssh.service ssh.socket
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=sysinit.target shutdown.target sockets.target ssh.socket ssh.service
+Conflicts=shutdown.target
 ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
 
 [Service]
@@ -123,9 +147,32 @@ ExecStart=/usr/bin/ssh-keygen -A
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target
 EOF
 systemctl enable regenerate-ssh-host-keys.service
+
+# Belt and braces, independent of the unit above: generate the keys from
+# sshd's own units too, so a missing key can never keep sshd down even if
+# the ordering is defeated again. ExecStartPre is a no-op once keys exist.
+# NB: the section differs per unit type — a .socket unit has no [Service]
+# section, and systemd rejects one with "Unknown section".
+mkdir -p /etc/systemd/system/ssh.service.d /etc/systemd/system/ssh.socket.d
+cat > /etc/systemd/system/ssh.service.d/10-hostkeys.conf <<'EOF'
+[Service]
+ExecStartPre=/usr/bin/ssh-keygen -A
+EOF
+cat > /etc/systemd/system/ssh.socket.d/10-hostkeys.conf <<'EOF'
+[Socket]
+ExecStartPre=/usr/bin/ssh-keygen -A
+EOF
+
+# If sshd does fail, do not let it stay down permanently.
+mkdir -p /etc/systemd/system/ssh.service.d
+cat > /etc/systemd/system/ssh.service.d/20-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
 
 # ---------------------------------------------------------------------------
 # 4. Reset cloud-init so the clone is treated as a brand-new instance.
