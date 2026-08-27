@@ -65,7 +65,7 @@ ansible-playbook -i inventory/hosts.ini scenarios/s2/playbook.yml \
 ### Step 5 — Run all scenarios
 
 ```bash
-# Run everything in sequence (takes 2–3 hours)
+# Run everything in sequence (S1–S28; budget 4–5 hours)
 ansible-playbook -i inventory/hosts.ini playbooks/run-all-scenarios.yml \
   -e results_base=$(pwd)/results
 
@@ -136,6 +136,55 @@ terraform -chdir=terraform destroy
 | S17 | etcd compaction + watch history gap       | etcd_compact         | I5             |
 | S18 | Node pressure eviction race               | memory_pressure      | I1             |
 | S19 | Split etcd quorum                         | network_partition    | I1, I5         |
+
+### Gray-failure scenarios (S20–S28)
+
+S1–S19 cover clean crash-stop and timing failures. Production clusters mostly
+fail *gray* — the node stays Ready while nothing works — and these sample that
+region. Added from `REVIEW.md` section 3.
+
+| ID  | Name                                      | Fault type                | Key invariants |
+|-----|-------------------------------------------|---------------------------|----------------|
+| S20 | Pod-network partition, mgmt net intact    | pod_network_partition     | I2 †           |
+| S21 | Keepalived VIP split-brain                | vrrp_vip_split            | I1 †           |
+| S22 | containerd / kubelet freeze (SIGSTOP)     | process_freeze            | † (omission)   |
+| S23 | etcd NOSPACE                              | etcd_nospace              | I5, I6, I10 †  |
+| S24 | Admission webhook timeout (Fail vs Ignore)| admission_webhook_timeout | † (see note)   |
+| S25 | API priority-and-fairness starvation      | apf_priority_starvation   | † (see note)   |
+| S26 | Node object deleted, kubelet alive        | node_object_deleted       | I1 †           |
+| S27 | Negative / substrate clock skew           | clock_skew_negative       | I1, I3 †       |
+| S28 | Stale etcd member rejoining after compact | etcd_stale_member         | I5 †           |
+
+**† The invariant mapping for these is provisional.** Each of these faults
+deliberately leaves the substrate looking healthy — every node Ready, etcd
+quorum intact, all API servers answering — which is precisely what makes them
+interesting and also what the current invariant set cannot see. Several cannot
+yet certify their own efficacy through `check-invariants.sh`, because every
+efficacy signal is derived from `snapshot_*.json` and these faults leave that
+schema unchanged. They carry scenario-local evidence files instead, and each
+scenario header names the signal that would close the gap. Treat the column
+above as intent, not as a claim about what the checker currently reports.
+
+Two of them have a second variant that `run-all-scenarios.yml` does **not**
+run, because the variant is a play var the scenario defines itself and cannot
+be overridden from an `import_playbook`:
+
+```bash
+ansible-playbook -i inventory/hosts.ini scenarios/s22/playbook.yml -e s22_variant=kubelet
+ansible-playbook -i inventory/hosts.ini scenarios/s27/playbook.yml -e s27_variant=substrate
+```
+
+**S28 runs last and mutates etcd membership** — it removes a member, wipes its
+data directory and re-adds it as a learner. Take a baseline snapshot before it
+and revert afterwards:
+
+```bash
+scripts/snapshot-baseline.sh          # cold snapshot of all 11 VMs
+scripts/revert-baseline.sh --yes      # roll the fleet back
+```
+
+None of S20–S28 has been executed yet. They are syntax-checked and reasoned
+about, not exercised.
 
 ---
 
