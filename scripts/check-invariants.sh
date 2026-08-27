@@ -1,16 +1,19 @@
 #!/bin/bash
 # scripts/check-invariants.sh
-# Evaluates the five paper invariants against a set of snapshot JSON files.
+# Evaluates the paper invariants against a set of snapshot JSON files.
 # Usage: check-invariants.sh <results_dir>
 #
 # Outputs a JSON report with per-invariant verdicts across all snapshots.
 #
-# Invariants checked:
-#   I1 — Exclusive authority (no two simultaneous owners/leaders)
-#   I2 — Reachability publication (endpoints match actual backends)
-#   I3 — Failure declaration consistency (declared-failed nodes not still active)
-#   I4 — Recovery coherence (post-fault state is uniquely determined)
-#   I5 — Observation-action consistency (no action on provably stale state)
+# Invariants checked (I7 and I8 are deliberately absent — see README.md):
+#   I1  — Exclusive authority (no two simultaneous owners/leaders)
+#   I2  — Reachability publication (endpoints match actual backends)
+#   I3  — Failure declaration consistency (declared-failed nodes not still active)
+#   I4  — Recovery coherence (repetitions of one fault converge to one state)
+#   I5  — Observation-action consistency (no action on provably stale state)
+#   I6  — Observation monotonicity (no observer reads an older state than it has)
+#   I9  — etcd quorum coherence (membership, quorum and leader view agree)
+#   I10 — Reconciliation termination (controllers stop generating new work)
 
 set -euo pipefail
 
@@ -40,18 +43,23 @@ fi
 # observer's clock, so a clock-skew fault on a cluster node cannot reorder the
 # trace. CALIBRATION_MODE=1 restricts the set to the baseline snapshot alone —
 # see the calibration gate in the assembly section.
+# snapshots_in() is the same ordering for an ARBITRARY run directory: I4 has to
+# read the sibling iterations of a repeated batch, not just its own run.
+snapshots_in() {  # $1 = a run directory
+  local dir="$1" f idx ts
+  for f in "$dir"/snapshot_*.json; do
+    [ -e "$f" ] || continue
+    idx=$(jq -r '.snapshot_index // empty' "$f" 2>/dev/null || echo "")
+    ts=$(jq -r '.timestamp // empty' "$f" 2>/dev/null || echo "")
+    [[ "$idx" =~ ^[0-9]+$ ]] || idx=9999
+    [ -n "$ts" ] || ts="9999-99-99T99:99:99Z"
+    printf '%04d\t%s\t%s\n' "$idx" "$ts" "$f"
+  done | LC_ALL=C sort -k1,1 -k2,2 | cut -f3
+}
+
 snapshots() {
-  local f idx ts list
-  list=$(
-    for f in "$RESULTS_DIR"/snapshot_*.json; do
-      [ -e "$f" ] || continue
-      idx=$(jq -r '.snapshot_index // empty' "$f" 2>/dev/null || echo "")
-      ts=$(jq -r '.timestamp // empty' "$f" 2>/dev/null || echo "")
-      [[ "$idx" =~ ^[0-9]+$ ]] || idx=9999
-      [ -n "$ts" ] || ts="9999-99-99T99:99:99Z"
-      printf '%04d\t%s\t%s\n' "$idx" "$ts" "$f"
-    done | LC_ALL=C sort -k1,1 -k2,2 | cut -f3
-  )
+  local list
+  list=$(snapshots_in "$RESULTS_DIR")
   [ -n "$list" ] || return 0
   if [ "${CALIBRATION_MODE:-0}" = "1" ]; then
     echo "$list" | sed -n 1p
@@ -489,73 +497,219 @@ check_i3() {
 }
 
 # ── I4: Recovery coherence ─────────────────────────────────────────────────────
-# Evaluated only if multiple post_fault snapshots exist.
-# Violation: post-fault snapshots show different pod placements or lease holders
-# (indicates nondeterministic recovery)
+# I4 asks whether independent repetitions of the SAME fault converge to the same
+# post-fault state. That question cannot be answered inside one run: comparing
+# two post-fault snapshots of a single run only says whether the lease holder
+# rotated during observation (ordinary renewal does that all the time), not
+# whether recovery is deterministic.
+#
+# What decides whether I4 is evaluable is therefore the LAYOUT ON DISK, never
+# the scenario id. scripts/repeat-scenario.sh writes a repeated batch as
+#
+#     results/<sN>/<run_id>/repeat_manifest.json
+#     results/<sN>/<run_id>/run_1/ … run_<K>/     ← one ordinary run each
+#
+# so when RESULTS_DIR's basename is run_<K> the batch root is its parent and the
+# sibling run_<K> directories are the repetitions. Any scenario put through the
+# harness gets a real cross-run I4; a single run gets INSUFFICIENT_DATA, which
+# is what a single run deserves whether or not it is called s6. The old test
+# (`[[ "$scenario" != s6* ]]`) hardcoded one scenario's private structure and so
+# left I4 unevaluated suite-wide — REVIEW.md M3.
+#
+# Iteration directories are NOT zero padded, so they are sorted NUMERICALLY:
+# run_10 comes after run_2, and `sort | tail -1` would put it before.
+#
+# ── The verdict here is PROVISIONAL inside a batch ─────────────────────────────
+# Each iteration writes its own invariant_report.json at the end of its own run,
+# so run_3 can only ever see runs 1–3, and only the last iteration sees the
+# whole batch. The verdict OF RECORD for a batch is the one
+# aggregate-results.sh recomputes at the batch root, where the batch is
+# complete: aggregate_report.json → invariant_heatmap[].I4, with
+# `I4_source: "batch_recompute"`, derived from the recovery_variance entry for
+# the scenario (recovery_variance_s6 is the alias for s6's). Every per-iteration
+# I4 computed inside a batch therefore carries `provisional: true` and says so
+# in its note.
+
+# Final post-fault state of ONE run directory, as a single comparable string.
+# Generic across scenarios, in preference order:
+#   1. run_summary.json .final_lease_holder  — S6 writes it; any scenario may
+#   2. run_summary.json .final_pod_placement — canonicalised name@node list,
+#      used only when there is no lease holder to compare
+#   3. the chronologically last snapshot whose .snapshot_label starts with
+#      "post_", else the chronologically last snapshot, read at
+#      .control_plane.controller_manager_lease.holder
+# Prints the empty string when nothing readable is there; the caller maps that
+# (and a literal "unknown") to unreadable and keeps it OUT of the distinct-state
+# count — counting "unknown" as a state of its own is what made an incomplete
+# batch read as non-deterministic recovery.
+i4_final_state() {
+  local dir="$1" v snap last post label
+  if [ -f "$dir/run_summary.json" ]; then
+    v=$(jq -r '
+      (.final_lease_holder // null) as $h
+      | if ($h != null) and (($h | tostring) != "") and (($h | tostring) != "null")
+        then ($h | if type == "string" then . else tojson end)
+        else ( (.final_pod_placement // null)
+               | if type == "array"
+                 then ([ .[]? | ((.name // "?") + "@" + (.node // "?")) ] | sort | join(","))
+                 else "" end )
+        end' "$dir/run_summary.json" 2>/dev/null || echo "")
+    case "$v" in
+      ""|null|unknown) ;;
+      *) printf '%s\n' "$v"; return 0 ;;
+    esac
+  fi
+
+  last=""; post=""
+  for snap in $(snapshots_in "$dir"); do
+    last="$snap"
+    label=$(snap_field "$snap" '.snapshot_label // ""')
+    case "$label" in
+      post_*) post="$snap" ;;
+    esac
+  done
+  snap="${post:-$last}"
+  [ -n "$snap" ] || { printf '\n'; return 0; }
+  snap_field "$snap" '.control_plane.controller_manager_lease.holder // ""'
+}
+
+# Sibling iteration directories of a batch root: run_<K> holding at least one
+# snapshot, whose iteration_meta.json does not say the iteration failed (a
+# failed iteration may have written partial snapshots, which would poison the
+# statistics), emitted in NUMERIC order.
+i4_iteration_dirs() {  # $1 = batch root
+  local root="$1" d name num status
+  for d in "$root"/run_*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    name=$(basename "$d")
+    num="${name#run_}"
+    case "$num" in ''|*[!0-9]*) continue ;; esac
+    ls "$d"/snapshot_*.json >/dev/null 2>&1 || continue
+    status="ok"
+    if [ -f "$d/iteration_meta.json" ]; then
+      status=$(jq -r '.status // "ok"' "$d/iteration_meta.json" 2>/dev/null || echo "ok")
+    fi
+    [ "$status" = "ok" ] || continue
+    printf '%d\t%s\n' "$((10#$num))" "$d"
+  done | LC_ALL=C sort -n -k1,1 | cut -f2
+}
 
 check_i4() {
-  # I4 (recovery coherence) is *cross-run* by construction: the question is
-  # whether independent repetitions of the same fault converge to the same
-  # post-fault state. Comparing post-fault snapshots *within a single run*
-  # only tells you whether the lease holder happened to rotate during
-  # observation (it often does, that's normal renewal), not whether the
-  # cluster recovered to a unique state. Only S6 materially evaluates I4
-  # because only S6 runs multiple iterations under a stable scenario_id.
-  #
-  # For every other scenario we return INSUFFICIENT_DATA explicitly; the
-  # cross-run comparison lives in aggregate-results.sh
-  # (collect_recovery_variance).
-  local scenario
-  scenario=$(snap_field "$(snapshots | head -1)" '.scenario_id // "unknown"')
+  local scenario base batch_root in_batch=0 layout="single"
+  local d name runs planned unreadable readable distinct verdict note provisional
+  local dirs nums states
+  dirs=(); nums=(); states=()
 
-  if [[ "$scenario" != s6* ]]; then
-    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
-           "note": "I4 is a cross-run invariant — only S6 (repeat-run study) can evaluate it. See aggregate_report.json recovery_variance_s6 block."}'
-    return
-  fi
+  scenario=$(snap_field "$(snapshots | sed -n 1p)" '.scenario_id // "unknown"')
 
-  # Inside an S6 sub-run (scenario_id "s6_run<N>") we still only have one
-  # final state; the cross-run comparison is done by aggregate-results.sh,
-  # so individual S6 runs also defer.
-  if [[ "$scenario" == s6_run* ]]; then
-    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
-           "note": "Single S6 iteration — see aggregate_report.json recovery_variance_s6 for the verdict across all repetitions."}'
-    return
-  fi
-
-  # Top-level S6 (scenario_id == "s6") with multiple per-run summaries —
-  # mirror the cross-run unique-holder count as the verdict.
-  local post_snaps=()
-  for snap in $(snapshots); do
-    label=$(snap_field "$snap" '.snapshot_label')
-    if [[ "$label" == post_* ]]; then
-      post_snaps+=("$snap")
-    fi
-  done
-
-  if [ ${#post_snaps[@]} -lt 2 ]; then
-    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "INSUFFICIENT_DATA",
-           "note": "fewer than 2 post-fault snapshots — S6 did not complete enough iterations"}'
-    return
-  fi
-
-  holders=()
-  for snap in "${post_snaps[@]}"; do
-    h=$(snap_field "$snap" '.control_plane.controller_manager_lease.holder // "unknown"')
-    holders+=("$h")
-  done
-
-  unique_holders=$(printf '%s\n' "${holders[@]}" | sort -u | grep -v null | wc -l)
-
-  if [ "$unique_holders" -le 1 ]; then
-    echo '{"invariant": "I4", "name": "recovery_coherence", "verdict": "PRESERVED",
-           "post_fault_snapshots": '"${#post_snaps[@]}"', "distinct_holders": '"$unique_holders"'}'
+  base=$(basename "$RESULTS_DIR")
+  if [[ "$base" =~ ^run_[0-9]+$ ]]; then
+    in_batch=1
+    layout="repeated"
+    batch_root=$(cd "$RESULTS_DIR/.." && pwd)
   else
-    HOLDER_LIST=$(printf '"%s",' "${holders[@]}" | sed 's/,$//')
-    echo "{\"invariant\": \"I4\", \"name\": \"recovery_coherence\", \"verdict\": \"VIOLATED\",
-           \"post_fault_snapshots\": ${#post_snaps[@]}, \"distinct_cm_holders\": $unique_holders,
-           \"holder_sequence\": [$HOLDER_LIST]}"
+    batch_root=""
   fi
+
+  if [ "$in_batch" -eq 1 ]; then
+    for d in $(i4_iteration_dirs "$batch_root"); do
+      dirs+=("$d")
+      name=$(basename "$d")
+      nums+=("${name#run_}")
+    done
+  elif ls "$RESULTS_DIR"/snapshot_*.json >/dev/null 2>&1; then
+    # A single run is run one of one. It is emitted through the same code path
+    # so both layouts read identically downstream.
+    dirs+=("$RESULTS_DIR")
+    nums+=(1)
+  fi
+
+  runs=${#dirs[@]}
+
+  planned="$runs"
+  if [ "$in_batch" -eq 1 ] && [ -f "$batch_root/repeat_manifest.json" ]; then
+    planned=$(jq -r '.iterations_planned // empty' "$batch_root/repeat_manifest.json" 2>/dev/null || echo "")
+    [[ "$planned" =~ ^[0-9]+$ ]] || planned="$runs"
+  fi
+
+  unreadable=0
+  local i=0 st
+  while [ "$i" -lt "$runs" ]; do
+    st=$(i4_final_state "${dirs[$i]}")
+    case "$st" in
+      ""|null|unknown|Unknown|UNKNOWN) st="unknown"; unreadable=$((unreadable + 1)) ;;
+    esac
+    states+=("$st")
+    i=$((i + 1))
+  done
+  readable=$((runs - unreadable))
+
+  local states_json nums_json
+  if [ "${#states[@]}" -eq 0 ]; then states_json='[]'
+  else states_json=$(printf '%s\n' "${states[@]}" | jq -R . | jq -cs .); fi
+  if [ "${#nums[@]}" -eq 0 ]; then nums_json='[]'
+  else nums_json=$(printf '%s\n' "${nums[@]}" | jq -R . | jq -cs 'map(tonumber? // .)'); fi
+
+  distinct=$(printf '%s' "$states_json" | jq '[ .[] | select(. != "unknown" and . != null and . != "") ] | unique | length')
+  [[ "$distinct" =~ ^[0-9]+$ ]] || distinct=0
+
+  provisional=false
+  if [ "$in_batch" -eq 1 ]; then provisional=true; fi
+
+  if [ "$runs" -lt 2 ]; then
+    verdict="INSUFFICIENT_DATA"
+    if [ "$in_batch" -eq 1 ]; then
+      note="only $runs readable iteration(s) in this batch so far — I4 needs at least 2 independent repetitions; the verdict of record is recomputed at the batch root by aggregate-results.sh (recovery_variance)."
+    elif [[ "$scenario" == s6_run* ]]; then
+      # Legacy path: S6's own plays label their snapshots s6_run<N> and older
+      # sweeps wrote a parallel results/s6_run<N>/ tree with no sibling
+      # iterations to compare against. Pre-existing quirk, left alone.
+      note="single S6 iteration in the legacy results/s6_run<N> layout — see aggregate_report.json recovery_variance_s6 for the verdict across all repetitions."
+    else
+      note="single run: I4 is a cross-run invariant and needs N > 1. Re-run this scenario through scripts/repeat-scenario.sh to make it evaluable; the cross-run comparison itself lives in aggregate-results.sh (recovery_variance)."
+    fi
+  elif [ "$readable" -eq 0 ]; then
+    verdict="INSUFFICIENT_DATA"
+    note="$runs iterations, none of which produced a readable final state (no run_summary.json and no lease holder in any post-fault snapshot) — no evidence either way."
+  elif [ "$distinct" -le 1 ]; then
+    verdict="PRESERVED"
+    note="$readable of $runs repetitions produced a readable final state and they all agree — recovery converged to a single state."
+  else
+    verdict="VIOLATED"
+    note="$distinct distinct final states across $runs repetitions of the same fault — recovery is not uniquely determined."
+  fi
+
+  if [ "$in_batch" -eq 1 ]; then
+    note="$note PROVISIONAL: this iteration can only see the repetitions that finished before it; aggregate_report.json's invariant_heatmap[].I4 (I4_source=batch_recompute) is the verdict of record."
+  fi
+
+  jq -nc \
+    --arg verdict "$verdict" \
+    --arg note "$note" \
+    --arg layout "$layout" \
+    --argjson runs "$runs" \
+    --argjson runs_expected "$planned" \
+    --argjson runs_unreadable "$unreadable" \
+    --argjson distinct "$distinct" \
+    --argjson provisional "$provisional" \
+    --argjson run_numbers "$nums_json" \
+    --argjson holders "$states_json" \
+    '{invariant: "I4",
+      name: "recovery_coherence",
+      verdict: $verdict,
+      layout: $layout,
+      runs: $runs,
+      run_numbers: $run_numbers,
+      runs_expected: $runs_expected,
+      runs_unreadable: $runs_unreadable,
+      distinct_final_states: $distinct,
+      # kept under its historical name so anything reading the old S6 output
+      # keeps working
+      distinct_cm_holders: $distinct,
+      holder_sequence: $holders,
+      provisional: $provisional,
+      note: $note}'
 }
 
 # ── I5: Observation-action consistency ─────────────────────────────────────────
