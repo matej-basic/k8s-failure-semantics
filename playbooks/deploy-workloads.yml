@@ -1,0 +1,28 @@
+---
+# playbooks/deploy-workloads.yml
+#
+# Apply just the scenario workloads (nginx-stateless, postgres-stateful) to a
+# cluster that is already up.
+#
+# Why this exists separately from setup-cluster.yml: the workload manifests in
+# roles/k8s-install/files/ change over the life of the project — the NFS-backed
+# postgres-stateful that S2 needs (REVIEW.md D8) is one such change — but
+# setup-cluster.yml runs the whole k8s-install role, kubeadm included, which is
+# not something to point at a live cluster just to refresh a Deployment.
+#
+# The task file it includes is `kubectl apply -f -` fed from the controller, so
+# it is idempotent and leaves no manifest on the node. A StatefulSet pod
+# template change rolls the pod; nothing else is touched.
+#
+# Usage:
+#   K8SFS_RUN_ID=$(date +%Y%m%d_%H%M%S) \
+#     ansible-playbook -i inventory/hosts.ini playbooks/deploy-workloads.yml
+
+- name: Deploy the scenario workloads
+  hosts: "{{ groups['control_plane'][0] }}"
+  gather_facts: no
+  tasks:
+    - name: Apply the standard workloads
+      include_role:
+        name: k8s-install
+        tasks_from: deploy-workloads

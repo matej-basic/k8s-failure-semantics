@@ -108,7 +108,7 @@
           PVC-backed volume, or its shared-volume evidence is empty and its
           I1 result is a naming collision rather than a correctness violation.
           Re-apply the workload before running S2:
-          ansible-playbook -i inventory/hosts.ini playbooks/setup-cluster.yml
+          ansible-playbook -i inventory/hosts.ini playbooks/deploy-workloads.yml
         success_msg: >-
           Running workload matches the tree: containers={{ wl.containers }},
           shared PVC={{ wl.pvc_volumes | join(',') }}.
