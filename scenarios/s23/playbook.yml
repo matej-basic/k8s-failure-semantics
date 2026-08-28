@@ -496,7 +496,12 @@
           run_once: true
 
         - name: Wait for the target member to answer endpoint status again
-          shell: etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
+          # `env -u ETCDCTL_ENDPOINTS`: etcdctl 3.5 exits fatal when an
+          # environment variable is shadowed by its command-line equivalent, and
+          # etcdctl_env carries ETCDCTL_ENDPOINTS for the whole cluster. This
+          # call must address ONE member, so the flag has to win — clear the
+          # variable rather than drop the flag (REVIEW.md D12).
+          shell: env -u ETCDCTL_ENDPOINTS etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
           environment: "{{ etcdctl_env }}"
           register: s23_target_back
           changed_when: false
@@ -515,7 +520,7 @@
           shell: |
             set -o pipefail
             for i in $(seq 1 30); do
-              etcdctl --endpoints=https://{{ s23_target_ip }}:2379 \
+              env -u ETCDCTL_ENDPOINTS etcdctl --endpoints=https://{{ s23_target_ip }}:2379 \
                 put {{ s23_trigger_key }} "s23-trip-$i" >/dev/null 2>&1 || true
               if etcdctl alarm list 2>&1 | grep -qi 'NOSPACE'; then
                 echo "ARMED after $i write(s)"
@@ -751,7 +756,8 @@
           ignore_unreachable: yes
 
         - name: STEP 5 — wait for the target member to serve again
-          shell: etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
+          # See the D12 note above: single-member addressing, so the flag wins.
+          shell: env -u ETCDCTL_ENDPOINTS etcdctl --endpoints=https://{{ s23_target_ip }}:2379 endpoint status
           environment: "{{ etcdctl_env }}"
           register: s23_target_recovered
           changed_when: false

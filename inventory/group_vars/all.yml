@@ -45,6 +45,14 @@ run_id: >-
 fault_duration: 60          # seconds fault is active
 observation_window: 120     # seconds we collect metrics after fault removal
 convergence_timeout: 300    # seconds we wait for semantic convergence
+
+# S26 only. How long the kubelet is given to re-register on its own after its
+# Node object is deleted, before the scenario restarts it. Short on purpose:
+# the kubelet does NOT re-register unaided (it retries a status update for an
+# object that no longer exists), so this window is a measurement of that fact,
+# not a wait for something expected to happen. Spending convergence_timeout
+# here just leaves the cluster a node short for five minutes (REVIEW.md D14).
+s26_unassisted_timeout: 60
 poll_interval: 5            # seconds between observer state snapshots
 
 # ── Continuous trace recorder ─────────────────────────────────────────────────

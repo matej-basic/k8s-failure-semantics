@@ -169,15 +169,24 @@
     # ── Tunables (all overridable on the command line) ──────────────────────
     # flood_concurrency  parallel client loops PER worker node
     # flood_shares       nominalConcurrencyShares of the flood's own priority
-    #                    level. Higher = the flood claims more of the server's
-    #                    concurrency and applies more pressure to the shared
-    #                    borrowable pool. Kept modest by default; raise it to
-    #                    push the controllers past APF's protective guarantees.
+    #                    level. LOW on purpose, and the direction matters: the
+    #                    signal this scenario asserts is apf_starvation_observed
+    #                    — "the flooded client accrued 429s, so APF actively
+    #                    shed load". With limitResponse: Reject the flood is
+    #                    rejected once it exceeds ITS OWN level's seats, so a
+    #                    small share is what produces the rejection. The default
+    #                    used to be 100, which buys the level roughly a fifth of
+    #                    the server's seats — more than the flood's ~120
+    #                    in-flight requests ever needed, so every request
+    #                    returned 200 and the run was correctly reported
+    #                    FAULT_INEFFECTIVE (REVIEW.md D19). Raise it only to
+    #                    study pressure on the shared borrowable pool, which is
+    #                    a different experiment and does not fire this signal.
     # flood_hard_deadline  wall-clock seconds after which EVERY flood worker
     #                    self-terminates even if it is never signalled. This is
     #                    the runaway guard: fault_duration + margin.
     flood_concurrency: "{{ s25_flood_concurrency | default(40) }}"
-    flood_shares: "{{ s25_flood_shares | default(100) }}"
+    flood_shares: "{{ s25_flood_shares | default(1) }}"
     flood_hard_deadline: "{{ (fault_duration | int) + (observation_window | int) + 60 }}"
     flood_hosts: "{{ groups['workers'] }}"
     apf_cp: "{{ groups['control_plane'][1] }}"          # cp2 — reachable, holds admin.conf
@@ -258,9 +267,19 @@
                           name: s25-flood
                           namespace: default
                     resourceRules:
+                      # namespaces + clusterScope are BOTH required here, and
+                      # the API server rejects the FlowSchema outright without
+                      # the first: "resource rules that are not cluster scoped
+                      # must supply at least one namespace" (REVIEW.md D13).
+                      # The flood client reads namespaced and cluster-scoped
+                      # resources alike, so it has to match both: namespaces
+                      # ["*"] covers every namespaced request, clusterScope
+                      # covers the rest. Neither implies the other.
                       - verbs: ["*"]
                         apiGroups: ["*"]
                         resources: ["*"]
+                        namespaces: ["*"]
+                        clusterScope: true
                     nonResourceRules:
                       - verbs: ["*"]
                         nonResourceURLs: ["*"]
@@ -277,10 +296,19 @@
         - name: Mint a bounded-lifetime token for the flood ServiceAccount
           # --duration bounds the token to the run; even a leaked token is
           # useless afterwards. Runs on cp2 (admin.conf present).
+          #
+          # Floored at 600 s because the TokenRequest API refuses anything
+          # shorter: "spec.expirationSeconds: Invalid value: 360: may not
+          # specify a duration less than 10 minutes". With the default timings
+          # the computed value is 60 + 120 + 60 + 120 = 360 s, so this task
+          # failed every time the scenario ran (REVIEW.md D15). The floor only
+          # ever lengthens the token beyond the run, which costs nothing: the
+          # flood workers are killed by flood_hard_deadline regardless, and
+          # teardown deletes the ServiceAccount the token authenticates as.
           shell: |
             export KUBECONFIG=/etc/kubernetes/admin.conf
             kubectl create token s25-flood -n default \
-              --duration={{ flood_hard_deadline | int + 120 }}s
+              --duration={{ [ (flood_hard_deadline | int + 120), 600 ] | max }}s
           register: s25_flood_token
           delegate_to: "{{ apf_cp }}"
           run_once: true
@@ -291,6 +319,19 @@
             flood_token: "{{ s25_flood_token.stdout }}"
           run_once: true
           no_log: true
+
+        - name: Create the flood working directory on each worker
+          # Three later tasks copy into /tmp/s25-flood (worker.sh, launch.sh and
+          # the token) and `copy:` will not create the parent, so every one of
+          # them failed with "Destination directory /tmp/s25-flood does not
+          # exist" (REVIEW.md D17). 0700: the token file lives here.
+          file:
+            path: /tmp/s25-flood
+            state: directory
+            mode: '0700'
+          delegate_to: "{{ item }}"
+          loop: "{{ flood_hosts }}"
+          run_once: true
 
         - name: Distribute the flood worker script to each worker node
           copy:
@@ -645,7 +686,16 @@
           # This is deliberately the LAST teardown task and it is allowed to
           # fail the play: a surviving generator would corrupt every later
           # scenario, so a leak must be loud, not swallowed.
-          shell: pgrep -f "{{ flood_marker }}" | wc -l | tr -d ' '
+          #
+          # The pattern is bracketed so it cannot match this task's own shell.
+          # `pgrep -f` scans full argv, and the argv of the bash running this
+          # command contains the pattern text, so an unbracketed pattern always
+          # matches at least that shell: the check returned 1 on every worker
+          # with zero flood processes actually alive, and being a failed_when
+          # gate it failed the whole run every time (REVIEW.md D18). Bracketing
+          # the first character makes the regex match the real workers' argv
+          # while the literal text in this shell's own argv no longer matches.
+          shell: pgrep -f "{{ flood_marker | regex_replace('^(.)', '[\\1]') }}" | wc -l | tr -d ' '
           delegate_to: "{{ item }}"
           loop: "{{ flood_hosts }}"
           run_once: true

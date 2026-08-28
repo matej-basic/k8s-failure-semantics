@@ -857,8 +857,52 @@
       ignore_errors: yes
 
     - block:
-        # Bounded by convergence_timeout (default 300 s) in 10 s steps. The
-        # kubelet re-registers on its own; this play never touches it.
+        # ── Unassisted re-registration: the measurement, not an assumption ────
+        # This scenario was written expecting the kubelet's own node-status loop
+        # to notice the NotFound and re-register within ~1-10 s, and the play
+        # deliberately "never touches it". On 2026-08-28 that turned out to be
+        # false: the kubelet stays active and retries a status UPDATE forever
+        # for an object that no longer exists —
+        #
+        #   kubelet_node_status.go:479 "Error updating node status, will retry"
+        #     err="error getting node \"worker1\": nodes \"worker1\" not found"
+        #
+        # — so the wait burned the whole 300 s and the run left the cluster a
+        # node short (REVIEW.md D14).
+        #
+        # That is a RESULT: the substrate does not re-create node identity on
+        # its own. So the unassisted window is still waited out and recorded,
+        # but on a short bound; then the kubelet is restarted and the fact that
+        # a restart was needed is carried into the evidence, because that is
+        # the finding this scenario exists to produce.
+        - name: Wait (unassisted) for the Node object to come back on its own
+          shell: |
+            set -o pipefail
+            READY=$(kubectl get node {{ target_node }} \
+              -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || echo "ABSENT")
+            echo "ready=${READY:-ABSENT}"
+            test "$READY" = "True"
+          register: rereg_unassisted
+          until: rereg_unassisted.rc == 0
+          retries: "{{ ((s26_unassisted_timeout | int) / 5) | round | int }}"
+          delay: 5
+          failed_when: false
+          changed_when: false
+
+        - name: Note whether the kubelet re-registered without help
+          set_fact:
+            s26_kubelet_restart_required: "{{ rereg_unassisted.rc != 0 }}"
+
+        - name: Restart the kubelet on the target node so it re-registers
+          # Only when the unassisted window expired. A kubelet that re-registered
+          # on its own is left strictly alone, so the restart never masks the
+          # behaviour the scenario is measuring.
+          systemd:
+            name: kubelet
+            state: restarted
+          delegate_to: "{{ target_node }}"
+          when: s26_kubelet_restart_required | bool
+
         - name: Wait for the Node object to exist again and report Ready=True
           shell: |
             set -o pipefail
@@ -870,6 +914,17 @@
           until: rereg.rc == 0
           retries: "{{ ((convergence_timeout | int) / 10) | round | int }}"
           delay: 10
+
+        - name: Record how the node came back
+          copy:
+            dest: "{{ results_dir }}/node_recovery_mode.json"
+            content: |
+              {{ { 'unassisted_timeout_s': (s26_unassisted_timeout | int),
+                   'reregistered_unassisted': (not (s26_kubelet_restart_required | bool)),
+                   'kubelet_restart_required': (s26_kubelet_restart_required | bool),
+                   'note': 'kubelet_restart_required=true means the kubelet did NOT re-register on its own within unassisted_timeout_s: it stayed active retrying a status update for a Node object that no longer existed. That is a finding about node identity re-creation, not a harness failure.' }
+                 | to_json }}
+          delegate_to: "{{ groups['observer'][0] }}"
 
         - name: Record the Node object identity AFTER re-registration
           shell: |
@@ -892,6 +947,43 @@
             dest: "{{ results_dir }}/node_identity_postrecovery.json"
             content: "{{ node_identity_post.stdout }}"
           delegate_to: "{{ groups['observer'][0] }}"
+
+        - name: Complete the identity transition from the post-recovery read
+          # node_identity_transition.json is computed from the 0.25 s sampler,
+          # which stops at the end of the observation window. That was fine
+          # under the original assumption that the kubelet re-registers within
+          # ~1-10 s of the delete. It does not (REVIEW.md D14), so the node now
+          # comes back during THIS play — after the sampler has stopped — and
+          # the sampler's own uid_after_reregistration is null, leaving
+          # uid_changed false against a UID that demonstrably changed.
+          #
+          # Fill it from the post-recovery read, and record which source the
+          # answer came from. absence_ms is deliberately left as the sampler
+          # computed it: the sampler genuinely did not span the return, and a
+          # number invented here would be a false measurement of exactly the
+          # kind this suite exists to avoid.
+          shell: |
+            set -o pipefail
+            jq -s '
+              .[0] as $t | .[1] as $post
+              | ($t.uid_after_reregistration // $post.uid) as $after
+              | $t
+                + { uid_after_reregistration: $after,
+                    uid_after_source: (if $t.uid_after_reregistration != null
+                                       then "node_sampler"
+                                       else "post_recovery_read" end),
+                    uid_changed: (($t.uid_before_delete != null) and ($after != null)
+                                  and ($t.uid_before_delete != $after)),
+                    distinct_uids_observed:
+                      (($t.distinct_uids_observed // []) + [ $after ]
+                       | map(select(. != null)) | unique) }
+            ' "{{ results_dir }}/node_identity_transition.json" \
+              "{{ results_dir }}/node_identity_postrecovery.json" \
+              > "{{ results_dir }}/node_identity_transition.json.new" \
+            && mv "{{ results_dir }}/node_identity_transition.json.new" \
+                  "{{ results_dir }}/node_identity_transition.json"
+          delegate_to: "{{ groups['observer'][0] }}"
+          ignore_errors: yes
 
         - name: Wait for nginx-stateless to be fully rolled out again
           shell: kubectl rollout status deployment/{{ stateless_app_name }} -n {{ stateful_app_namespace }} --timeout=180s
