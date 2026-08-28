@@ -1224,9 +1224,21 @@ fault_efficacy() {
     # the invariant and the efficacy signal cannot drift apart.
     def split_view:
       [ .etcd.member_status[]? | { leader: (.Status.leader // null),
-                                   term:   (.Status.raftTerm // null) } ] as $m
+                                   term:   (.Status.raftTerm // null),
+                                   leaderless: (((.Status.errors // [])
+                                                 | map(select(test("no leader"; "i")))
+                                                 | length) > 0) } ] as $m
       | { leaders: ([ $m[].leader | select(. != null) ] | unique),
-          terms:   ([ $m[].term   | select(. != null) ] | unique) };
+          terms:   ([ $m[].term   | select(. != null) ] | unique),
+          # The STABLE signature of a peer-port split: some members report
+          # "etcdserver: no leader" while others do not. Divergent raft terms
+          # are the sharper evidence but they are transient — they show only
+          # in a snapshot that lands during the term bump, which is why one S19
+          # run recorded terms [2,3] and the next recorded [3] across all five
+          # members with the partition demonstrably still in place and two
+          # members leaderless.
+          leaderless:      ([ $m[] | select(.leaderless) ] | length),
+          has_leader_view: ([ $m[] | select(.leaderless | not) ] | length) };
     def probe:   (.external_probe.httpCode // null);
     def holders: [ (.control_plane.controller_manager_lease.holder // empty),
                    (.control_plane.scheduler_lease.holder // empty) ];
@@ -1258,11 +1270,15 @@ fault_efficacy() {
         # was still reported FAULT_INEFFECTIVE because the one signal it was
         # required to produce was a count that cannot move (REVIEW.md D22).
         etcd_quorum_split_observed:
-          (((($base | split_view).leaders | length) <= 1
-            and (($base | split_view).terms | length) <= 1)
+          ((($base | split_view) as $b
+            | ($b.leaders | length) <= 1
+              and ($b.terms | length) <= 1
+              and $b.leaderless == 0)
            and (([ $rest[]
-                   | select(((. | split_view).leaders | length) > 1
-                            or ((. | split_view).terms | length) > 1) ]
+                   | (. | split_view) as $v
+                   | select(($v.leaders | length) > 1
+                            or ($v.terms | length) > 1
+                            or ($v.leaderless > 0 and $v.has_leader_view > 0)) ]
                  | length) > 0)),
 
         # The API server stopped answering at all for at least one snapshot
