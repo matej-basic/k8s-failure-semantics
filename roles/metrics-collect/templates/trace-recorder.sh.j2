@@ -301,7 +301,7 @@ sample_k8s() {
   # the same degradation contract tasks/snapshot.yml uses.
   ( kc get nodes -o json                                                              > "$d/nodes.json"  2>/dev/null ) &
   ( kc get leases --all-namespaces -o json                                            > "$d/leases.json" 2>/dev/null ) &
-  ( kc get endpoints {{ stateless_app_name }} -n {{ stateful_app_namespace }} -o json > "$d/eps.json"    2>/dev/null ) &
+  ( kc get endpoints {{ stateless_app_name }} {{ stateful_app_name }} -n {{ stateful_app_namespace }} -o json > "$d/eps.json"    2>/dev/null ) &
   ( kc get pod {{ stateful_app_name }}-0 -n {{ stateful_app_namespace }} -o json      > "$d/pg.json"     2>/dev/null ) &
   wait
 
@@ -362,14 +362,32 @@ sample_k8s() {
 
   # core/v1 Endpoints, not EndpointSlice, to stay on the same object
   # tasks/snapshot.yml reads — the two are meant to be comparable.
+  # BOTH workload services, because check_i2 sums notReadyAddresses over every
+  # service in the snapshot's endpoint_states — which is exactly
+  # `nginx-stateless postgres-stateful` (tasks/snapshot.yml). Recording only the
+  # stateless one made scripts/violation-duration.sh's I2 predicate a subset
+  # over a NARROWER SERVICE SET than the check it claims to bound, so it missed
+  # every violation on the other service. In S2 the partitioned pod is the
+  # stateful one, so that was every violation: the snapshot series reported I2
+  # VIOLATED while the trace reported no_episode_in_trace across 894 records.
+  #
+  # Shape: `.endpoints.not_ready_count` and `.ready_count` stay top-level and
+  # are now sums across the services, so the predicate that reads them is
+  # unchanged; per-service detail moves under `.services[]`. `kubectl get` with
+  # more than one name returns a List, so unwrap .items when present.
   eps=$(jqf "$d/eps.json" '
-    { service: .metadata.name,
-      ready_addresses:
-        [ .subsets[]?.addresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ],
-      not_ready_addresses:
-        [ .subsets[]?.notReadyAddresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ] }
-    | .ready_count     = (.ready_addresses | length)
-    | .not_ready_count = (.not_ready_addresses | length)') \
+    ( if has("items") then .items else [ . ] end )
+    | { services:
+          [ .[] |
+            { service: .metadata.name,
+              ready_addresses:
+                [ .subsets[]?.addresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ],
+              not_ready_addresses:
+                [ .subsets[]?.notReadyAddresses[]? | { ip: .ip, node: .nodeRef.name, pod: .targetRef.name } ] }
+            | .ready_count     = (.ready_addresses | length)
+            | .not_ready_count = (.not_ready_addresses | length) ] }
+    | .ready_count     = ([ .services[].ready_count ]     | add // 0)
+    | .not_ready_count = ([ .services[].not_ready_count ] | add // 0)') \
     || note_err endpoints
 
   # found:false is a real observation (the pod object is gone from the API) and

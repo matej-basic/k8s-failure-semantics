@@ -189,17 +189,16 @@ What is now confirmed against hardware rather than assumed:
 - **Failure containment.** The aborted run left no cordons, no injected DROP
   rules and no informer Job. The lab returned to baseline without a revert.
 
-**Durations are still null on every violation, for three separate reasons —
-worth understanding before trusting duration coverage.** I1 and I3 return
-`no_trace_predicate`: both decide from node-local crictl container lists, which
-the 1 Hz trace does not record. That is designed and honest. I2 returns
-`no_episode_in_trace: the snapshot series recorded a violation the trace never
-saw (the two sample different instants)` — and *that* inverts M1's premise,
-which is that the trace resolves what the snapshot grid cannot. The same script
-found two I2 episodes on the earlier run of the same scenario, so the mechanism
-works; something about this run's endpoint violation fell outside the trace
-predicate. Open question, and the first thing to look at before M3's collection
-run, since the durations are meant to be a headline number.
+**The first real duration — `I2 VIOLATED for 112 s`** (run `20260828_130606`),
+one closed episode ended by an observed clear, `censored: false`, over a
+901-record trace with an intact footer. This is what M1 and M4 were for, and it
+took fixing D11 below to get there.
+
+I1 and I3 remain `duration_s: null`, and correctly so: both decide from
+node-local crictl container lists, which the 1 Hz trace does not record, and
+`violation-duration.sh` says exactly that rather than inventing a number.
+Extending duration coverage to them means recording container state in the
+trace, which is a real cost and a separate decision.
 
 One known footgun, already documented in the tree and left alone: the
 `pkill -f` teardown tasks in `roles/fault-inject/tasks/teardown.yml` match the
@@ -789,6 +788,55 @@ Ansible and applying it:
 Run through `snapshot.yml`'s own collection logic, that line yields
 `{"ok":true,"reason":null,"source":"https://kubernetes.default.svc","cache_age_ms":5424}`
 — the observer M2 has been missing in every run to date.
+
+---
+
+### D11 — The I2 trace predicate watched one service; the check it bounds sums over two
+
+Fixed 2026-08-28.
+
+`scripts/violation-duration.sh` documents each trace predicate as "a strict
+subset of the corresponding `check_i*()` predicate". For I2 that was true of the
+*field* and false of the *scope*.
+
+- `check_i2` sums `notReadyAddresses` over every service in the snapshot's
+  `endpoint_states`, which `tasks/snapshot.yml` populates from **two** services:
+  `nginx-stateless` and `postgres-stateful`.
+- The 1 Hz recorder ran `kubectl get endpoints {{ stateless_app_name }}` — the
+  stateless service alone.
+
+So a not-ready endpoint on the stateful service was invisible to the trace. In
+S2 the partitioned pod *is* the stateful one, so that was every violation. From
+run `20260828_124524`:
+
+```
+snapshot_t_plus_30:  nginx-stateless   ready=1 notReady=0
+                     postgres-stateful ready=1 notReady=1   ← the violation
+trace.jsonl:         894 records, not_ready_count = 0 in every one
+```
+
+The invariant came back `VIOLATED` from the snapshots and
+`no_episode_in_trace: the snapshot series recorded a violation the trace never
+saw (the two sample different instants)` from the duration engine — a reason
+that reads as a sampling-resolution limit and is actually a scope bug.
+
+**Why it looked non-deterministic.** An earlier run of the same scenario *did*
+find two I2 episodes. That run predated `playbooks/deploy-workloads.yml`, when
+all three nginx pods still happened to sit on worker1, so partitioning worker1
+did put nginx endpoints not-ready. The apparent flakiness was pod placement.
+
+**Fix.** The recorder now queries both services, matching the snapshot exactly.
+`.endpoints.not_ready_count` and `.ready_count` stay top-level and become sums,
+so the predicate reading them is unchanged; per-service detail moves under
+`.services[]`, and the `List` that `kubectl get` returns for a multi-name query
+is unwrapped. The `covers` string now states the scope. `tasks/snapshot.yml` had
+the two service names hardcoded beside the variables that already define them —
+de-hardcoded, since two places naming one set with one of them hardcoded is how
+this drifts apart again.
+
+**Verified live.** Mid-fault the trace recorded 112 consecutive records with
+`not_ready_count: 1` on `postgres-stateful`, and the report closed them into a
+single 112 s episode with `end_reason: clear_observed`.
 
 ---
 

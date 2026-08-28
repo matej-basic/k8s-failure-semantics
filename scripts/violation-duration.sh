@@ -104,7 +104,7 @@ SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 #   mode none   — argument is the reason
 DURATION_SOURCES='
 I1|none|no_trace_predicate: dual ownership is decided from node-local crictl container lists, which the 1 Hz trace does not record||
-I2|trace|trace.jsonl:endpoints_not_ready|published endpoints carrying notReadyAddresses|in-cluster service probe (not in the trace)
+I2|trace|trace.jsonl:endpoints_not_ready|published endpoints carrying notReadyAddresses, summed over the same two workload services check_i2 reads|in-cluster service probe (not in the trace)
 I3|none|no_trace_predicate: the check pairs a withdrawn Ready/taint with node-local crictl containers, and containers are not in the trace||
 I4|none|not_measurable: I4 is a cross-run invariant with no instant of violation inside one run||
 I5|m2|node_ready|two API servers disagreeing about a node Ready status|watch-cache revision lag (no counterpart in the trace)

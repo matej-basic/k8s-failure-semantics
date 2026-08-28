@@ -117,7 +117,7 @@
              }]
            }]' 2>/dev/null || echo null)
     ES=$(run_or_null kubectl get endpoints -n {{ stateful_app_namespace }} \
-                     nginx-stateless postgres-stateful -o json \
+                     {{ stateless_app_name }} {{ stateful_app_name }} -o json \
          | jq '[.items[] | {
              service: .metadata.name,
              subsets: .subsets,
