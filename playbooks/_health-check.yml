@@ -18,6 +18,49 @@
   tasks:
     - meta: clear_host_errors
 
+- name: Ensure every API server is serving before asserting anything through one
+  # REVIEW.md D21. A control-plane node isolated from etcd (S1, S17, S19, and
+  # anything else that partitions the control plane) does NOT reliably recover
+  # when the partition is lifted: its kube-apiserver static pod crashloops
+  # while etcd is unreachable, and by the time connectivity returns the kubelet
+  # has backed off far enough that the container simply stays Exited. Observed
+  # on 2026-08-28 with cp1 at restart attempt 30, container Exited for eight
+  # minutes with the manifest intact and etcd reachable; a kubelet restart
+  # brought it back on the first probe.
+  #
+  # This matters beyond the one node. cp1 holds the keepalived VIP, so a dead
+  # apiserver there means https://<vip>:6443 refuses for everyone — which is
+  # how S3 failed at its very first task, before it had injected anything, and
+  # why the checks below (all of which speak to ONE apiserver) cannot be
+  # trusted to run before this play has.
+  #
+  # Repair, then assert: a node that will not serve after a kubelet restart is
+  # a real failure and this play fails loudly.
+  hosts: control_plane
+  gather_facts: no
+  ignore_unreachable: yes
+  tasks:
+    - name: Probe the local API server
+      shell: curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz
+      register: apiserver_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Restart kubelet where the API server is not serving
+      systemd:
+        name: kubelet
+        state: restarted
+      when: (apiserver_probe.stdout | default('')) != '200'
+
+    - name: Wait for the API server to serve again
+      shell: curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz
+      register: apiserver_recheck
+      until: apiserver_recheck.stdout == '200'
+      retries: 24
+      delay: 5
+      changed_when: false
+      when: (apiserver_probe.stdout | default('')) != '200'
+
 - name: Inter-scenario health check
   hosts: "{{ groups['control_plane'][0] }}"
   gather_facts: no
