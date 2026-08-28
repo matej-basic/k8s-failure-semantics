@@ -31,6 +31,18 @@
     # any value on it.
     mode: '0777'
 
+- name: Ensure /etc/exports.d exists
+  # exports(5) documents /etc/exports.d/*.exports, but Ubuntu's
+  # nfs-kernel-server (1:2.6.4-3ubuntu5.1 on 24.04) ships only /etc/exports and
+  # does not create the drop-in directory. Writing the export straight into it
+  # fails with "Destination directory /etc/exports.d does not exist".
+  file:
+    path: /etc/exports.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
 - name: Declare the export
   copy:
     dest: /etc/exports.d/k8s-failure-semantics.exports

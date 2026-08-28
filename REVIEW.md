@@ -112,6 +112,43 @@ The next step is `scripts/preflight.sh`, then `scripts/run-sweep-detached.sh`,
 at N ≥ 5 via `scripts/repeat-scenario.sh`. Until that data exists, no number in
 `results/` or `report.html` should be cited.
 
+### Shake-down run — 2026-08-28
+
+First execution of any of this against the lab, per step 1 of the work order.
+`scripts/preflight.sh` passes (11 VMs over ssh, API VIP up, vCenter
+authenticating, refresh-only plan clean) and the cluster was healthy going in:
+6 nodes Ready, v1.36.1, Ubuntu 24.04.
+
+**The shake-down is blocked at S2 by D7 below.** S11 and S12 were not attempted:
+`run_id` lives in `inventory/group_vars/all.yml` and every scenario derives
+`results_dir` from it, so they fail the same way. Three defects found, two
+fixed:
+
+| # | Defect | Status |
+|---|--------|--------|
+| — | `preflight.sh` used `\s` in `sed -E` (BSD sed leaves the line unsubstituted) and let `ssh` eat the heredoc node list | fixed, `a957d12` |
+| — | `roles/nfs-server` wrote `/etc/exports.d/*.exports` without creating the directory; Ubuntu 24.04's `nfs-kernel-server` does not ship it | fixed |
+| **D7** | **`run_id` is a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference** | **open — blocks everything** |
+
+What did work, and is now confirmed against hardware rather than assumed:
+
+- **The S2 NFS enrichment.** `postgres-shared-nfs` binds RWX with
+  `Retain`, and `postgres-stateful-0` runs on worker1 with its `data` volume
+  backed by the PVC. The pin play (cordon → delete → wait → uncordon) placed it
+  correctly. This is the change that makes dual ownership consequential and it
+  had never executed before.
+- **The trace recorder's safety design.** Recorders left behind by the aborted
+  run were running under `timeout --kill-after=30 1140` and expired on their
+  own. The "detached but bounded" claim in the play header holds.
+- **Failure containment.** The aborted run left no cordons, no injected DROP
+  rules and no informer Job. The lab returned to baseline without a revert.
+
+Still unverified, because the run never reached them: fault injection itself,
+the observer views arriving populated, the S11 VIP fix, the S12 flap, and
+every one of S20–S28.
+
+---
+
 ---
 
 ## 1. Defects that invert the current results
@@ -385,6 +422,89 @@ distinguishable from one that ran and found nothing.
 
 ---
 
+### D7 — `run_id` is re-evaluated on every reference, so one run scatters across many directories
+
+`inventory/group_vars/all.yml:17`
+
+```yaml
+run_id: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+```
+
+Ansible group_vars are lazy: this is not a value assigned once at start, it is
+an expression re-evaluated at every point of use. The lookup runs a fresh
+`date` each time, so `run_id` changes whenever the clock crosses a second
+boundary mid-play — which, over a scenario lasting minutes, is essentially
+every reference.
+
+Everything the suite writes is addressed through it:
+
+```yaml
+results_dir:          "{{ results_base }}/{{ scenario_id }}/{{ run_id }}"
+informer_object_name: "{{ observer_informer_name }}-{{ scenario_id }}-{{ run_id | replace('_','-') | lower }}"
+```
+
+**Observed in the 2026-08-28 S2 run.** Four distinct values of `run_id` inside
+one invocation:
+
+| Consumer | Value it saw |
+|---|---|
+| `results_dir` (first write) | `20260828_095846` |
+| `results_dir` (second write) | `20260828_095847` |
+| `informer_object_name` at render | `…-095844` |
+| `results_dir` at the final collection task | `20260828_095916` |
+
+The run produced two result directories, holding one file and zero files:
+
+```
+results/s2/20260828_095846/   1 file
+results/s2/20260828_095847/   0 files
+```
+
+**Impact**
+
+- **Every scenario writes its artefacts into a scatter of sibling directories,
+  most of them empty.** `check-invariants.sh` is pointed at one of them, so it
+  sees a fraction of the snapshots at best.
+- The in-cluster informer is created under one name and looked up under
+  another. `trace-start.yml` renders the manifest to
+  `{{ trace_remote_dir }}/{{ informer_object_name }}.yml`, then the next task
+  `kubectl apply -f`s a path with a *different* timestamp and fails with
+  `the path "..." does not exist`. The informer therefore never exists, and
+  every snapshot records `informer_absent` — which is exactly the state M2 was
+  written to eliminate, and it silently reduces every VIOLATED verdict to
+  `duration_s: null`.
+- Collection tasks delegated back to the observer fail with `Destination
+  directory ... does not exist`, because the directory was created under an
+  earlier stamp.
+- Both informer failures are `ignore_errors: yes`, deliberately and for good
+  reason (an observer that cannot be created should not abort a run with a
+  fault already injected). The cost is that this defect is silent: the run
+  reports `EXIT=0`.
+
+**Why it was not caught earlier.** Nothing here is reachable offline. The
+archived May 2026 results predate the trace and the informer entirely, and
+`--syntax-check` cannot see a lazily-evaluated lookup.
+
+**Fix.** `run_id` must be resolved once per invocation and then be constant.
+Options, cheapest first:
+
+1. Take it from the environment, which is stable for the life of the process:
+   `run_id: "{{ lookup('env', 'K8SFS_RUN_ID') | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"`,
+   with `scripts/run-sweep-detached.sh`, `scripts/repeat-scenario.sh` and the
+   README's step-4 invocation exporting it once. Leaves the bare ad-hoc
+   `ansible-playbook` call still broken, so pair it with (3).
+2. Pass it as an extra var (`-e run_id=$(date +%Y%m%d_%H%M%S)`). Extra vars are
+   literals, evaluated once. Same caveat about ad-hoc runs.
+3. Pin it in a `set_fact` in the first play of each scenario and push it to
+   every host with `delegate_facts`. Correct regardless of how the playbook is
+   invoked, but it is 23 files.
+
+Whichever is chosen, add an assertion that the value is stable — a first-play
+`set_fact` of `run_id` compared against `run_id` re-read in the last play — so
+a regression here fails loudly instead of producing empty directories.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
@@ -577,26 +697,28 @@ The code order below is done; what is left is the data. Steps 1–3, 5 and 7 of
 the original plan (D1–D6, M1–M5, S20–S28) are in the tree — see *Implementation
 status* above for where each one landed. The remaining work is all lab time:
 
-1. **Shake-down run.** `scripts/preflight.sh`, then a single pass over S2, S11
+1. **Fix D7 first — nothing below can run until it is done.** The 2026-08-28
+   shake-down got as far as S2 and stopped there; see *Shake-down run* above.
+2. **Shake-down run.** `scripts/preflight.sh`, then a single pass over S2, S11
    and S12 only. These three carry the changes most likely to be wrong on
    contact: the in-cluster probe, the per-API-server views, the S11 VIP block
    and the S12 etcd-peer flap. Confirm `.observers[]` arrives populated, that
    S11 moves worker1 out of `Ready=True`, and that S2's two postgres copies
    both mount the NFS PV. Nothing downstream is worth running until this passes.
-2. **Validate the new scenarios once each.** S20–S28 have never executed. Run
+3. **Validate the new scenarios once each.** S20–S28 have never executed. Run
    them singly and check each against its own efficacy assertion before
    committing them to a full sweep — a scenario that comes back
    `FAULT_INEFFECTIVE` needs its injection fixed, not more repetitions.
-3. **Full sweep at N = 1.** `scripts/run-sweep-detached.sh` across all 23
+4. **Full sweep at N = 1.** `scripts/run-sweep-detached.sh` across all 23
    scenarios, including S5 and S6, which have no archived results at all.
    Rebuild the report and read the heatmap for detectors that fail the
    calibration gate — `DETECTOR_INVALID` at this stage is a bug in the check,
    not a finding.
-4. **Final collection at N ≥ 5.** `scripts/repeat-scenario.sh` per scenario,
+5. **Final collection at N ≥ 5.** `scripts/repeat-scenario.sh` per scenario,
    which is what makes I4 evaluable and turns the M4 durations into medians and
    IQRs rather than single observations. Budget the lab time: 23 scenarios at
    five runs is the largest single cost remaining in the project.
-5. **Retire the archived data.** Once the new sweep exists, delete or clearly
+6. **Retire the archived data.** Once the new sweep exists, delete or clearly
    date-fence the 2026-05-20/21 `results/` tree and regenerate `report.html`
    from the new runs. Until then, no number in either is citable.
 
