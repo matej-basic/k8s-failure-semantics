@@ -39,27 +39,49 @@
   hosts: control_plane
   gather_facts: no
   ignore_unreachable: yes
+  #
+  # STABILITY, not a single 200. A crashlooping apiserver answers healthz
+  # perfectly well during each Running window, so one probe can pass on a
+  # server that is being SIGKILLed every minute. Observed after S4: the
+  # clock-skew teardown calls `chronyc makestep`, the time jump fails the
+  # apiserver's liveness probe, kubelet kills it (exit 137, no OOM, etcd
+  # answering in 3.5 ms), and it crashloops for several minutes. S4's health
+  # check probed inside a Running window and passed; S5 then started and its
+  # first kubectl hit a refused VIP. Three consecutive successes spaced a few
+  # seconds apart is the cheapest check that a crashloop cannot satisfy.
   tasks:
-    - name: Probe the local API server
-      shell: curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz
+    - name: Probe the local API server for STABLE health
+      shell: |
+        for i in 1 2 3; do
+          c=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz)
+          [ "$c" = "200" ] || { echo "unstable:$c"; exit 1; }
+          [ "$i" = "3" ] || sleep 4
+        done
+        echo stable
       register: apiserver_probe
       changed_when: false
       failed_when: false
 
-    - name: Restart kubelet where the API server is not serving
+    - name: Restart kubelet where the API server is not stably serving
       systemd:
         name: kubelet
         state: restarted
-      when: (apiserver_probe.stdout | default('')) != '200'
+      when: (apiserver_probe.stdout | default('')) is not search('stable')
 
-    - name: Wait for the API server to serve again
-      shell: curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz
+    - name: Wait for the API server to serve stably again
+      shell: |
+        for i in 1 2 3; do
+          c=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:6443/healthz)
+          [ "$c" = "200" ] || { echo "unstable:$c"; exit 1; }
+          [ "$i" = "3" ] || sleep 4
+        done
+        echo stable
       register: apiserver_recheck
-      until: apiserver_recheck.stdout == '200'
-      retries: 24
-      delay: 5
+      until: apiserver_recheck.stdout is search('stable')
+      retries: 20
+      delay: 10
       changed_when: false
-      when: (apiserver_probe.stdout | default('')) != '200'
+      when: (apiserver_probe.stdout | default('')) is not search('stable')
 
 - name: Inter-scenario health check
   hosts: "{{ groups['control_plane'][0] }}"
