@@ -983,6 +983,61 @@ must not be run unattended.
 
 ---
 
+### Full-suite validation — 2026-08-28/29: all 23 scenarios execute their fault
+
+Every scenario now runs end to end with `run_validity: OK` and
+`fault_efficacy: EFFECTIVE`, verified on the live lab:
+
+```
+s1  s2  s3  s4  s5  s6  s8  s11 s12 s14 s15 s17
+s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28      — 23/23 OK / EFFECTIVE
+```
+
+Getting there took **16 further defects (D12–D27)** beyond the six already
+recorded above. Three patterns are worth carrying forward.
+
+**Most "scenario failures" were not scenario failures.** S3 and S5 were each
+recorded as broken when they had inherited a dead API server from the scenario
+before them (D20, D21). S5's own defect (D25) only surfaced once the harness
+was fixed and it could run far enough to reach it. Sequential sweeps
+mis-attribute damage to whatever runs next, so an inter-scenario gate has to be
+strong enough to stop that — which is why D21 repairs *and* asserts, and why it
+demands stable health rather than one 200.
+
+**Silent teardown loss was the most dangerous class.** D20: Ansible's
+unreachable marker is sticky across plays, so one dropped ssh connection during
+a fault window silently removed a host from its own teardown play. S1 finished
+`failed=0` having left seven DROP rules on cp1, killing its API server and the
+VIP with it. 22 of 23 scenarios were exposed; only S23 had the guard, and
+`_health-check.yml` had documented the hazard all along.
+
+**A scenario that runs is not a scenario that measures.** S25 needed five fixes
+before it injected anything (D13, D15, D17, D18) and a sixth (D19) before APF
+actually shed load — it had been reporting a clean run with 750 requests, every
+one a 200. S6 was worse: it ran cleanly, produced five iterations, and fed the
+suite's **first ever evaluable I4** — off a partition that never touched the
+node, because it omitted the API VIP (D27). `i4_verdict: PRESERVED, all
+readable repetitions converged` was five repetitions of an undisturbed cluster.
+With the VIP blocked, worker1 now goes `Unknown` mid-fault in every iteration,
+all five report EFFECTIVE, and I4 PRESERVED means something.
+
+**I4 is now evaluable for the first time in the suite's history**, from S6's
+five repetitions: `run_count: 5, runs_unreadable: 0, unique_final_states: 1,
+deterministic_recovery: true`.
+
+Two things deliberately left alone, both recorded rather than fixed:
+
+- `scenarios/s6/run-one.yml` initialises `run_comparison.json` to `[]` and
+  nothing ever writes it. Nothing reads it either — `aggregate-results.sh`
+  computes recovery variance from `run_summary.json` — so it is inert, but it
+  should not be read as "compared, found nothing".
+- The `pkill -f` self-match in `roles/fault-inject/tasks/teardown.yml`, already
+  documented at `scenarios/s3/playbook.yml:207`. Harmless there because the
+  target dies anyway and the rc is ignored; D18 was the same bug in a place
+  where it *was* load-bearing, and that one is fixed.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
@@ -1187,11 +1242,12 @@ status* above for where each one landed. The remaining work is all lab time:
    above. Six of nine execute correctly. Fix D12 (S23), D13 (S25) and D14 (S26)
    and re-validate those three before the sweep — S26 in particular must not be
    run unattended, as it leaves the cluster a node short.
-4. **Full sweep at N = 1.** `scripts/run-sweep-detached.sh` across all 23
-   scenarios, including S5 and S6, which have no archived results at all.
-   Rebuild the report and read the heatmap for detectors that fail the
-   calibration gate — `DETECTOR_INVALID` at this stage is a bug in the check,
-   not a finding.
+4. **Full sweep at N = 1.** Every scenario has now been run singly and comes
+   back OK / EFFECTIVE (see *Full-suite validation* above), so the sweep is no
+   longer a hunt for broken scenarios — it is the first coherent N = 1 dataset.
+   Run `scripts/run-sweep-detached.sh`, rebuild the report, and read the
+   heatmap for detectors that fail the calibration gate; `DETECTOR_INVALID` at
+   this stage is a bug in the check, not a finding.
 5. **Final collection at N ≥ 5.** `scripts/repeat-scenario.sh` per scenario,
    which is what makes I4 evaluable and turns the M4 durations into medians and
    IQRs rather than single observations. Budget the lab time: 23 scenarios at
