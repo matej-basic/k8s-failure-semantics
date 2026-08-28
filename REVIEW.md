@@ -840,6 +840,149 @@ single 112 s episode with `end_reason: clear_observed`.
 
 ---
 
+### Step 3 — S20–S28 validated singly, 2026-08-28
+
+All nine gray-failure scenarios executed for the first time, one
+`ansible-playbook` process each, with `playbooks/_health-check.yml` between them
+and a gate that stops the sequence rather than run later scenarios against a
+degraded lab. The gate fired once, after S26.
+
+| Scenario | Ran | Efficacy | Violations | Note |
+|---|---|---|---|---|
+| S20 pod-network partition | yes | EFFECTIVE | **I2, `duration_s` 19.011** | Exactly the signature §3 predicted: data plane dead, every node Ready |
+| S21 VIP split-brain | yes | EFFECTIVE | none | `split_observed: true`, `max_simultaneous_vip_holders: 2` |
+| S22 runtime/kubelet freeze | yes | EFFECTIVE | none | `target_process_frozen` fired |
+| S23 etcd NOSPACE | **fault aborted** | EFFECTIVE (wrongly) | I5 | D12 |
+| S24 admission webhook | yes | EFFECTIVE | none | Fail/Ignore contrast reproduced |
+| S25 APF starvation | **no** | — | — | D13, aborted before injection |
+| S26 node object deleted | **left lab degraded** | EFFECTIVE | I2 | D14 |
+| S27 clock skew | yes | EFFECTIVE | I3 | `clock_offset_applied`, offset still held mid-window |
+| S28 stale etcd member | yes | EFFECTIVE | none | `etcd_members_dropped` fired |
+
+Six of nine execute their fault correctly on first run. Three do not, and are
+recorded as D12–D14 below.
+
+**Two scenarios prove their fault and violate nothing.** S21 demonstrably put
+two nodes on the API VIP at once and S22 demonstrably froze the runtime, yet
+every invariant came back PRESERVED or NOT_APPLICABLE. That is not a failed run:
+it is the invariant set having no detector for either condition. Whether to add
+one is a question for the paper — but "EFFECTIVE, no violations" should not be
+read as "nothing happened".
+
+**`require_proposed` is advisory, and S23 shows the cost.** The suite already
+emits the signals a scenario *would* assert if the vocabulary supported them —
+S23 emitted `require_proposed: ["cluster_writes_rejected", "etcd_alarm_armed"]`
+with `require_proposed_satisfied: false`, correctly identifying that its own
+fault never happened — but nothing consumes that field, so the run still
+reported `EFFECTIVE`. Promoting `require_proposed` to binding once its signals
+are implemented is the smallest change that would have caught D12 automatically.
+Note this is NOT a claim that the efficacy gate is generally vacuous: `required`
+comes from `fault_efficacy_defaults` keyed by fault class, and
+`roles/fault-inject/defaults/main.yml` explains why most gray-failure classes
+deliberately declare none — asserting "the cluster visibly reacted" would mark a
+correctly-executed gray-failure run FAULT_INEFFECTIVE.
+
+---
+
+### D12 — S23's fault never executes: `etcdctl` refuses `ETCDCTL_ENDPOINTS` alongside `--endpoints`
+
+Open. S23 aborts mid-fault, immediately after lowering the backend quota and
+restarting the target member:
+
+```
+etcdctl --endpoints=https://10.0.0.56:2379 endpoint status
+{"level":"fatal","msg":"conflicting environment variable is shadowed by
+ corresponding command-line flag (either unset environment variable or disable
+ flag))","environment-variable":"ETCDCTL_ENDPOINTS"}
+```
+
+etcd 3.5.30's `etcdctl` treats an environment variable shadowed by its
+command-line equivalent as fatal. The play sets `ETCDCTL_ENDPOINTS` in the task
+environment *and* passes `--endpoints`.
+
+The run then jumps to teardown and completes: quota drop-in removed, ballast
+removed, alarms disarmed, safety net confirming the cluster writable. The lab is
+left clean — but the NOSPACE phase never ran. Evidence: no mid-fault snapshot at
+all (`pre_fault` → `post_clear_t30`), no `rw_contrast_nospace_*.json`, and
+`etcd_alarm_armed: null`.
+
+It nonetheless reported `EFFECTIVE` off an incidental `lease_holder_changed`,
+and produced a full invariant set including I5 VIOLATED — verdicts describing a
+cluster whose intended fault never occurred.
+
+**Fix.** Either drop `--endpoints` and let the environment variable stand, or
+clear it for the invocation (`env -u ETCDCTL_ENDPOINTS etcdctl --endpoints=…`).
+Audit every `etcdctl` call in the suite for the same shadowing, not just this
+one. Then make `require_proposed` binding so a repeat cannot pass as EFFECTIVE.
+
+---
+
+### D13 — S25's FlowSchema is rejected by the API server, so it never injects
+
+Open. S25 fails at its first apply and never reaches injection:
+
+```
+The FlowSchema "s25-flood" is invalid:
+spec.rules[0].resourceRules[0].namespaces: Required value:
+resource rules that are not cluster scoped must supply at least one namespace
+```
+
+`scenarios/s25/playbook.yml:260` declares `verbs/apiGroups/resources: ["*"]` with
+neither `namespaces` nor `clusterScope`. A `resourceRule` must supply one or the
+other.
+
+Teardown ran and verified no flood process survived on any worker, and the
+health check passed, so nothing is left behind — but the scenario has never
+injected anything. It produced no results directory and no invariant report.
+
+**Fix.** Add `namespaces: ["*"]` and `clusterScope: true` to the resource rule.
+Both are needed for a client whose requests span namespaced and cluster-scoped
+resources.
+
+---
+
+### D14 — S26 leaves the lab a node short: the kubelet does not re-register on its own
+
+Open, and the most consequential of the three.
+
+S26 deletes the Node object while the kubelet keeps running, then waits up to
+300 s for it to re-register. It does not. The kubelet stays `active` and retries
+a status *update* for an object that no longer exists:
+
+```
+kubelet_node_status.go:479 "Error updating node status, will retry"
+  err="error getting node \"worker1\": nodes \"worker1\" not found"
+```
+
+`systemctl restart kubelet` re-registers it immediately, under a **new** Node
+object (`AGE 1s`, new uid).
+
+**This is arguably S26's result rather than only its bug.** §3 proposed S26 to
+probe "identity re-creation with a live substrate"; what it found is that the
+substrate does *not* re-create the identity on its own — a kubelet whose Node
+object is deleted wedges rather than re-registering. That is a sharper finding
+than the scenario was written to expect, and it is the reason
+`node_identity_recreated` never fires.
+
+**The failure handling is exemplary and should be copied**, not changed: S26
+detected its own non-recovery and aborted loudly —
+
+```
+S26 DID NOT RECOVER — THE LAB IS LEFT DEGRADED
+The cluster is now short one node and EVERY LATER SCENARIO WILL MEASURE …
+```
+
+— and the inter-scenario health gate independently stopped the sequence. Without
+both, S27 and S28 would have run against a five-node cluster and produced
+plausible, wrong results.
+
+**Fix.** S26's recovery step must restart the kubelet rather than wait for a
+re-registration that does not come, and the scenario should record the fact that
+a restart was required as evidence, since that *is* the finding. Until then S26
+must not be run unattended.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
@@ -1040,10 +1183,10 @@ status* above for where each one landed. The remaining work is all lab time:
    and the S12 etcd-peer flap. Confirm `.observers[]` arrives populated, that
    S11 moves worker1 out of `Ready=True`, and that S2's two postgres copies
    both mount the NFS PV. Nothing downstream is worth running until this passes.
-3. **Validate the new scenarios once each.** S20–S28 have never executed. Run
-   them singly and check each against its own efficacy assertion before
-   committing them to a full sweep — a scenario that comes back
-   `FAULT_INEFFECTIVE` needs its injection fixed, not more repetitions.
+3. ~~**Validate the new scenarios once each.**~~ Done 2026-08-28; see *Step 3*
+   above. Six of nine execute correctly. Fix D12 (S23), D13 (S25) and D14 (S26)
+   and re-validate those three before the sweep — S26 in particular must not be
+   run unattended, as it leaves the cluster a node short.
 4. **Full sweep at N = 1.** `scripts/run-sweep-detached.sh` across all 23
    scenarios, including S5 and S6, which have no archived results at all.
    Rebuild the report and read the heatmap for detectors that fail the
