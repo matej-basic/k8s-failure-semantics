@@ -31,9 +31,11 @@ make the results defensible), Section 3 is coverage (new scenarios).
 
 ---
 
-## Implementation status — Aug 27 2026
+## Implementation status — Aug 28 2026
 
-**Section 1 (D1–D6) is implemented.** Sections 2 and 3 are not.
+**All three sections are implemented in the tree.** Everything that remains is
+lab execution: the suite has never been run against the cluster since the
+fixes landed, so `results/` is still the superseded May 2026 sweep.
 
 | Item | Status | Where |
 |------|--------|-------|
@@ -43,8 +45,16 @@ make the results defensible), Section 3 is coverage (new scenarios).
 | D4 I5 staleness, I9 quorum | fixed | `metrics-collect` (`.observers[]`, `.etcd.expected_members`), `check_i5`, `check_i9` |
 | D5 S11 VIP, S12 flap peers | fixed | `scenarios/s11/playbook.yml`, `scenarios/s12/playbook.yml`, `roles/fault-inject/tasks/network-flap.yml` |
 | D6 calibration gate, fault efficacy | fixed | `check-invariants.sh` (calibration pass, `fault_efficacy`), `roles/fault-inject/{defaults,tasks}/main.yml`, `scripts/aggregate-results.sh` |
-| M1–M5 methodology | open | — |
-| S20–S28 new scenarios | open | — |
+| S20–S28 new scenarios | added | `scenarios/s20`–`s28` (`f98f637`), README index (`834dc11`) |
+| M1 1 Hz continuous trace | done | `roles/metrics-collect` (`73410eb`), wired into every scenario (`62d37dc`) |
+| M2 explicit observer set | done | `metrics-collect` (`8b4ae4b`), `scripts/observer-disagreement-duration.sh` |
+| M3 repetition and statistics | harness done, data not collected | `scripts/repeat-scenario.sh` (`57da7bc`), cross-run stats (`493d366`), report rendering (`b328713`) |
+| M4 verdict vocabulary | done | `check-invariants.sh` — `NOT_APPLICABLE`, `DETECTOR_INVALID`, `FAULT_INEFFECTIVE`, `duration_s`, `scripts/violation-duration.sh` (`c0fe01a`) |
+| M5 numbering and docs | done | `README.md` "Why the numbering has gaps" (`67f2064`) |
+| S2 NFS enrichment | done | `roles/nfs-server/`, `postgres-stateful.yml` now mounts the `postgres-shared-nfs` PVC |
+| **Full re-run of the sweep** | **open** | `results/` still holds only the 2026-05-20/21 runs |
+| **N ≥ 5 data collection (M3)** | **open** | every scenario has one archived run; I4 still has no input |
+| **S5 and S6 results** | **open** | `results/s5` and `results/s6` do not exist |
 
 ### What the fixes do to the archived results
 
@@ -84,12 +94,23 @@ Offline, against the archived `results/` tree (no cluster required):
   while S2 stays `OK`.
 - `build-report.sh` rebuilt end to end over the corrected results.
 
-Not verified: anything requiring the lab. The Ansible changes are
-syntax-checked but unexecuted — in particular the per-API-server view task
-(which assumes the kubeadm API server certificate carries the node's own
-address in its SANs, the kubeadm default), the in-cluster probe, and the S11
-and S12 injection changes. First live run should confirm that `.observers[]`
-arrives populated and that S11 now moves worker1 out of `Ready=True`.
+Not verified: anything requiring the lab. Every change to the Ansible side —
+the D1–D6 fixes, the M1/M2 collection changes and all nine new scenarios — is
+syntax-checked but unexecuted. Specifically still unvalidated on hardware:
+
+- the per-API-server view task, which assumes the kubeadm API server
+  certificate carries the node's own address in its SANs (the kubeadm default);
+- the in-cluster probe (D3);
+- the S11 VIP and S12 etcd-peer injection fixes (D5) — the first live run should
+  confirm `.observers[]` arrives populated and that S11 moves worker1 out of
+  `Ready=True`;
+- the 1 Hz trace and the observer-disagreement matrix (M1, M2), including
+  whether the recorder keeps up for a full scenario duration;
+- S20–S28 in their entirety, and S2 against the NFS-backed PV.
+
+The next step is `scripts/preflight.sh`, then `scripts/run-sweep-detached.sh`,
+at N ≥ 5 via `scripts/repeat-scenario.sh`. Until that data exists, no number in
+`results/` or `report.html` should be cited.
 
 ---
 
@@ -552,20 +573,32 @@ make.
 
 ## 4. Suggested order of work
 
-1. **D1** (snapshot ordering) and **D2** (I3 condition) — both are a few lines
-   and both change the heatmap materially.
-2. **D3** (probe from inside the cluster) and **D5** (S11 VIP, S12 etcd peers) —
-   these make four scenarios measure something.
-3. **D6** (calibration gate + efficacy assertion) — cheap, and prevents the
-   whole class from recurring.
-4. Re-run the full sweep. The current `results/` and `report.html` predate the
-   5-member etcd cluster and should not be cited.
-5. **D4** (real staleness probe for I5, inventory-derived `n` for I9) and
-   **M1**/**M2** (1 Hz trace, explicit observer set) — this is where the paper's
-   headline numbers come from.
-6. **M3** (N ≥ 5) — final data collection.
-7. New scenarios, in the order listed: S20 and S21 give the most new signal for
-   the least new infrastructure.
+The code order below is done; what is left is the data. Steps 1–3, 5 and 7 of
+the original plan (D1–D6, M1–M5, S20–S28) are in the tree — see *Implementation
+status* above for where each one landed. The remaining work is all lab time:
+
+1. **Shake-down run.** `scripts/preflight.sh`, then a single pass over S2, S11
+   and S12 only. These three carry the changes most likely to be wrong on
+   contact: the in-cluster probe, the per-API-server views, the S11 VIP block
+   and the S12 etcd-peer flap. Confirm `.observers[]` arrives populated, that
+   S11 moves worker1 out of `Ready=True`, and that S2's two postgres copies
+   both mount the NFS PV. Nothing downstream is worth running until this passes.
+2. **Validate the new scenarios once each.** S20–S28 have never executed. Run
+   them singly and check each against its own efficacy assertion before
+   committing them to a full sweep — a scenario that comes back
+   `FAULT_INEFFECTIVE` needs its injection fixed, not more repetitions.
+3. **Full sweep at N = 1.** `scripts/run-sweep-detached.sh` across all 23
+   scenarios, including S5 and S6, which have no archived results at all.
+   Rebuild the report and read the heatmap for detectors that fail the
+   calibration gate — `DETECTOR_INVALID` at this stage is a bug in the check,
+   not a finding.
+4. **Final collection at N ≥ 5.** `scripts/repeat-scenario.sh` per scenario,
+   which is what makes I4 evaluable and turns the M4 durations into medians and
+   IQRs rather than single observations. Budget the lab time: 23 scenarios at
+   five runs is the largest single cost remaining in the project.
+5. **Retire the archived data.** Once the new sweep exists, delete or clearly
+   date-fence the 2026-05-20/21 `results/` tree and regenerate `report.html`
+   from the new runs. Until then, no number in either is citable.
 
 ---
 
