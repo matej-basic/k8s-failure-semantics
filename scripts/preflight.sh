@@ -53,7 +53,12 @@ if [ ! -f "$TFVARS" ]; then
   bad "terraform/terraform.tfvars not found — copy terraform.tfvars.example"
   log ""; log "preflight aborted."; exit 1
 fi
-tfvar() { grep -E "^\s*$1\s*=" "$TFVARS" | head -1 | sed -E 's/^[^=]*=\s*"?([^"]*)"?\s*$/\1/'; }
+# POSIX character classes, not \s: BSD sed (macOS, the usual control node)
+# does not understand \s and silently leaves the line unsubstituted.
+tfvar() {
+  grep -E "^[[:space:]]*$1[[:space:]]*=" "$TFVARS" | head -1 \
+    | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
+}
 VC_HOST=$(tfvar vcenter_server)
 VC_USER=$(tfvar vcenter_user)
 VC_PASS=$(tfvar vcenter_password)
@@ -141,7 +146,9 @@ import socket,sys
 s=socket.socket(); s.settimeout(3)
 sys.exit(0 if s.connect_ex(('$ip',$port))==0 else 1)" 2>/dev/null; then
     if [ "$port" = 22 ] && [ -f "$KEY_EXPANDED" ]; then
-      if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+      # -n: the caller is a `while read` over a heredoc, and ssh would
+      # otherwise consume the remaining node list from stdin.
+      if ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
              -i "$KEY_EXPANDED" "$SSH_USER@$ip" true 2>/dev/null; then
         ok "$(printf '%-9s %-12s' "$name" "$ip") ssh ok"
       else
