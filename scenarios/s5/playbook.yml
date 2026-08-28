@@ -168,8 +168,16 @@
         source: "{{ item }}"
         jump: DROP
         comment: "fault-inject-api-block-{{ scenario_id }}"
-      loop: "{{ groups['workers'] | map('extract', hostvars, 'ansible_host') | list
-               + [hostvars[groups['observer'][0]]['ansible_host']] }}"
+      # The observer is `localhost ansible_connection=local` (inventory), and
+      # localhost has no ansible_host, so indexing it raised
+      # "'HostVarsVars object' has no attribute 'ansible_host'" and killed the
+      # play on every control-plane host before a single rule was added
+      # (REVIEW.md D25). Include the observer only when it actually has a
+      # routable address to block; with a local connection there is nothing on
+      # the cluster network to drop, and the workers still are.
+      loop: "{{ (groups['workers'] | map('extract', hostvars, 'ansible_host') | list)
+               + ([ hostvars[groups['observer'][0]].ansible_host ]
+                  if (hostvars[groups['observer'][0]].ansible_host is defined) else []) }}"
 
 - name: S5 — Wait during API disruption
   hosts: localhost
