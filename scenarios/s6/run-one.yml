@@ -118,6 +118,17 @@
       - cp1
       - cp2
       - cp3
+    # The API VIP, for exactly the reason S2 and S11 carry it (REVIEW.md D5):
+    # the kubelet reaches the API server through keepalived at {{ api_vip }},
+    # not through the individual control-plane addresses, so blocking only
+    # cp1/cp2/cp3 leaves the heartbeat path open and the node never leaves
+    # Ready. S6 was never given this fix. Every iteration of the 2026-08-28
+    # batch recorded worker1 Ready=True in all three snapshots: the partition
+    # was inert, and "all five repetitions converged to the same final state"
+    # — the basis for I4 — was five repetitions of an undisturbed cluster
+    # (REVIEW.md D27).
+    extra_peer_ips:
+      - "{{ api_vip }}"
   roles:
     - role: fault-inject
 
@@ -224,3 +235,30 @@
             "final_lease_holder": {{ final_lease_holder.stdout }}
           }
       delegate_to: "{{ groups['observer'][0] }}"
+
+- name: "S6 Run {{ run_number }} — Invariant report for this iteration"
+  # Every other scenario ends by running the checker; S6 did not, so its five
+  # iterations produced snapshots and a run_summary and nothing that reads
+  # them. scripts/aggregate-results.sh could still compute recovery variance
+  # (it reads run_summary.json), but the cross-scenario heatmap looks for an
+  # invariant_report per run directory and therefore rendered S6 as NOT_RUN /
+  # NO_DATA after a clean five-iteration batch — the exact confusion D6
+  # objected to, a scenario that ran and one that never ran looking identical
+  # (REVIEW.md D26).
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    results_dir: "{{ run_results_dir }}"
+  tasks:
+    - command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
+      register: s6_invariant_report
+      changed_when: false
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.json"
+        content: "{{ s6_invariant_report.stdout }}"
+
+    - copy:
+        dest: "{{ results_dir }}/invariant_report.txt"
+        content: "{{ s6_invariant_report.stdout }}"
