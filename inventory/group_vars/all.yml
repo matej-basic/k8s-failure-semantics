@@ -313,7 +313,15 @@ observer_informer_ready_timeout: 60
 # trace-start, the delete in trace-stop and the `kubectl logs job/...` in
 # snapshot.yml all address the same name without re-deriving it. run_id carries
 # an underscore, which is not legal in a DNS-1123 name, hence the replace.
-informer_object_name: "{{ observer_informer_name }}-{{ scenario_id }}-{{ run_id | replace('_', '-') | lower }}"
+# scenario_id is sanitised the same way run_id is. S6's repeat harness sets
+# scenario_id to s6_run1 … s6_run5, and an underscore is not legal in an RFC
+# 1123 object name: "ServiceAccount \"k8s-obs-informer-s6_run1-…\" is invalid:
+# metadata.name … a lowercase RFC 1123 subdomain must consist of …". The
+# informer could therefore never be created for any S6 iteration, and any
+# future scenario_id carrying an underscore would hit the same wall
+# (REVIEW.md D23).
+informer_object_name: >-
+  {{ observer_informer_name }}-{{ scenario_id | replace('_', '-') | lower }}-{{ run_id | replace('_', '-') | lower }}
 
 # ── Per-API-server sampling inside the 1 Hz trace ─────────────────────────────
 # The M1 recorder samples ONE API server, so its records cannot show two

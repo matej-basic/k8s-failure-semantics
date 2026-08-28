@@ -37,6 +37,25 @@
       register: r
       until: r.rc == 0
 
+- name: "S6 Run {{ run_number }} — Create this iteration's results directory"
+  # Every other scenario creates its results directory in its pre-flight play.
+  # run-one.yml has no pre-flight play, so nothing created
+  # results/s6_run<N>/<run_id> and the first task to write into it -
+  # fault-inject's "Declare what this fault must observably do" - failed with
+  # "Destination directory ... does not exist", taking the iteration with it
+  # (REVIEW.md D24). Created here, before any play that writes evidence.
+  hosts: "{{ groups['observer'][0] }}"
+  gather_facts: no
+  vars:
+    scenario_id: "s6_run{{ run_number }}"
+    results_dir: "{{ run_results_dir }}"
+  tasks:
+    - name: Ensure the iteration results directory exists
+      file:
+        path: "{{ results_dir }}"
+        state: directory
+        mode: '0755'
+
 - name: "S6 Run {{ run_number }} — Start the continuous 1 Hz observer trace"
   # The trace calls go in run-one.yml, not in playbook.yml, because run-one.yml
   # IS S6's unit of repetition. playbook.yml imports it five times and

@@ -1220,6 +1220,13 @@ fault_efficacy() {
         | ((.podNamespace // "default") + "/" + .podName + "@" + $h) ]
       | unique;
     def members: (.etcd.member_status | length) // 0;
+    # Same shape check_i9 uses for leader_or_term_divergence, factored out so
+    # the invariant and the efficacy signal cannot drift apart.
+    def split_view:
+      [ .etcd.member_status[]? | { leader: (.Status.leader // null),
+                                   term:   (.Status.raftTerm // null) } ] as $m
+      | { leaders: ([ $m[].leader | select(. != null) ] | unique),
+          terms:   ([ $m[].term   | select(. != null) ] | unique) };
     def probe:   (.external_probe.httpCode // null);
     def holders: [ (.control_plane.controller_manager_lease.holder // empty),
                    (.control_plane.scheduler_lease.holder // empty) ];
@@ -1239,6 +1246,24 @@ fault_efficacy() {
            and (([ $rest[] | select(((. | probe) != null) and ((. | probe) != ($base | probe))) ] | length) > 0)),
         placement_changed:
           (([ $rest[] | select((. | placement) != ($base | placement)) ] | length) > 0),
+
+        # Raft split, observed the way check_i9 observes it: two distinct
+        # leader IDs, or two distinct raft terms, among the members that
+        # answered in ONE snapshot — and not already true at baseline.
+        #
+        # etcd_members_dropped cannot express this. A peer-port partition
+        # (S19 blocks 2380, not 2379) leaves every member answering client
+        # requests, so the member COUNT never falls: S19 split raft cleanly,
+        # I9 recorded leader_or_term_divergence with terms [2,3], and the run
+        # was still reported FAULT_INEFFECTIVE because the one signal it was
+        # required to produce was a count that cannot move (REVIEW.md D22).
+        etcd_quorum_split_observed:
+          (((($base | split_view).leaders | length) <= 1
+            and (($base | split_view).terms | length) <= 1)
+           and (([ $rest[]
+                   | select(((. | split_view).leaders | length) > 1
+                            or ((. | split_view).terms | length) > 1) ]
+                 | length) > 0)),
 
         # The API server stopped answering at all for at least one snapshot
         # while it had answered at baseline. Recorded separately so that a

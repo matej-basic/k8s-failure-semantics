@@ -162,7 +162,8 @@
             "fault_type": "etcd_quorum_split",
             "efficacy": {
               "target_node": "",
-              "require": ["etcd_members_dropped"]
+              "_comment": "etcd_quorum_split_observed, NOT etcd_members_dropped. This scenario blocks the PEER port 2380, not the client port 2379, so every member keeps answering client requests and the member count never falls - the old requirement could not fire by construction. The 2026-08-28 run split raft cleanly (I9 VIOLATED, leader_or_term_divergence, terms [2,3]) and was still reported FAULT_INEFFECTIVE. See REVIEW.md D22.",
+              "require": ["etcd_quorum_split_observed"]
             }
           }
       delegate_to: "{{ groups['observer'][0] }}"
