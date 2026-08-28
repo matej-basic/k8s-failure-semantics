@@ -104,6 +104,13 @@
   gather_facts: no
   vars:
     scenario_id: "s6_run{{ run_number }}"
+    # Without this, results_dir falls back to results_base/<scenario_id>/<run_id>
+    # — results/s6_run1/<run_id>, a path this harness never creates and not
+    # where the iteration's evidence belongs. fault-inject writes
+    # scenario_meta.json there, so the play died with "Destination directory
+    # does not exist" and took the iteration with it (REVIEW.md D24). Every
+    # other play in this file already overrides it; these two did not.
+    results_dir: "{{ run_results_dir }}"
     fault_type: network_asymmetric
     target_host: worker1
     direction: outbound
@@ -146,6 +153,7 @@
   gather_facts: no
   vars:
     scenario_id: "s6_run{{ run_number }}"
+    results_dir: "{{ run_results_dir }}"      # see the inject play above
     fault_type: teardown
   roles:
     - role: fault-inject
