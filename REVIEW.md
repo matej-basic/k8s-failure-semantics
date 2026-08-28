@@ -119,33 +119,40 @@ First execution of any of this against the lab, per step 1 of the work order.
 authenticating, refresh-only plan clean) and the cluster was healthy going in:
 6 nodes Ready, v1.36.1, Ubuntu 24.04.
 
-**The shake-down is blocked at S2 by D7 below.** S11 and S12 were not attempted:
-`run_id` lives in `inventory/group_vars/all.yml` and every scenario derives
-`results_dir` from it, so they fail the same way. Three defects found, two
-fixed:
+D7 blocked the first attempt entirely; with it fixed, S2 ran end to end and
+wrote a single complete result directory. Five defects found, four fixed:
 
 | # | Defect | Status |
 |---|--------|--------|
 | — | `preflight.sh` used `\s` in `sed -E` (BSD sed leaves the line unsubstituted) and let `ssh` eat the heredoc node list | fixed, `a957d12` |
 | — | `roles/nfs-server` wrote `/etc/exports.d/*.exports` without creating the directory; Ubuntu 24.04's `nfs-kernel-server` does not ship it | fixed |
-| **D7** | **`run_id` is a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference** | **open — blocks everything** |
+| D7 | `run_id` was a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference | fixed |
+| — | `observer_informer_image` was `bitnami/kubectl:1.29`; Bitnami retired their public Docker Hub catalogue in 2025, so the informer Job sat in `ImagePullBackOff` | fixed |
+| **D8** | **S2 never applies the workload it measures; the divergence ledger comes back empty and is reported as `SINGLE_WRITER`** | **open** |
 
-What did work, and is now confirmed against hardware rather than assumed:
+What is now confirmed against hardware rather than assumed:
 
-- **The S2 NFS enrichment.** `postgres-shared-nfs` binds RWX with
-  `Retain`, and `postgres-stateful-0` runs on worker1 with its `data` volume
-  backed by the PVC. The pin play (cordon → delete → wait → uncordon) placed it
-  correctly. This is the change that makes dual ownership consequential and it
-  had never executed before.
-- **The trace recorder's safety design.** Recorders left behind by the aborted
-  run were running under `timeout --kill-after=30 1140` and expired on their
-  own. The "detached but bounded" claim in the play header holds.
+- **`run_id` is stable.** One S2 run, one result directory, holding the full
+  set: seven snapshots, `trace_meta.json`, `run_index.txt`, `scenario_meta.json`
+  and the node-local container captures.
+- **The NFS server half of the S2 enrichment.** `postgres-shared-nfs` binds RWX
+  with `Retain`, exported from worker3. The *workload* half does not work — see
+  D8 — so dual-ownership harm is still unmeasured.
+- **The pin play.** cordon → delete → wait → uncordon placed
+  `postgres-stateful-0` on worker1 as intended.
+- **The informer is created and named correctly** once `run_id` holds still.
+- **The trace recorder's safety design.** Recorders orphaned by the aborted run
+  ran under `timeout --kill-after=30 1140` and expired on their own; the next
+  run's trace-start reaped them, as its header claims.
 - **Failure containment.** The aborted run left no cordons, no injected DROP
   rules and no informer Job. The lab returned to baseline without a revert.
 
-Still unverified, because the run never reached them: fault injection itself,
-the observer views arriving populated, the S11 VIP fix, the S12 flap, and
-every one of S20–S28.
+One known footgun, already documented in the tree and left alone: the
+`pkill -f` teardown tasks in `roles/fault-inject/tasks/teardown.yml` match the
+calling shell's own argv and return `rc: -15`. `scenarios/s3/playbook.yml:207`
+explains this and accepts it — the target dies regardless — but it does mean
+teardown reports failures on every run, which is noise a real teardown failure
+would hide in.
 
 ---
 
@@ -502,6 +509,64 @@ Options, cheapest first:
 Whichever is chosen, add an assertion that the value is stable — a first-play
 `set_fact` of `run_id` compared against `run_id` re-read in the last play — so
 a regression here fails loudly instead of producing empty directories.
+
+---
+
+### D8 — S2 never applies the workload it measures, so its headline evidence is empty
+
+Found on the 2026-08-28 shake-down, once D7 was fixed and S2 ran end to end for
+the first time.
+
+`scenarios/s2/playbook.yml` applies `roles/nfs-server`, which installs the
+server, creates the `postgres-shared-nfs` PV and PVC, and binds them. It does
+**not** apply `roles/k8s-install/files/postgres-stateful.yml`. The StatefulSet
+is only ever applied by `playbooks/setup-cluster.yml`, at cluster build time.
+
+So on a cluster built before the NFS enrichment landed — which is every cluster
+that currently exists — S2 runs against the *old* workload:
+
+```
+running:  containers=[postgres]                     volumes=[{"emptyDir":{},"name":"data"}]
+manifest: containers=[postgres, divergence-writer]  volumes=[shared → PVC postgres-shared-nfs]
+```
+
+The PVC binds and then nothing mounts it (`kubectl get pods -o json` → no pod
+references any PVC). The `divergence-writer` sidecar, which is the only thing
+that writes to the shared volume, does not exist in the running pod, so the
+ledger is never written.
+
+**Impact.** `divergent_writes.json` from that run:
+
+```json
+{"total_records": 0, "distinct_pod_uids": 0, "writers": [],
+ "concurrent_window": {"overlapping": false}, "verdict": "SINGLE_WRITER"}
+```
+
+Zero records is *missing data*. It is reported as `SINGLE_WRITER`, whose own
+embedded note glosses it as "only one copy ever wrote, so the run carries no
+dual-ownership harm" — a substantive negative finding, drawn from a ledger no
+process was ever able to write to. This is the exact failure mode D6 and M4
+were written to prevent, reproduced in a new artefact that predates neither.
+
+**Fix**, both halves needed:
+
+1. S2 must guarantee the workload it measures. Either apply
+   `postgres-stateful.yml` itself before pinning the pod, or assert that the
+   running StatefulSet carries the `divergence-writer` container and a
+   `persistentVolumeClaim` volume, and fail the run as `FAULT_INEFFECTIVE` if
+   not. An assertion is preferable: it keeps scenario and deployment concerns
+   separate and names the problem instead of silently mutating the cluster
+   mid-suite.
+2. `divergent_writes.json` needs the same verdict discipline as the invariants:
+   `total_records == 0` is `INSUFFICIENT_DATA`, never `SINGLE_WRITER`.
+   `SINGLE_WRITER` should require at least one parsed record from exactly one
+   writer.
+
+**Also worth checking during the fix.** The suite has no general assertion that
+the cluster's running workloads match the manifests in the tree. Any scenario
+whose finding depends on a workload detail is exposed the same way; S2 is
+simply the one where the gap was visible, because its evidence file came back
+empty rather than merely wrong.
 
 ---
 

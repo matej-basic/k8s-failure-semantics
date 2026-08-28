@@ -96,7 +96,7 @@
               serviceAccountName: default
               containers:
               - name: controller
-                image: bitnami/kubectl:1.29
+                image: "{{ observer_informer_image }}"
                 command: ["/bin/sh", "-c"]
                 args:
                   - |

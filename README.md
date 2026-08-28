@@ -54,12 +54,18 @@ ansible -i inventory/hosts.ini etcd[0] -m shell -a \
 
 ### Step 4 — Run a single scenario
 
+`run_id` stamps every artefact path, so it has to be fixed once for the whole
+invocation. Export it, or pass `-e run_id=...`; a run with neither set stops
+immediately rather than scattering its results across directories (REVIEW.md
+D7). The sweep and repeat harnesses set it for you.
+
 ```bash
 # Example: run S2 (asymmetric worker isolation)
+export K8SFS_RUN_ID=$(date +%Y%m%d_%H%M%S)
 ansible-playbook -i inventory/hosts.ini scenarios/s2/playbook.yml \
   -e results_base=$(pwd)/results
 
-# Results are written to results/s2/<timestamp>/
+# Results are written to results/s2/$K8SFS_RUN_ID/
 ```
 
 ### Step 5 — Run all scenarios

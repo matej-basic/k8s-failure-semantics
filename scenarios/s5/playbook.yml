@@ -51,7 +51,7 @@
               serviceAccountName: default
               containers:
               - name: reconciler
-                image: bitnami/kubectl:1.29
+                image: "{{ observer_informer_image }}"
                 command: ["/bin/sh", "-c"]
                 args:
                   - |
@@ -79,7 +79,7 @@
               serviceAccountName: default
               containers:
               - name: reconciler
-                image: bitnami/kubectl:1.29
+                image: "{{ observer_informer_image }}"
                 command: ["/bin/sh", "-c"]
                 args:
                   - |

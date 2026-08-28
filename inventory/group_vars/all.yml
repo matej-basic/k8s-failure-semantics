@@ -14,7 +14,26 @@ ansible_shell_executable: /bin/bash
 # ── Scenario metadata ─────────────────────────────────────────────────────────
 scenario_id: "unset"
 scenario_name: "unset"
-run_id: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+# run_id must be CONSTANT for one invocation: results_dir, informer_object_name
+# and every artefact path derive from it.
+#
+# It used to be `lookup('pipe', 'date +%Y%m%d_%H%M%S')`. group_vars are lazy,
+# so that was re-evaluated at every reference and changed whenever the clock
+# crossed a second. One S2 run saw four different values — two result
+# directories holding one file between them, and an informer rendered under one
+# name and applied under another (REVIEW.md D7).
+#
+# The environment is stable for the life of the ansible-playbook process, so
+# take it from there. `-e run_id=...` still wins over this (extra vars are
+# literals, evaluated once) and is what scripts/run-sweep-detached.sh and
+# scripts/repeat-scenario.sh already pass.
+#
+# Deliberately fatal when neither is set: a silent fallback to the clock is the
+# defect this replaces. See README step 4 for the single-scenario invocation.
+run_id: >-
+  {{ lookup('env', 'K8SFS_RUN_ID')
+     | default(undef('run_id is unset: export K8SFS_RUN_ID=$(date +%Y%m%d_%H%M%S) '
+                     ~ 'or pass -e run_id=... (see README step 4)'), true) }}
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 fault_duration: 60          # seconds fault is active
@@ -226,9 +245,15 @@ observer_dataplane_endpoints: true
 observer_informer_enabled: true
 observer_informer_namespace: kube-system
 observer_informer_name: "k8s-obs-informer"
-# Already used in-cluster by scenarios/s5 and scenarios/s14, so it is a known
-# pullable image on this lab rather than a new dependency.
-observer_informer_image: bitnami/kubectl:1.29
+# Was bitnami/kubectl:1.29 on the strength of scenarios/s5 and s14 already
+# using it. That stopped being true: Bitnami retired their public Docker Hub
+# catalogue in 2025 and the tag no longer resolves, so the informer Job sat in
+# ImagePullBackOff and every snapshot recorded informer_absent (found on the
+# 2026-08-28 shake-down). registry.k8s.io/kubectl is published by the
+# Kubernetes project itself, is version-matched to the cluster, and is not
+# subject to Docker Hub pull limits. Keep the tag in step with the cluster
+# version on upgrade.
+observer_informer_image: registry.k8s.io/kubectl:v1.36.1
 # Seconds between the informer's own sampling loops. Deliberately slower than
 # the 1 Hz trace: the informer is consulted by snapshots (every 30-60 s), not
 # per tick, and each of its three reads is bounded at 0.30 x this so all three
