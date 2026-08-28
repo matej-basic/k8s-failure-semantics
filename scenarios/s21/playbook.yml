@@ -447,6 +447,20 @@
       vars:
         snapshot_label: pre_fault
 
+- name: S21 — Clear sticky unreachable state so teardown can run
+  # Ansible marks a host unreachable on its first unreachable task, and that
+  # marker is STICKY ACROSS PLAYS: the host is silently dropped from every
+  # later play, teardown included. On 2026-08-28 S1 lost cp1 to an ssh hiccup
+  # mid-fault, its "Tear down partition" play was skipped for that host, and
+  # seven DROP rules survived the run — cp1's API server could not reach etcd,
+  # the VIP went down with it, and the sweep halted (REVIEW.md D20).
+  # localhost is always reachable, so this play is guaranteed to run and to
+  # reset that state before the teardown below.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: S21 — Inject the VRRP split, measure it, and restore unconditionally
   hosts: k8s_cluster:etcd
   gather_facts: no
@@ -827,6 +841,10 @@
       # endpoint for every scenario that runs after this one, so none of
       # this may be conditional on the measurement having worked.
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         - name: Remove the VRRP block rules
           shell: |
             iptables-save | grep -v "{{ s21_rule_comment }}" | iptables-restore

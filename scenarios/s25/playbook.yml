@@ -644,6 +644,10 @@
 
       # ── Unconditional teardown ─────────────────────────────────────────────
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         # Order matters: kill FIRST (idempotently, without failing the play),
         # then remove the APF objects, then LAST assert no flood survived. If
         # the kill somehow left survivors, the APF cleanup still runs before the

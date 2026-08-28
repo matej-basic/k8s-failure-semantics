@@ -344,6 +344,20 @@
     - role: metrics-collect
 
 # ─────────────────────────────────────────────────────────────────────────────
+- name: S27 — Clear sticky unreachable state so teardown can run
+  # Ansible marks a host unreachable on its first unreachable task, and that
+  # marker is STICKY ACROSS PLAYS: the host is silently dropped from every
+  # later play, teardown included. On 2026-08-28 S1 lost cp1 to an ssh hiccup
+  # mid-fault, its "Tear down partition" play was skipped for that host, and
+  # seven DROP rules survived the run — cp1's API server could not reach etcd,
+  # the VIP went down with it, and the sweep halted (REVIEW.md D20).
+  # localhost is always reachable, so this play is guaranteed to run and to
+  # reset that state before the teardown below.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: S27 — Inject skew, hold, then restore no matter what
   # One play over the whole cluster, not a target-only play, so that the
   # cluster-wide metrics-collect snapshots taken during the fault window sit
@@ -617,6 +631,10 @@
           vars: { snapshot_label: fault_t_end }
 
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
 
         # ── Restore — runs whatever happened above ───────────────────────
 

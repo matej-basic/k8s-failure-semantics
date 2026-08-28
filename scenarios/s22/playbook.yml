@@ -454,6 +454,10 @@
           run_once: true
 
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         # ── Resume. Idempotent by construction ────────────────────────────
         # SIGCONT to a process that is already running is a no-op, so this is
         # safe to run whether or not the SIGSTOP above ever happened, and safe

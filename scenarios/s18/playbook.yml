@@ -236,6 +236,16 @@
         dest: "{{ results_dir }}/placement_analysis.json"
         content: "{{ placement_analysis.stdout }}"
 
+- name: S18 — Clear sticky unreachable state so the cleanup below can run
+  # REVIEW.md D20: an unreachable marker is sticky across plays, so a host lost
+  # to an ssh hiccup mid-fault is silently dropped from every later play —
+  # here that would leave stress-ng hammering worker3.
+  # localhost is always reachable, so this play always runs and resets it.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: S18 — Clean up stress-ng if still running
   hosts: worker3
   gather_facts: no

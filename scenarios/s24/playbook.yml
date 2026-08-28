@@ -489,6 +489,10 @@
       # that runs after it in the sweep, so this section assumes nothing about
       # the state it inherits.
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         - name: Remove the S24 webhook configuration
           # Attempted from EVERY control-plane node rather than run_once on
           # one of them: if the designated node is unreachable at teardown

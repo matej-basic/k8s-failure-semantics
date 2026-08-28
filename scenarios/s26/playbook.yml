@@ -1022,6 +1022,10 @@
               {{ ansible_failed_task.name | default('unknown task') }}:
               {{ ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail')) }}
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         - name: Save the recovery verification record
           copy:
             dest: "{{ results_dir }}/recovery_verification.json"

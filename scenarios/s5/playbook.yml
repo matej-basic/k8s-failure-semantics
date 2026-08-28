@@ -188,6 +188,20 @@
       shell: |
         iptables-save | grep -v "fault-inject-api-block-{{ scenario_id }}" | iptables-restore
 
+- name: S5 — Clear sticky unreachable state so teardown can run
+  # Ansible marks a host unreachable on its first unreachable task, and that
+  # marker is STICKY ACROSS PLAYS: the host is silently dropped from every
+  # later play, teardown included. On 2026-08-28 S1 lost cp1 to an ssh hiccup
+  # mid-fault, its "Tear down partition" play was skipped for that host, and
+  # seven DROP rules survived the run — cp1's API server could not reach etcd,
+  # the VIP went down with it, and the sweep halted (REVIEW.md D20).
+  # localhost is always reachable, so this play is guaranteed to run and to
+  # reset that state before the teardown below.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: S5 — Capture amplification burst (immediate post-reconnect)
   hosts: k8s_cluster:etcd
   gather_facts: no

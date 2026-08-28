@@ -899,6 +899,10 @@
       # from a clean finish, from a mid-injection failure, and from the repair
       # path of a previous aborted run.
       always:
+        - name: Clear per-host error state so teardown runs everywhere
+          # See REVIEW.md D20: an unreachable marker is sticky across plays and
+          # would silently skip the teardown steps below.
+          meta: clear_host_errors
         - name: TEARDOWN — remove S28 isolation rules from every etcd host
           # Run per host rather than delegated to one, so a single unreachable
           # host cannot leave rules behind anywhere else. Only S28's own

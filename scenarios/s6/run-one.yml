@@ -112,6 +112,16 @@
   roles:
     - role: metrics-collect
 
+- name: "S6 Run {{ run_number }} — Clear sticky unreachable state before lifting"
+  # REVIEW.md D20: an unreachable marker is sticky across plays, so a worker
+  # lost to an ssh hiccup during the isolation window would be dropped from the
+  # Lift fault play below and stay partitioned — for this iteration AND every
+  # one after it, since this file runs five times.
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - meta: clear_host_errors
+
 - name: "S6 Run {{ run_number }} — Lift fault"
   hosts: worker1
   gather_facts: no
