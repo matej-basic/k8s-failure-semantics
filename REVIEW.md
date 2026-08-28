@@ -128,8 +128,41 @@ wrote a single complete result directory. Five defects found, four fixed:
 | — | `roles/nfs-server` wrote `/etc/exports.d/*.exports` without creating the directory; Ubuntu 24.04's `nfs-kernel-server` does not ship it | fixed |
 | D7 | `run_id` was a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference | fixed |
 | — | `observer_informer_image` was `bitnami/kubectl:1.29`; Bitnami retired their public Docker Hub catalogue in 2025, so the informer Job sat in `ImagePullBackOff` | fixed |
+| **D10** | **the informer still records `informer_absent` in every snapshot after the image fix, while `trace_meta.json` calls it ready** | **open** |
 | D8 | S2 never applies the workload it measures; the divergence ledger came back empty and was reported as `SINGLE_WRITER` | fixed (assertion + verdict); needs the workload re-applied to the lab |
 | D9 | `script:` shipped check-invariants.sh to a temp dir, so `violation-duration.sh` was never found and every `duration_s` was null | fixed |
+
+**Runs completed: S2 (twice), S11, S12 — all four `run_validity: OK`,
+`fault_efficacy: EFFECTIVE`, zero task failures.** Results:
+
+| Scenario | Verdicts | What it establishes |
+|---|---|---|
+| S2 `20260828_104635` | I1, I2, I3 VIOLATED; I5, I6, I9, I10 PRESERVED; I4 INSUFFICIENT_DATA | `postgres-stateful-0` running on worker1 **and** worker3 across 3 snapshots, confirmed node-locally |
+| S11 `20260828_102436` | I3 VIOLATED; I6, I9 NOT_APPLICABLE; 4 PRESERVED | The D5 VIP fix works: worker1 now leaves `Ready=True` |
+| S12 `20260828_103525` | all PRESERVED | The D5 flap fix works: `lease_holder_changed` fired |
+
+**S2's headline result, which is what the NFS enrichment was for:**
+
+```json
+{"verdict": "UNFENCED_CONCURRENT_WRITES", "total_records": 946,
+ "distinct_pod_uids": 2, "distinct_nodes": 2, "writer_alternations": 640,
+ "concurrent_window": {"start": "08:52:46.133Z", "end": "08:58:08.216Z",
+                       "overlapping": true}}
+```
+
+Two pod UIDs on two nodes under one StatefulSet identity, alternating 640 times
+across a 5m22s overlapping window on one shared volume. That is two live
+processes writing to the same volume with no fencing — the claim §3 argued the
+paper actually wants — where the pre-fix run of the same scenario reported
+`total_records: 0`.
+
+**S11 is the sharper observer-relative finding.** I3 VIOLATED with worker1 at
+`Ready=Unknown` while its containers keep running: declared-uncertain rather
+than declared-failed, which is the I3b split §1's D2 entry proposed. Before the
+D2 and D5 fixes this scenario reported an undisturbed cluster.
+
+Note also that S11 and S12 return `NOT_APPLICABLE` where they used to inflate
+the preserved count — the M4 vocabulary doing its job on live data.
 
 What is now confirmed against hardware rather than assumed:
 
@@ -141,12 +174,32 @@ What is now confirmed against hardware rather than assumed:
   D8 — so dual-ownership harm is still unmeasured.
 - **The pin play.** cordon → delete → wait → uncordon placed
   `postgres-stateful-0` on worker1 as intended.
-- **The informer is created and named correctly** once `run_id` holds still.
+- **The informer is created and named correctly** once `run_id` holds still —
+  but it still records nothing; see D10.
+- **The D8 assertion fires correctly in both directions.** It stopped the run
+  against the stale workload, and after `playbooks/deploy-workloads.yml` it
+  reported `containers=['postgres', 'divergence-writer'], shared
+  PVC=postgres-shared-nfs`.
+- **`violation-duration.sh` is reached** after D9, and answers structurally
+  (`source: "trace:endpoints_not_ready"`) rather than with the old
+  `"produced no output"`.
 - **The trace recorder's safety design.** Recorders orphaned by the aborted run
   ran under `timeout --kill-after=30 1140` and expired on their own; the next
   run's trace-start reaped them, as its header claims.
 - **Failure containment.** The aborted run left no cordons, no injected DROP
   rules and no informer Job. The lab returned to baseline without a revert.
+
+**Durations are still null on every violation, for three separate reasons —
+worth understanding before trusting duration coverage.** I1 and I3 return
+`no_trace_predicate`: both decide from node-local crictl container lists, which
+the 1 Hz trace does not record. That is designed and honest. I2 returns
+`no_episode_in_trace: the snapshot series recorded a violation the trace never
+saw (the two sample different instants)` — and *that* inverts M1's premise,
+which is that the trace resolves what the snapshot grid cannot. The same script
+found two I2 episodes on the earlier run of the same scenario, so the mechanism
+works; something about this run's endpoint violation fell outside the trace
+predicate. Open question, and the first thing to look at before M3's collection
+run, since the durations are meant to be a headline number.
 
 One known footgun, already documented in the tree and left alone: the
 `pkill -f` teardown tasks in `roles/fault-inject/tasks/teardown.yml` match the
@@ -636,6 +689,57 @@ always reachable. The scripts are now executable in git as well.
 through `script:` reaches for a sibling. This was found only because a trace
 existed to compare against — with no trace, the null is indistinguishable from
 the honest "this run predates M1" null the script is designed to emit.
+
+---
+
+### D10 — The in-cluster informer records `informer_absent` in every snapshot, while trace_meta reports it healthy
+
+Open. Found on the 2026-08-28 shake-down and **not** fixed; the image defect
+below was a necessary fix but not a sufficient one.
+
+The informer's original failure was its image: `observer_informer_image` was
+`bitnami/kubectl:1.29`, and Bitnami retired their public Docker Hub catalogue
+in 2025, so the Job sat in `ImagePullBackOff`. That is fixed — the image is now
+`registry.k8s.io/kubectl:v1.36.1`, verified pullable with `crictl pull` from a
+node, and the Job is created under the right name.
+
+It still produces nothing. From the S2 run of 2026-08-28 (`20260828_104635`),
+every snapshot, pre-fault included:
+
+```json
+{"ok": false, "reason": "informer_absent", "source": null,
+ "job": "k8s-obs-informer-s2-20260828-104635"}
+```
+
+`informer_tail.jsonl` is 1 byte. Meanwhile `trace_meta.json` reports the
+informer as `{"created": true, "ready": true}`, so nothing in the run's own
+output says the observer is missing except the snapshots themselves.
+
+**Impact.** The in-cluster informer is one of the six observers M2 specifies,
+and the only one representing a cached client view — the observer most likely
+to lag, which is precisely what the paper's disagreement matrix is about. Every
+run to date has been missing it. The per-API-server views, the etcd view and
+the node-local crictl views all work (see the shake-down section), so this is
+one observer of six, not the whole of M2.
+
+**Where to start.** The Job was already reaped by `trace-stop.yml` before it
+could be inspected, which is itself part of the problem — there is no artefact
+of *why* it produced nothing. Worth checking, roughly in order:
+
+1. Whether the informer pod ever reached Running: capture
+   `kubectl -n kube-system describe job/…` and the pod's phase into the results
+   directory *before* the reap, not after.
+2. Whether `trace-stop.yml:153`'s `kubectl logs job/…` runs while the pod still
+   exists. If the Job's `ttlSecondsAfterFinished` or the reap in `trace-start`
+   races the log collection, the tail is empty regardless of what the informer
+   did.
+3. Whether the container's command works under `registry.k8s.io/kubectl`, whose
+   entrypoint and shell differ from the Bitnami image it replaced. The manifest
+   in `roles/metrics-collect/templates/informer.yml.j2` was written against
+   Bitnami's conventions.
+4. Whether `created: true, ready: true` in `trace_meta.json` is measuring
+   anything — a readiness claim that survives a pod which never produced a line
+   is a detector that cannot fail, the same class as D2 and D3.
 
 ---
 
