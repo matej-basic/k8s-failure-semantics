@@ -128,7 +128,7 @@ wrote a single complete result directory. Five defects found, four fixed:
 | — | `roles/nfs-server` wrote `/etc/exports.d/*.exports` without creating the directory; Ubuntu 24.04's `nfs-kernel-server` does not ship it | fixed |
 | D7 | `run_id` was a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference | fixed |
 | — | `observer_informer_image` was `bitnami/kubectl:1.29`; Bitnami retired their public Docker Hub catalogue in 2025, so the informer Job sat in `ImagePullBackOff` | fixed |
-| **D10** | **the informer still records `informer_absent` in every snapshot after the image fix, while `trace_meta.json` calls it ready** | **open** |
+| D10 | the informer recorded `informer_absent` in every snapshot after the image fix, while `trace_meta.json` called it ready | fixed |
 | D8 | S2 never applies the workload it measures; the divergence ledger came back empty and was reported as `SINGLE_WRITER` | fixed (assertion + verdict); needs the workload re-applied to the lab |
 | D9 | `script:` shipped check-invariants.sh to a temp dir, so `violation-duration.sh` was never found and every `duration_s` was null | fixed |
 
@@ -694,8 +694,8 @@ the honest "this run predates M1" null the script is designed to emit.
 
 ### D10 — The in-cluster informer records `informer_absent` in every snapshot, while trace_meta reports it healthy
 
-Open. Found on the 2026-08-28 shake-down and **not** fixed; the image defect
-below was a necessary fix but not a sufficient one.
+**Fixed 2026-08-28.** Found on the shake-down; the image change described
+below was necessary but not sufficient, and was itself wrong.
 
 The informer's original failure was its image: `observer_informer_image` was
 `bitnami/kubectl:1.29`, and Bitnami retired their public Docker Hub catalogue
@@ -722,24 +722,73 @@ run to date has been missing it. The per-API-server views, the etcd view and
 the node-local crictl views all work (see the shake-down section), so this is
 one observer of six, not the whole of M2.
 
-**Where to start.** The Job was already reaped by `trace-stop.yml` before it
-could be inspected, which is itself part of the problem — there is no artefact
-of *why* it produced nothing. Worth checking, roughly in order:
+**Root cause — two independent defects.**
 
-1. Whether the informer pod ever reached Running: capture
-   `kubectl -n kube-system describe job/…` and the pod's phase into the results
-   directory *before* the reap, not after.
-2. Whether `trace-stop.yml:153`'s `kubectl logs job/…` runs while the pod still
-   exists. If the Job's `ttlSecondsAfterFinished` or the reap in `trace-start`
-   races the log collection, the tail is empty regardless of what the informer
-   did.
-3. Whether the container's command works under `registry.k8s.io/kubectl`, whose
-   entrypoint and shell differ from the Bitnami image it replaced. The manifest
-   in `roles/metrics-collect/templates/informer.yml.j2` was written against
-   Bitnami's conventions.
-4. Whether `created: true, ready: true` in `trace_meta.json` is measuring
-   anything — a readiness claim that survives a pod which never produced a line
-   is a detector that cannot fail, the same class as D2 and D3.
+*The image could not run the script.* `registry.k8s.io/kubectl` is Kubernetes'
+distroless go-runner image: it ships the `kubectl` binary and nothing else, no
+`/bin/sh`. `informer.yml.j2` runs `command: ["/bin/sh", "-c"]` with the
+observation loop as `args`. The container therefore never started:
+
+```
+State:      Terminated
+  Reason:   StartError
+  Message:  ... exec: "/bin/sh": stat /bin/sh: no such file or directory
+  Exit Code: 128
+```
+
+Reproduced independently with a bare `kubectl run` against that image, so it is
+the image and not anything specific to the Job template. The earlier swap away
+from the retired `bitnami/kubectl:1.29` fixed the pull and broke the exec.
+
+*The readiness check could not fail.* `trace-start.yml` computed
+
+```yaml
+"ready": {{ ('READY' in (informer_ready.stdout | default(''))) | ternary('true','false') }}
+```
+
+against a wait that echoes `READY` or **`NOT_READY`** — and `'READY' in
+'NOT_READY'` is `True`. The field was therefore `true` unconditionally, which is
+why `trace_meta.json` reported a healthy informer for a pod that never ran. A
+detector that cannot fail, the same class as D2 and D3.
+
+**Two further defects surfaced while fixing those**, both pre-existing and both
+verified against the pristine `registry.k8s.io/kubectl` binary as well:
+
+- `--request-timeout` breaks kubectl's in-cluster config auto-detection in this
+  client version — the call falls back to `http://localhost:8080` and fails. The
+  flag is gone from the read wrapper; `timeout(1)` is now the sole per-read
+  bound. Note the trade-off recorded in the template: with no `timeout` on
+  PATH there is now no bound at all, acceptable only because the image is
+  pinned to one that ships GNU coreutils.
+- This client emits `Warning: v1 Endpoints is deprecated…` on stderr for every
+  endpoints read, and the wrapper merges stderr into stdout to classify
+  NotFound. The warning text was landing inside the emitted JSON and corrupting
+  it. A `nowarn()` filter strips it.
+
+**Fix.** Image is `quay.io/openshift/origin-cli:4.22`, which carries both
+`kubectl` and a real shell with GNU `date %3N`; CPU limit raised 200m → 500m
+after measuring the newer client at 0.9–2.0 s per call under the old limit
+against an ~0.84 s budget. Readiness now polls until `kubectl logs --tail=1`
+returns a line satisfying the same `has("answers")` predicate `snapshot.yml`
+uses, and on timeout writes `informer_diagnostic.json` into the results
+directory with the pod phase and each container's terminated reason and exit
+code — so a future silent informer leaves an artefact naming its cause instead
+of a bare `informer_absent`.
+
+**Verified against the live cluster**, by rendering the real template through
+Ansible and applying it:
+
+```json
+{"ts":"2026-08-28T09:48:09.933Z","ts_epoch_ms":1787910489937,
+ "source":"https://kubernetes.default.svc",
+ "read_mode":"in_cluster_serviceaccount_linearizable",
+ "resource_versions":{"node":"132879","pod":"125163","endpoints":"118539"},
+ "answers":{"node_ready":{"state":"answered","answer":"True","reason":null}, …}}
+```
+
+Run through `snapshot.yml`'s own collection logic, that line yields
+`{"ok":true,"reason":null,"source":"https://kubernetes.default.svc","cache_age_ms":5424}`
+— the observer M2 has been missing in every run to date.
 
 ---
 

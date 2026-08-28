@@ -255,11 +255,36 @@ observer_informer_name: "k8s-obs-informer"
 # using it. That stopped being true: Bitnami retired their public Docker Hub
 # catalogue in 2025 and the tag no longer resolves, so the informer Job sat in
 # ImagePullBackOff and every snapshot recorded informer_absent (found on the
-# 2026-08-28 shake-down). registry.k8s.io/kubectl is published by the
-# Kubernetes project itself, is version-matched to the cluster, and is not
-# subject to Docker Hub pull limits. Keep the tag in step with the cluster
-# version on upgrade.
-observer_informer_image: registry.k8s.io/kubectl:v1.36.1
+# 2026-08-28 shake-down).
+#
+# The fix was then tried as registry.k8s.io/kubectl:v1.36.1 — official,
+# version-matched, not subject to Docker Hub pull limits — but that image is
+# Kubernetes' distroless "go-runner" build: it ships ONLY the kubectl binary,
+# no /bin/sh at all. templates/informer.yml.j2's `command: ["/bin/sh", "-c"]`
+# made every pod fail instantly with StartError / exit 128 ("stat /bin/sh: no
+# such file or directory" — confirmed by applying the Job by hand and reading
+# the container's terminated state), which produced zero log lines while the
+# Job itself still showed as created. Same symptom as the Bitnami outage,
+# different cause, and this is the same shakedown that caught it (still
+# 2026-08-28).
+#
+# quay.io/openshift/origin-cli is UBI-based (real GNU coreutils, not
+# busybox/musl), bundles both `kubectl` and `/bin/sh`, and is tagged by
+# OpenShift minor version rather than by kubectl version directly — verified
+# by pulling it with `crictl pull` on a cluster node and running it: 4.22
+# resolves to kubectl v1.35.2, one minor behind this cluster's v1.36.1 and
+# within kubectl's supported skew. This also matters for a reason that isn't
+# about the shell: the informer script formats timestamps with `date`'s GNU
+# extension `%3N` (milliseconds) to build ts_epoch_ms, which busybox/musl
+# `date` (e.g. alpine/k8s, portainer/kubectl-shell — also checked here)
+# silently ignores instead of erroring on, producing a truncated, wrong
+# timestamp rather than a visible failure. UBI's coreutils `date` supports it
+# properly (checked: `date -u +%s%3N` produces real millisecond epoch, not the
+# literal string "%3N" or a truncated value). Keep the tag in step with the
+# cluster version on upgrade — check `kubectl version --client` inside a
+# candidate tag before bumping, the OpenShift-minor-to-kubectl-version mapping
+# is not 1:1.
+observer_informer_image: quay.io/openshift/origin-cli:4.22
 # Seconds between the informer's own sampling loops. Deliberately slower than
 # the 1 Hz trace: the informer is consulted by snapshots (every 30-60 s), not
 # per tick, and each of its three reads is bounded at 0.30 x this so all three

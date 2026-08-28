@@ -275,17 +275,55 @@
       ignore_errors: yes
       ignore_unreachable: yes
 
-    - name: Trace — wait for the informer to start producing lines
-      # Bounded and non-fatal. If it never becomes Ready the snapshots record
-      # informer_absent, which is the correct reading.
+    - name: Trace — wait for the informer to actually emit a parseable line
+      # D10: `kubectl wait --for=condition=Ready pod` only proves the
+      # container STARTED. That is not what "ready" is supposed to mean here
+      # — it is supposed to mean the observer is observing — and it let a
+      # completely broken informer (distroless image, no /bin/sh, StartError
+      # on every attempt) report as created+ready while emitting zero log
+      # lines. So poll the same predicate tasks/snapshot.yml applies to every
+      # line it reads, `type == object and has("answers")`, against
+      # `kubectl logs --tail=1`, and only call it ready once that has actually
+      # been satisfied once.
+      #
+      # On timeout, also capture a diagnostic — pod phase plus every
+      # container's waiting/terminated reason and exit code — as a second
+      # output line. Without this a failing informer left no artifact
+      # explaining why, which is a large part of why D10 went unnoticed: the
+      # OLD ready computation below was `'READY' in stdout`, and the string
+      # "NOT_READY" contains "READY" as a substring, so it evaluated true
+      # unconditionally regardless of which branch the wait actually took.
       shell: |
         set -u
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        kubectl -n {{ observer_informer_namespace }} \
-          wait --for=condition=Ready pod \
-          -l job-name='{{ informer_object_name }}' \
-          --timeout={{ observer_informer_ready_timeout | default(60) }}s 2>/dev/null \
-          && echo READY || echo NOT_READY
+        NS='{{ observer_informer_namespace }}'
+        JOB='{{ informer_object_name }}'
+        T={{ observer_informer_timeout | default(6) }}
+        DEADLINE=$(( $(date +%s) + {{ observer_informer_ready_timeout | default(60) }} ))
+        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+          LINE=$(kubectl -n "$NS" logs "job/$JOB" --tail=1 --request-timeout="${T}s" 2>/dev/null | tail -1 || echo "")
+          if [ -n "$LINE" ] && printf '%s' "$LINE" | jq -e 'type == "object" and has("answers")' >/dev/null 2>&1; then
+            echo READY
+            exit 0
+          fi
+          sleep 1
+        done
+        echo NOT_READY
+        kubectl -n "$NS" get pod -l job-name="$JOB" -o json --request-timeout="${T}s" 2>/dev/null \
+          | jq -c '{
+              pods: [ .items[] | {
+                name: .metadata.name,
+                phase: .status.phase,
+                containers: [ .status.containerStatuses[]? | {
+                  name: .name,
+                  ready: .ready,
+                  restartCount: .restartCount,
+                  waiting: (.state.waiting // null),
+                  terminated: (.state.terminated // null),
+                  lastTerminated: (.lastState.terminated // null)
+                } ]
+              } ]
+            }' 2>/dev/null || echo '{"pods": [], "note": "could not read pod status for diagnostic"}'
       register: informer_ready
       delegate_to: "{{ trace_k8s_host }}"
       run_once: true
@@ -296,6 +334,36 @@
       ignore_errors: yes
       ignore_unreachable: yes
 
+    - name: Trace — resolve whether the informer is actually ready
+      # stdout_lines[0] is READY or NOT_READY; stdout_lines[1], present only
+      # on NOT_READY, is the diagnostic JSON gathered above. Computed once as
+      # facts, with defaults that tolerate the wait task above having been
+      # skipped entirely (informer disabled, or the create failed), so
+      # trace_meta.json and the diagnostic file below always agree.
+      set_fact:
+        informer_actually_ready: "{{ (informer_ready.stdout_lines | default([]) | first | default('')) == 'READY' }}"
+        informer_ready_diag_line: "{{ (informer_ready.stdout_lines | default([]))[1] | default('') }}"
+      run_once: true
+
+    - name: Trace — assemble a diagnostic for why the informer is not emitting lines
+      # Three cases, in the order they can occur: the Job never got created at
+      # all (use the apply's own stderr/stdout), it was created but the poll
+      # above timed out with a pod-status diagnostic, or the poll produced no
+      # diagnostic at all (host went unreachable between create and wait).
+      set_fact:
+        informer_diagnostic_json: >-
+          {%- if informer_ready_diag_line | default('') | length > 0 -%}
+          {{ informer_ready_diag_line }}
+          {%- elif (informer_create.rc | default(1)) != 0 -%}
+          {"reason": "job_create_failed", "create_stderr": {{ informer_create.stderr | default('') | to_json }}, "create_stdout": {{ informer_create.stdout | default('') | to_json }}}
+          {%- else -%}
+          {"reason": "no_diagnostic_available", "detail": "the readiness poll produced no pod status (host unreachable, or it never ran)"}
+          {%- endif -%}
+      run_once: true
+      when:
+        - observer_informer_enabled | bool
+        - not (informer_actually_ready | default(false) | bool)
+
     - name: Trace — ensure the results directory exists on the observer
       file:
         path: "{{ results_dir }}"
@@ -303,6 +371,32 @@
         mode: '0755'
       delegate_to: "{{ groups['observer'][0] }}"
       run_once: true
+
+    - name: Trace — save the informer diagnostic alongside the results
+      # The counterpart to informer_tail.jsonl (captured at stop, when there
+      # is output to capture): this exists precisely when that file would be
+      # empty, so a broken informer always leaves ONE of the two explaining
+      # what happened. Placed after the directory-creation task above, which
+      # it depends on.
+      #
+      # | to_json, not a bare {{ }}: informer_diagnostic_json's value came out
+      # of an {% if %} block whose branches are themselves JSON text (the
+      # poll's own diagnostic line) or Jinja dict literals, and Ansible's
+      # native Jinja mode silently parses a rendered value that LOOKS like a
+      # JSON/Python literal into an actual dict rather than leaving it as
+      # text (confirmed with a throwaway dry-run playbook). Interpolating
+      # that dict directly would print Python's repr — single-quoted keys,
+      # True/False — which is not valid JSON. to_json forces real JSON
+      # serialization regardless of which native/non-native form the fact
+      # ended up in.
+      copy:
+        dest: "{{ results_dir }}/informer_diagnostic.json"
+        content: "{{ informer_diagnostic_json | to_json }}\n"
+      delegate_to: "{{ groups['observer'][0] }}"
+      run_once: true
+      when:
+        - observer_informer_enabled | bool
+        - not (informer_actually_ready | default(false) | bool)
 
     - name: Trace — record the recorder configuration alongside the results
       # Written at START, not at stop, so it exists even if the run is aborted
@@ -320,7 +414,8 @@
               "object_name": "{{ informer_object_name }}",
               "namespace": "{{ observer_informer_namespace }}",
               "created": {{ ((observer_informer_enabled | bool) and (informer_create.rc | default(1)) == 0) | ternary('true', 'false') }},
-              "ready": {{ ('READY' in (informer_ready.stdout | default(''))) | ternary('true', 'false') }},
+              "ready": {{ (informer_actually_ready | default(false) | bool) | ternary('true', 'false') }},
+              "diagnostic_file": {{ 'null' if (informer_actually_ready | default(false) | bool) or not (observer_informer_enabled | bool) else '"informer_diagnostic.json"' }},
               "active_deadline_seconds": {{ observer_informer_max_seconds | int }},
               "ttl_seconds_after_finished": {{ observer_informer_ttl_seconds | int }}
             },

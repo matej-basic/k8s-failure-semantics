@@ -118,13 +118,27 @@ spec:
           image: {{ observer_informer_image }}
           imagePullPolicy: IfNotPresent
           resources:
-            requests: { cpu: "10m", memory: "32Mi" }
-            limits:   { cpu: "200m", memory: "128Mi" }
+            # 200m used to be enough for bitnami/kubectl:1.29's per-call
+            # startup cost. It is not enough for quay.io/openshift/origin-cli's
+            # kubectl (v1.35.2 client): measured by execing repeated timed
+            # reads into a live informer pod, a single `kubectl get node`
+            # under a 200m limit took 0.9-2.0s wall-clock (CPU-throttled Go
+            # runtime + TLS setup), which alone exceeds the ~0.84s per-read
+            # budget computed below — every read would time out before it
+            # even reached the network. 500m brought the same call down to a
+            # consistent ~350-400ms, comfortably inside budget. Re-measure
+            # before lowering this on a future image/kubectl swap.
+            requests: { cpu: "50m", memory: "32Mi" }
+            limits:   { cpu: "500m", memory: "128Mi" }
           env:
             # kubectl caches API discovery under $KUBECACHEDIR; without a
-            # writable one this image (which runs as uid 1001 with a read-only
-            # HOME) re-fetches /api and /apis on EVERY call, which does not fit
-            # inside the sub-second per-read budget below.
+            # writable one it re-fetches /api and /apis on EVERY call, which
+            # does not fit inside the sub-second per-read budget below. The
+            # current image (quay.io/openshift/origin-cli) runs as root with a
+            # writable $HOME, so this is no longer load-bearing for
+            # permissions the way it was under the old uid-1001 bitnami image
+            # — but pinning the cache dir explicitly still avoids one
+            # discovery round-trip per read, so it stays.
             - { name: HOME,        value: /tmp }
             - { name: KUBECACHEDIR, value: /tmp/.kube/cache }
           command: ["/bin/sh", "-c"]
@@ -137,36 +151,68 @@ spec:
               NS='{{ observer_question_namespace }}'
               INTERVAL={{ observer_informer_interval | int }}
 
-              # Every read is bounded twice and both bounds are shorter than
-              # the loop interval: kubectl's own --request-timeout, and
-              # timeout(1) around the process for the case where it hangs before
-              # arming that. Three SEQUENTIAL reads at
+              # Each read used to be bounded TWICE, deliberately: kubectl's own
+              # --request-timeout, and timeout(1) around the whole process for
+              # the case where it hangs before that ever arms. Only the second
+              # bound survives (D10): kubectl's in-cluster config
+              # auto-detection (the "Using in-cluster configuration" path that
+              # reads $KUBERNETES_SERVICE_HOST and the projected SA token) is
+              # broken by --request-timeout in this client — confirmed
+              # directly by execing into a running informer pod and diffing
+              # `kubectl get node ...` against the same call with
+              # --request-timeout added: the flag alone makes it try
+              # http://localhost:8080 instead of the API server and fail with
+              # connection-refused, on both quay.io/openshift/origin-cli's
+              # kubectl (v1.35.2) and registry.k8s.io/kubectl:v1.36.1's. That
+              # is a real client bug, not an artifact of either image, so the
+              # flag is gone rather than routed around with explicit
+              # --server/--token/--certificate-authority flags — that
+              # workaround was tried and measured at 0.9-2.0s per call (no
+              # discovery-cache reuse across invocations), which alone blows
+              # the per-read budget below regardless of CPU headroom.
+              #
+              # timeout(1) alone still gives every read a hard wall-clock
+              # bound. Three SEQUENTIAL reads at
               # {{ '%.2f' | format(observer_informer_interval | float * 0.30) }}s
               # each sum to
               # {{ '%.2f' | format(observer_informer_interval | float * 0.90) }}s,
               # inside the {{ observer_informer_interval | int }}s tick, so a
               # blackholed API server slows a line down, it never wedges the
-              # loop or lets one read starve the other two.
-              RT='{{ "%.2f" | format(observer_informer_interval | float * 0.28) }}'
+              # loop or lets one read starve the other two. Without timeout(1)
+              # on the PATH there is now NO bound on a hung read at all (the
+              # kubectl-side one is gone) — acceptable only because
+              # observer_informer_image is pinned to one confirmed to ship
+              # GNU coreutils' timeout; re-verify this if that image changes.
               HT='{{ "%.2f" | format(observer_informer_interval | float * 0.30) }}'
               if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=1; else HAVE_TIMEOUT=0; fi
               K() {
                 if [ "$HAVE_TIMEOUT" = "1" ]; then
-                  timeout -k 0.2 "$HT" kubectl --request-timeout="${RT}s" "$@" 2>&1
+                  timeout -k 0.2 "$HT" kubectl "$@" 2>&1
                 else
-                  kubectl --request-timeout="${RT}s" "$@" 2>&1
+                  kubectl "$@" 2>&1
                 fi
               }
 
               esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
               ans()    { printf '{"state":"answered","answer":"%s","reason":null}' "$(esc "$1")"; }
               unread() { printf '{"state":"unreadable","answer":null,"reason":"%s"}' "$1"; }
+              # kubectl's server-side deprecation warnings (this client warns
+              # on every `get endpoints` call: "v1 Endpoints is deprecated in
+              # v1.33+") land on stderr, which K() merges into stdout so the
+              # NotFound classification below can see real API errors too.
+              # Left in place, that warning text — and the newline before the
+              # jsonpath output that follows it — ends up INSIDE the JSON
+              # string built at the bottom of the loop, breaking the line as
+              # JSON. Strip it out of $OUT before anything downstream reads
+              # it; it never carries an error, only noise.
+              nowarn() { printf '%s' "$1" | grep -v '^Warning:'; }
 
               while : ; do
                 TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
                 MS=$(date -u +%s%3N)
 
                 OUT=$(K get node "$NODE" -o jsonpath='{.metadata.resourceVersion}|{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'); RC=$?
+                OUT=$(nowarn "$OUT")
                 RV_NODE=""
                 if [ "$RC" = "0" ]; then
                   RV_NODE=${OUT%%|*}; V=${OUT#*|}
@@ -178,6 +224,7 @@ spec:
                 fi
 
                 OUT=$(K get pod "$POD" -n "$NS" -o jsonpath='{.metadata.resourceVersion}|{.spec.nodeName}'); RC=$?
+                OUT=$(nowarn "$OUT")
                 RV_POD=""
                 if [ "$RC" = "0" ]; then
                   RV_POD=${OUT%%|*}; V=${OUT#*|}
@@ -189,6 +236,7 @@ spec:
                 fi
 
                 OUT=$(K get endpoints "$SVC" -n "$NS" -o jsonpath='{.metadata.resourceVersion}|{range .subsets[*].addresses[*]}{.ip},{end}'); RC=$?
+                OUT=$(nowarn "$OUT")
                 RV_EPS=""
                 if [ "$RC" = "0" ]; then
                   RV_EPS=${OUT%%|*}; V=${OUT#*|}
