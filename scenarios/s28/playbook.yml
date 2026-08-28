@@ -1174,7 +1174,10 @@
             metrics_mode: trace-stop
 
         - name: Invariant report
-          script: ../../scripts/check-invariants.sh {{ results_dir }}
+          # See REVIEW.md D9: `script:` copies this file alone to a temp dir,
+          # so its sibling scripts/violation-duration.sh is missing and every
+          # duration_s comes back null. Run it in place.
+          command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
           register: s28_invariants
           delegate_to: "{{ groups['observer'][0] }}"
           run_once: true

@@ -1024,7 +1024,10 @@
   vars: *s21_vars
   tasks:
     - name: Run invariant checker script
-      script: ../../scripts/check-invariants.sh {{ results_dir }}
+      # See REVIEW.md D9: `script:` copies this file alone to a temp dir,
+      # so its sibling scripts/violation-duration.sh is missing and every
+      # duration_s comes back null. Run it in place.
+      command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
       register: s21_invariant_report
 
     - name: Write invariant report (text)

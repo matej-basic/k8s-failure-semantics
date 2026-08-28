@@ -62,6 +62,57 @@
   roles:
     - role: nfs-server
 
+- name: S2 — Assert the running workload is the one this scenario measures
+  # REVIEW.md D8. This play applies roles/nfs-server, which creates and binds
+  # the shared PV/PVC — but the StatefulSet itself is only ever applied by
+  # playbooks/setup-cluster.yml, at cluster build time. On a cluster built
+  # before the NFS enrichment landed, S2 therefore sets up a shared volume that
+  # the running pod does not mount, and measures the old single-container
+  # emptyDir workload: no divergence-writer sidecar, an empty ledger, and a
+  # verdict drawn from a file nothing could write to.
+  #
+  # Assert rather than kubectl apply here on purpose. Deploying the workload is
+  # setup-cluster.yml's job; a scenario that quietly re-applies manifests
+  # mid-suite would make every later scenario's starting state depend on which
+  # scenarios ran before it. Naming the mismatch and stopping is both cheaper
+  # and more honest than measuring the wrong thing.
+  hosts: "{{ groups['control_plane'][1] }}"
+  gather_facts: no
+  vars:
+    scenario_id: s2
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Read the running postgres-stateful pod template
+      shell: |
+        kubectl get statefulset postgres-stateful -n default -o json \
+          | jq -c '{containers:  [.spec.template.spec.containers[].name],
+                    pvc_volumes: [.spec.template.spec.volumes[]
+                                  | select(.persistentVolumeClaim)
+                                  | .persistentVolumeClaim.claimName]}'
+      register: s2_running_workload
+      changed_when: false
+
+    - name: Fail when the cluster runs an older postgres-stateful than the tree
+      vars:
+        wl: "{{ s2_running_workload.stdout | from_json }}"
+      assert:
+        that:
+          - "'divergence-writer' in wl.containers"
+          - "wl.pvc_volumes | length > 0"
+        fail_msg: >-
+          The running postgres-stateful does not match
+          roles/k8s-install/files/postgres-stateful.yml.
+          Running containers={{ wl.containers }}, pvc_volumes={{ wl.pvc_volumes }};
+          this scenario needs the divergence-writer sidecar and a
+          PVC-backed volume, or its shared-volume evidence is empty and its
+          I1 result is a naming collision rather than a correctness violation.
+          Re-apply the workload before running S2:
+          ansible-playbook -i inventory/hosts.ini playbooks/setup-cluster.yml
+        success_msg: >-
+          Running workload matches the tree: containers={{ wl.containers }},
+          shared PVC={{ wl.pvc_volumes | join(',') }}.
+
 - name: S2 — Pin postgres-stateful-0 onto worker1
   # I1 (dual ownership) is a StatefulSet-identity property, so the partition
   # target (worker1) must actually host the StatefulSet pod. Cordon the other
@@ -417,6 +468,15 @@
                 | ($w | map(.node) | unique | length) as $nnode
                 | ($w | map(.pod)  | unique | length) as $npod
                 | ($nuid > 1 and $nnode > 1 and $npod == 1 and $ws <= $we) as $unfenced
+                | (if $t then ($t[2] | tonumber) else 0 end) as $parsed
+                # A ledger nobody wrote to is missing data, not a finding. It
+                # used to fall through to SINGLE_WRITER, whose note asserts
+                # "the run carries no dual-ownership harm" — a substantive
+                # negative conclusion drawn from an empty file (REVIEW.md D8).
+                | (if $parsed == 0 then "INSUFFICIENT_DATA"
+                   elif $unfenced then "UNFENCED_CONCURRENT_WRITES"
+                   elif $nuid > 1 then "SEQUENTIAL_WRITERS"
+                   else "SINGLE_WRITER" end) as $verdict
                 | {
                     ledger: $ledger,
                     total_records:       (if $t then ($t[1] | tonumber) else 0 end),
@@ -432,8 +492,8 @@
                       end:   (if $unfenced then $we else null end),
                       overlapping: $unfenced
                     },
-                    verdict: (if $unfenced then "UNFENCED_CONCURRENT_WRITES" else "SINGLE_WRITER" end),
-                    note: "UNFENCED_CONCURRENT_WRITES = one StatefulSet identity, two pod UIDs on two nodes, with overlapping write intervals on one shared volume. SINGLE_WRITER = only one copy ever wrote, so the run carries no dual-ownership harm."
+                    verdict: $verdict,
+                    note: "INSUFFICIENT_DATA = no parsed record reached the ledger, so this run measured nothing; check that the running StatefulSet carries the divergence-writer sidecar and mounts the shared PVC. UNFENCED_CONCURRENT_WRITES = one StatefulSet identity, two pod UIDs on two nodes, with overlapping write intervals on one shared volume. SEQUENTIAL_WRITERS = more than one writer, but their intervals did not overlap: identity was reused without concurrent harm. SINGLE_WRITER = exactly one copy wrote, so the run carries no dual-ownership harm."
                   }
               '
           register: s2_divergence
@@ -534,7 +594,14 @@
   vars:
     scenario_id: s2
   tasks:
-    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+    # NOT `script:`. That module copies this one file to a temp dir on the
+    # target and runs it from there, so check-invariants.sh's
+    # SELF_DIR=$(dirname $0) points at the temp dir and its sibling
+    # scripts/violation-duration.sh is not there. Every VIOLATED verdict
+    # then came back duration_s: null, reason "violation-duration.sh
+    # produced no output" — M4's duration half, dead suite-wide
+    # (REVIEW.md D9). Run it in place instead.
+    - command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
       register: invariant_report
     - copy:
         dest: "{{ results_dir }}/invariant_report.txt"

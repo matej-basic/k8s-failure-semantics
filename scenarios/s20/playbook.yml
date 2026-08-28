@@ -780,7 +780,14 @@
   vars:
     scenario_id: s20
   tasks:
-    - script: ../../scripts/check-invariants.sh {{ results_dir }}
+    # NOT `script:`. That module copies this one file to a temp dir on the
+    # target and runs it from there, so check-invariants.sh's
+    # SELF_DIR=$(dirname $0) points at the temp dir and its sibling
+    # scripts/violation-duration.sh is not there. Every VIOLATED verdict
+    # then came back duration_s: null, reason "violation-duration.sh
+    # produced no output" — M4's duration half, dead suite-wide
+    # (REVIEW.md D9). Run it in place instead.
+    - command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
       register: invariant_report
     - copy:
         dest: "{{ results_dir }}/invariant_report.txt"

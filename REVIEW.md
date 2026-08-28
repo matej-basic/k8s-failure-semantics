@@ -128,7 +128,8 @@ wrote a single complete result directory. Five defects found, four fixed:
 | — | `roles/nfs-server` wrote `/etc/exports.d/*.exports` without creating the directory; Ubuntu 24.04's `nfs-kernel-server` does not ship it | fixed |
 | D7 | `run_id` was a lazy `lookup('pipe', 'date ...')`, re-evaluated on every reference | fixed |
 | — | `observer_informer_image` was `bitnami/kubectl:1.29`; Bitnami retired their public Docker Hub catalogue in 2025, so the informer Job sat in `ImagePullBackOff` | fixed |
-| **D8** | **S2 never applies the workload it measures; the divergence ledger comes back empty and is reported as `SINGLE_WRITER`** | **open** |
+| D8 | S2 never applies the workload it measures; the divergence ledger came back empty and was reported as `SINGLE_WRITER` | fixed (assertion + verdict); needs the workload re-applied to the lab |
+| D9 | `script:` shipped check-invariants.sh to a temp dir, so `violation-duration.sh` was never found and every `duration_s` was null | fixed |
 
 What is now confirmed against hardware rather than assumed:
 
@@ -567,6 +568,74 @@ the cluster's running workloads match the manifests in the tree. Any scenario
 whose finding depends on a workload detail is exposed the same way; S2 is
 simply the one where the gap was visible, because its evidence file came back
 empty rather than merely wrong.
+
+---
+
+### D9 — `script:` breaks check-invariants.sh's sibling lookup, so no VIOLATED verdict ever gets a duration
+
+Found on the 2026-08-28 shake-down, in the first run that had a 1 Hz trace to
+measure against.
+
+Every scenario invoked the checker the same way:
+
+```yaml
+- script: ../../scripts/check-invariants.sh {{ results_dir }}
+```
+
+Ansible's `script:` module copies **that one file** to a temp directory on the
+target and executes it there. `check-invariants.sh:77` then resolves
+
+```bash
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)     # → ~/.ansible/tmp/ansible-tmp-…
+```
+
+and line 249 looks for a sibling that was never copied:
+
+```bash
+duration=$(bash "$SELF_DIR/violation-duration.sh" "$RESULTS_DIR" "$inv" 2>/dev/null)
+[ -n "$duration" ] || duration='{… "reason": "violation-duration.sh produced no output"}'
+```
+
+**Impact — M4's duration half is dead suite-wide.** Every VIOLATED verdict in
+every scenario carries `duration_s: null` with reason `violation-duration.sh
+produced no output`. From the 2026-08-28 S2 run:
+
+```json
+{"invariant":"I2","verdict":"VIOLATED","duration_s":null,
+ "duration":{"source":"none","reason":"violation-duration.sh produced no output"}}
+```
+
+The script itself is fine. Run by hand against the same results directory it
+returns two episodes for I2 off a 953-record trace. It was never reached.
+
+Note what this defeats: the review's own argument for durations — "I1 violated
+for 143 s" being a materially stronger result than "I1 VIOLATED" — was
+implemented, and then silently produced nulls, with the null carrying a reason
+string that reads like a data limitation rather than a wiring bug.
+
+`roles/metrics-collect/tasks/trace-stop.yml:238` already got this right for
+`observer-disagreement-duration.sh`, invoking it through `{{ role_path }}/../..`;
+`disagreement_duration.json` is written correctly in the same run where every
+`duration_s` is null.
+
+**Fix (applied).** Run the checker in place rather than shipping it to a temp
+dir. All 22 scenarios now use:
+
+```yaml
+- command: "{{ repo_dir }}/scripts/check-invariants.sh {{ results_dir }}"
+```
+
+with `repo_dir: "{{ inventory_dir | dirname }}"` in `group_vars/all.yml`.
+Derived from the inventory, not from `playbook_dir`: an imported playbook
+reports the *top-level* playbook's directory, so `playbook_dir` would be wrong
+for `playbooks/run-all-scenarios.yml`, which is the sweep that matters most.
+The observer is `localhost ansible_connection=local`, so the repo path is
+always reachable. The scripts are now executable in git as well.
+
+**Worth checking during any follow-up:** whether any other script invoked
+through `script:` reaches for a sibling. This was found only because a trace
+existed to compare against — with no trace, the null is indistinguishable from
+the honest "this run predates M1" null the script is designed to emit.
 
 ---
 

@@ -11,6 +11,12 @@
 # /bin/sh symlink (system scripts and apt post-installs rely on dash semantics).
 ansible_shell_executable: /bin/bash
 
+# Repo root, derived from the inventory rather than from playbook_dir: an
+# imported playbook (playbooks/run-all-scenarios.yml) reports the TOP-LEVEL
+# playbook's directory, so playbook_dir is wrong for exactly the sweep that
+# matters most. -i inventory/hosts.ini is always passed, so this is stable.
+repo_dir: "{{ inventory_dir | dirname }}"
+
 # ── Scenario metadata ─────────────────────────────────────────────────────────
 scenario_id: "unset"
 scenario_name: "unset"
