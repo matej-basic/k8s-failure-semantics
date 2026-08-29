@@ -1081,7 +1081,7 @@ fresh clones from the rebuilt template all came up with sshd listening within
 
 ### D31 — the inter-iteration health gate passes on a cluster with two API servers down
 
-Open. Observed three times during the 2026-08-29 N=5 campaign, always after S3
+Fixed 2026-08-29. Observed four times during the 2026-08-29 N=5 campaign, always after S3
 (etcd latency).
 
 S3's teardown restores connectivity but does not wait for the API servers to
@@ -1090,14 +1090,34 @@ they recover on their own, and sometimes they do not. On the third occurrence
 cp2 and cp3 were both serving nothing (`/healthz` → 000) while cp1 answered
 200 — and `playbooks/_health-check.yml` reported **passed**.
 
-That is the D21 repair failing to fire. Its play probes each control-plane
-node's own `/healthz` and restarts the kubelet wherever the API server is not
-serving, and the action is right: restarting kubelet by hand on cp2 and cp3
-brought all three back in 30 s, exactly as the play would have. The likely
-cause is the `ignore_unreachable: yes` on that play — a node that is
-momentarily unreachable mid-fault has its tasks skipped, and the play still
-reports success, so the gate passes over precisely the hosts it exists to
-repair.
+**Root cause: a substring match, and one introduced by the D21 fix itself.**
+The probe echoes `stable` on success and `unstable:<code>` on failure, and both
+conditions tested it with Jinja's `search`, which is a substring match:
+
+```yaml
+when:  (apiserver_probe.stdout) is not search('stable')   # "unstable:000" CONTAINS "stable"
+until: apiserver_recheck.stdout is search('stable')       # so this matches instantly
+```
+
+`'unstable:000' is search('stable')` is **True**. That inverted both
+conditions: the kubelet restart never fired, and the wait that was supposed to
+block until recovery passed on the first try against a dead API server. The
+gate could not fail, which is why it reported "passed" over a two-thirds-dead
+control plane.
+
+This is the same trap as D10's `'READY' in 'NOT_READY'` — found and fixed
+earlier the same day, then reintroduced in a play written to fix a *different*
+instance of it. `ignore_unreachable` was not the cause; the hosts were
+reachable throughout.
+
+**Fixed.** Both conditions now compare exactly (`| trim == 'stable'`), and a
+new assert step makes the play repair-then-**assert**: it fails when a node is
+still not serving after a kubelet restart and 200 s of waiting, rather than
+only when a task errors. Verified by killing cp3's kubelet and API server and
+running the gate: it detected the failure, restarted the kubelet
+(`changed: [cp3]` — the repair firing for the first time), waited for stable
+health, asserted success, and left cp3 at `healthz=200`. On a cluster with
+NotReady nodes it exits 2; on a healthy one it passes.
 
 **Why it matters more than it looks.** The batch is deliberately configured to
 record a failure and carry on, so the gate is not what stops a bad run — but a

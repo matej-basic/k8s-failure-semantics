@@ -62,11 +62,22 @@
       changed_when: false
       failed_when: false
 
+    # EXACT equality, never `search`. The probe above echoes `stable` on
+    # success and `unstable:<code>` on failure — and "unstable:000" CONTAINS
+    # the substring "stable", so `is search('stable')` matches the failure
+    # case too. That inverted both conditions in this play: the restart below
+    # never fired, and the wait that follows passed instantly on a dead API
+    # server. The gate reported "passed" three times over a control plane with
+    # two of three apiservers serving nothing, and once with the VIP down with
+    # them (REVIEW.md D31).
+    #
+    # This is the same substring trap as D10's `'READY' in 'NOT_READY'`, in a
+    # play written to fix a different instance of it. Compare exactly.
     - name: Restart kubelet where the API server is not stably serving
       systemd:
         name: kubelet
         state: restarted
-      when: (apiserver_probe.stdout | default('')) is not search('stable')
+      when: (apiserver_probe.stdout | default('') | trim) != 'stable'
 
     - name: Wait for the API server to serve stably again
       shell: |
@@ -77,11 +88,26 @@
         done
         echo stable
       register: apiserver_recheck
-      until: apiserver_recheck.stdout is search('stable')
+      until: (apiserver_recheck.stdout | default('') | trim) == 'stable'
       retries: 20
       delay: 10
       changed_when: false
-      when: (apiserver_probe.stdout | default('')) is not search('stable')
+      when: (apiserver_probe.stdout | default('') | trim) != 'stable'
+
+    # Repair-then-ASSERT. Until now the play could only fail if a task errored;
+    # a host whose apiserver never came back simply fell out of the `until`
+    # loop and the play still succeeded. Fail loudly instead, so a gate that
+    # reports "passed" means every control-plane node is actually serving.
+    - name: Assert this control-plane node is serving after repair
+      assert:
+        that:
+          - (apiserver_recheck.stdout | default(apiserver_probe.stdout) | default('') | trim) == 'stable'
+        fail_msg: >-
+          {{ inventory_hostname }} is not serving on 6443 after a kubelet
+          restart and {{ 20 * 10 }}s of waiting
+          (last probe: {{ apiserver_recheck.stdout | default(apiserver_probe.stdout) | default('none') }}).
+          Every scenario reaches the cluster through the API VIP, so a run
+          started in this state measures the previous scenario's damage.
 
 - name: Inter-scenario health check
   hosts: "{{ groups['control_plane'][0] }}"
