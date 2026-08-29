@@ -355,6 +355,30 @@ fi
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Cluster health in one word, for the per-iteration record. Asks EACH
+# control-plane node for its own /healthz rather than going through one API
+# server or the VIP: when S3 took out cp1 and cp3, cp2 still answered 200 and
+# the VIP was dead, so any single-endpoint probe would have called that
+# healthy. Echoes "healthy", or "degraded:<detail>". Never fails the caller.
+cluster_health_probe() {
+  local cps ip up=0 total=0 vip_code=""
+  cps=$(awk '/^\[control_plane\]/{f=1;next} /^\[/{f=0} f && /ansible_host=/{
+          for (i=1;i<=NF;i++) if ($i ~ /^ansible_host=/) { sub(/^ansible_host=/,"",$i); print $i }
+        }' "$INVENTORY" 2>/dev/null)
+  for ip in $cps; do
+    total=$(( total + 1 ))
+    if [ "$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              "${SSH_USER:-ansible}@$ip" \
+              'curl -sk -o /dev/null -w "%{http_code}" --max-time 5 https://127.0.0.1:6443/healthz' \
+              2>/dev/null)" = "200" ]; then
+      up=$(( up + 1 ))
+    fi
+  done
+  [ "$total" -eq 0 ] && { printf 'unknown'; return 0; }
+  if [ "$up" -eq "$total" ]; then printf 'healthy'
+  else printf 'degraded:apiservers_%s_of_%s' "$up" "$total"; fi
+}
+
 # Written into every iteration directory. This is the file that makes N
 # discoverable from a single results_dir without parsing directory names —
 # check-invariants.sh is handed one directory and has to decide whether it is
@@ -528,6 +552,18 @@ while [ $i -lt ${#SC_IDS[@]} ]; do
     LOG="$DIR/ansible.log"
     STARTED=$(now_iso); T0=$(date +%s)
 
+    # ── Cluster health going IN ───────────────────────────────────────────
+    # Some scenarios legitimately leave the cluster broken: S3 has twice taken
+    # out two of three API servers and the VIP, needing a kubelet restart to
+    # come back. That is accepted — it is what a fault-injection suite does —
+    # but a run that STARTED on a degraded cluster is measuring the previous
+    # scenario's wreckage, not its own fault, and nothing recorded that.
+    #
+    # Cheap, direct, and independent of any one API server: ask each
+    # control-plane node for its own /healthz. Recorded, never fatal.
+    PRE_HEALTH=$(cluster_health_probe)
+    echo "-- pre-iteration cluster health: $PRE_HEALTH"
+
     echo
     echo "== $SCEN iteration $K/$N  ($(iter_playbook_rel "$SCEN")) -> $DIR"
     "${CMD[@]}" 2>&1 | tee "$LOG"
@@ -555,15 +591,37 @@ while [ $i -lt ${#SC_IDS[@]} ]; do
 
     # Between iterations, not after the last one: leave the cluster in the
     # state the final iteration left it, exactly as a single run does.
+    HEALTH_RC=""
     if [ "$SCEN_HEALTH" -eq 1 ] && [ "$K" -lt "$N" ] && [ "$INTERRUPTED" -eq 0 ]; then
       echo "-- inter-iteration health check"
-      if ! ansible-playbook -i "$INVENTORY" "$HEALTH_PLAYBOOK" \
+      if ansible-playbook -i "$INVENTORY" "$HEALTH_PLAYBOOK" \
            -e "results_base=$RESULTS_BASE" >> "$LOG" 2>&1; then
+        HEALTH_RC=passed
+      else
+        HEALTH_RC=failed
         echo "-- health check FAILED after $SCEN run_$K (see $LOG)" >&2
         BATCH_RC=1
         if [ "$STOP_ON_ERROR" -eq 1 ]; then INTERRUPTED=1; break; fi
       fi
     fi
+
+    # ── Cluster health coming OUT, written beside the run's own evidence ──
+    # cluster_health.json is what lets analysis separate "this fault produced
+    # this result" from "this run inherited a broken cluster". The batch
+    # deliberately carries on either way (that is the default and the operator
+    # asked to keep it), so the record is the safeguard, not the stopping.
+    POST_HEALTH=$(cluster_health_probe)
+    echo "-- post-iteration cluster health: $POST_HEALTH"
+    jq -n --arg pre "$PRE_HEALTH" --arg post "$POST_HEALTH" \
+          --arg hc "${HEALTH_RC:-not_run}" --arg scen "$SCEN" --argjson k "$K" \
+      '{scenario: $scen, run_number: $k,
+        cluster_health_before: $pre,
+        cluster_health_after:  $post,
+        inter_iteration_health_check: $hc,
+        started_degraded: ($pre != "healthy"),
+        left_degraded:    ($post != "healthy"),
+        note: "started_degraded=true means this iteration ran against a cluster the PREVIOUS scenario left broken, so its verdicts describe inherited damage rather than its own fault. left_degraded=true is often legitimate - a fault-injection scenario may deliberately end with a control plane that has not finished recovering."}' \
+      > "$DIR/cluster_health.json" 2>/dev/null || true
 
     K=$(( K + 1 ))
   done
