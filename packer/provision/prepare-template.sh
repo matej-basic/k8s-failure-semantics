@@ -203,4 +203,51 @@ dd if=/dev/zero of=/EMPTY bs=1M 2>/dev/null || true
 rm -f /EMPTY
 sync
 
+# ── sshd watchdog ─────────────────────────────────────────────────────────────
+# On 2026-08-29, 8 of 11 freshly cloned VMs booted with NOTHING listening on
+# port 22: multi-user.target reached, no failed units, hostname and IP set by
+# guest customization, open-vm-tools running — just no sshd. ssh.service and
+# ssh.socket were both enabled, their symlinks intact and dated from the image
+# build, and the failed boots logged nothing for either unit. The trigger is
+# still unidentified.
+#
+# This image has no password login by design (the account is locked and
+# PasswordAuthentication is off), so a VM in that state is unrecoverable: no
+# ssh, no console login, and vCenter guest operations need credentials that do
+# not exist. It cost a full lab rebuild.
+#
+# Rather than depend on a root cause that is not yet understood, assert the
+# property that actually matters — something is listening on 22 — and repair it
+# if not. Oneshot, late in boot, idempotent, silent when sshd is already up.
+cat > /etc/systemd/system/ssh-watchdog.service <<'UNIT'
+[Unit]
+Description=Guarantee sshd is listening (see packer/provision/prepare-template.sh)
+After=multi-user.target cloud-init.target network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ssh-watchdog
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /usr/local/sbin/ssh-watchdog <<'SCRIPT'
+#!/bin/sh
+# Exit 0 as soon as something is listening on 22; otherwise try to start the
+# socket, then the service, up to ~30s. Never fatal to the boot.
+i=0
+while [ "$i" -lt 10 ]; do
+  if ss -lnt 2>/dev/null | grep -q ':22 '; then exit 0; fi
+  systemctl start ssh.socket  2>/dev/null || true
+  systemctl start ssh.service 2>/dev/null || true
+  sleep 3
+  i=$((i + 1))
+done
+ss -lnt 2>/dev/null | grep -q ':22 '
+SCRIPT
+chmod 0755 /usr/local/sbin/ssh-watchdog
+systemctl enable ssh-watchdog.service
+
 echo "Template prepared. cloud-init will handle VMware guest customization on clone."
