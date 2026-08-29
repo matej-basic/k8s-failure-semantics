@@ -1038,6 +1038,47 @@ Two things deliberately left alone, both recorded rather than fixed:
 
 ---
 
+### Rebuild-path defects — 2026-08-29 (D28–D30, all open)
+
+Found while rebuilding the lab. None affect scenario results; all three break
+the documented path to a working cluster, which matters because that path is
+the one used after any lab loss.
+
+**D28 — `terraform apply` never runs Ansible.** `scripts/redeploy-cluster.sh`
+documents its second step as "provision fresh VMs, write the inventory, and run
+playbooks/setup-cluster.yml on top". `terraform/ansible.tf` contains a single
+`local_file` resource that writes `inventory/hosts.ini` — no provisioner, no
+`local-exec`, no `ansible-playbook`. The script therefore leaves 11 bare Ubuntu
+VMs and reports "Cluster rebuilt from scratch." Either wire the playbook in or
+correct the header and have the script invoke it directly.
+
+**D29 — a fresh install always fails `deploy-workloads`, and the failure
+cascades.** `roles/k8s-install/tasks/control-plane-init.yml:83` includes
+`deploy-workloads.yml`, which applies a 3-replica nginx Deployment and then
+waits for its rollout — while the only node in the cluster is the
+still-tainted first control-plane node. The wait times out (3 attempts, 2 min
+each), cp1 is marked failed, and Ansible drops it from every later play. The
+NFS play then skips creating the PV and PVC, because that task is gated on
+`inventory_hostname == ansible_play_hosts_all[0]` and that host is cp1. The run
+ends with `postgres-stateful-0` Pending on a PVC that was never created, and
+nothing says so. Re-running the playbook fixes it, since the workers have
+joined by then — which is how this was recovered, but it should not need two
+passes. Either move workload deployment after the worker-join play, or drop the
+rollout wait to a `wait_for` that tolerates zero schedulable workers.
+
+**D30 — `Install kubectl on observer` assumes a Linux package manager.** It
+fails on the macOS control machine with
+`{"cmd": "update", "msg": "[Errno 2] No such file or directory: b'update'"}`.
+Harmless in practice — kubectl is already present there — but it puts a
+`failed=1` on every setup run and trains the operator to ignore failures in the
+recap, which is exactly how D29 stayed invisible.
+
+**Also confirmed here:** the sshd watchdog added in `cec17cd` works. Eleven
+fresh clones from the rebuilt template all came up with sshd listening within
+15 s, against 3 of 11 on the previous image, with four of those unrecoverable.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
