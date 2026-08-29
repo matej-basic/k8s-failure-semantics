@@ -1079,6 +1079,43 @@ fresh clones from the rebuilt template all came up with sshd listening within
 
 ---
 
+### D31 — the inter-iteration health gate passes on a cluster with two API servers down
+
+Open. Observed three times during the 2026-08-29 N=5 campaign, always after S3
+(etcd latency).
+
+S3's teardown restores connectivity but does not wait for the API servers to
+finish reconnecting to etcd. They crashloop for a while afterwards; sometimes
+they recover on their own, and sometimes they do not. On the third occurrence
+cp2 and cp3 were both serving nothing (`/healthz` → 000) while cp1 answered
+200 — and `playbooks/_health-check.yml` reported **passed**.
+
+That is the D21 repair failing to fire. Its play probes each control-plane
+node's own `/healthz` and restarts the kubelet wherever the API server is not
+serving, and the action is right: restarting kubelet by hand on cp2 and cp3
+brought all three back in 30 s, exactly as the play would have. The likely
+cause is the `ignore_unreachable: yes` on that play — a node that is
+momentarily unreachable mid-fault has its tasks skipped, and the play still
+reports success, so the gate passes over precisely the hosts it exists to
+repair.
+
+**Why it matters more than it looks.** The batch is deliberately configured to
+record a failure and carry on, so the gate is not what stops a bad run — but a
+gate that reports "passed" on a two-thirds-dead control plane means every
+scenario after it measures the previous scenario's wreckage, and the run-level
+record says nothing was wrong. `cluster_health.json` (added in `c0b50c8`,
+corrected in `3d2da48`) catches it independently, which is why the campaign can
+continue safely: `started_degraded` marks the affected runs for analysis. But
+the gate itself should not be trusted until this is fixed.
+
+**Fix.** Drop `ignore_unreachable` from the repair play, or keep it and assert
+afterwards that every control-plane node reported 200 — failing the play when
+any did not, rather than when the play merely finished. Then give S3 an
+explicit post-teardown wait for its API servers, so the repair is a backstop
+rather than the normal path.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
