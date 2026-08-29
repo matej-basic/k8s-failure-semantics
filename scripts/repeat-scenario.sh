@@ -379,6 +379,34 @@ cluster_health_probe() {
   else printf 'degraded:apiservers_%s_of_%s' "$up" "$total"; fi
 }
 
+# The probe above is one instantaneous sample, and an API server reconnecting
+# to etcd after a fault is briefly unavailable without being broken: the first
+# instrumented S3 iteration recorded apiservers_0_of_3 immediately after its
+# teardown, while the inter-iteration health check — which retries — passed,
+# and all three answered 200 a minute later. A single sample would therefore
+# mark the NEXT run started_degraded on a cluster that was fine, and a noisy
+# record is worse than none for the analysis this exists to support.
+#
+# So allow the same tolerance the health check has: re-probe for up to
+# health_settle_seconds before concluding the cluster is actually degraded.
+# Reports the first reading too, because "recovered after 40s" is itself a
+# measurement about the scenario.
+cluster_health_settled() {
+  local deadline first now result
+  first=$(cluster_health_probe)
+  [ "$first" = "healthy" ] && { printf '%s' "$first"; return 0; }
+  deadline=$(( $(date +%s) + ${HEALTH_SETTLE_SECONDS:-90} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 10
+    result=$(cluster_health_probe)
+    if [ "$result" = "healthy" ]; then
+      printf 'healthy_after_settle(first=%s)' "$first"
+      return 0
+    fi
+  done
+  printf '%s' "$result"
+}
+
 # Written into every iteration directory. This is the file that makes N
 # discoverable from a single results_dir without parsing directory names —
 # check-invariants.sh is handed one directory and has to decide whether it is
@@ -561,7 +589,7 @@ while [ $i -lt ${#SC_IDS[@]} ]; do
     #
     # Cheap, direct, and independent of any one API server: ask each
     # control-plane node for its own /healthz. Recorded, never fatal.
-    PRE_HEALTH=$(cluster_health_probe)
+    PRE_HEALTH=$(cluster_health_settled)
     echo "-- pre-iteration cluster health: $PRE_HEALTH"
 
     echo
@@ -610,7 +638,7 @@ while [ $i -lt ${#SC_IDS[@]} ]; do
     # this result" from "this run inherited a broken cluster". The batch
     # deliberately carries on either way (that is the default and the operator
     # asked to keep it), so the record is the safeguard, not the stopping.
-    POST_HEALTH=$(cluster_health_probe)
+    POST_HEALTH=$(cluster_health_settled)
     echo "-- post-iteration cluster health: $POST_HEALTH"
     jq -n --arg pre "$PRE_HEALTH" --arg post "$POST_HEALTH" \
           --arg hc "${HEALTH_RC:-not_run}" --arg scen "$SCEN" --argjson k "$K" \
@@ -618,8 +646,9 @@ while [ $i -lt ${#SC_IDS[@]} ]; do
         cluster_health_before: $pre,
         cluster_health_after:  $post,
         inter_iteration_health_check: $hc,
-        started_degraded: ($pre != "healthy"),
-        left_degraded:    ($post != "healthy"),
+        started_degraded: (($pre | startswith("degraded"))),
+        left_degraded:    (($post | startswith("degraded"))),
+        recovered_after_settle: (($post | startswith("healthy_after_settle"))),
         note: "started_degraded=true means this iteration ran against a cluster the PREVIOUS scenario left broken, so its verdicts describe inherited damage rather than its own fault. left_degraded=true is often legitimate - a fault-injection scenario may deliberately end with a control plane that has not finished recovering."}' \
       > "$DIR/cluster_health.json" 2>/dev/null || true
 
