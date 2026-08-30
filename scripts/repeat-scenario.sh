@@ -375,8 +375,27 @@ cluster_health_probe() {
     fi
   done
   [ "$total" -eq 0 ] && { printf 'unknown'; return 0; }
-  if [ "$up" -eq "$total" ]; then printf 'healthy'
-  else printf 'degraded:apiservers_%s_of_%s' "$up" "$total"; fi
+  if [ "$up" -ne "$total" ]; then
+    printf 'degraded:apiservers_%s_of_%s' "$up" "$total"
+    return 0
+  fi
+
+  # Control-plane health is not the whole story. S21 leaves a worker pointing
+  # the VIP at a stale MAC (REVIEW.md D32): every apiserver answers 200, the
+  # VIP answers for everyone else, and one node is stranded and NotReady. An
+  # apiserver-only probe called that "healthy" and the next scenario started
+  # on a five-node cluster. Count Ready nodes too.
+  local ready expected
+  ready=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            "${SSH_USER:-ansible}@${cps%% *}" \
+            'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready"' \
+            2>/dev/null | tr -d ' ')
+  expected=$(awk '/^\[control_plane\]|^\[workers\]/{f=1;next} /^\[/{f=0} f && /ansible_host=/{n++} END{print n+0}' "$INVENTORY" 2>/dev/null)
+  if [ -n "$ready" ] && [ -n "$expected" ] && [ "$expected" -gt 0 ] && [ "$ready" -ne "$expected" ]; then
+    printf 'degraded:nodes_ready_%s_of_%s' "${ready:-0}" "$expected"
+    return 0
+  fi
+  printf 'healthy'
 }
 
 # The probe above is one instantaneous sample, and an API server reconnecting

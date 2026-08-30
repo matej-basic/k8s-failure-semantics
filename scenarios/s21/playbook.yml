@@ -1036,6 +1036,44 @@
     - include_role: { name: metrics-collect }
       vars: { metrics_mode: trace-stop }
 
+- name: S21 — Force VIP ARP re-resolution on every node
+  # REVIEW.md D32. When the VRRP split heals, one holder wins — but every
+  # client that learned the LOSER's MAC keeps it. The entry stays REACHABLE,
+  # nothing re-resolves it, and keepalived's gratuitous ARP does not reliably
+  # reach every client. The victim is then cut off from the VIP indefinitely:
+  #
+  #   worker2 -> https://10.0.0.49:6443/healthz (cp1 direct)  200
+  #   worker2 -> https://10.0.0.59:6443/healthz (the VIP)     000
+  #   worker1, worker3 -> the VIP                             200
+  #
+  # Every apiserver healthy, the VIP up for everyone else, one node silently
+  # stranded. Its kubelet cannot update node status, the node goes NotReady,
+  # and it stays there — every later iteration then fails pre-flight in ~60 s
+  # without measuring anything, and any scenario that follows starts degraded.
+  # Observed twice in the N=5 campaign, hitting a different worker each time.
+  #
+  # Flushing the neighbour entry forces re-resolution on the next packet.
+  # Idempotent, and harmless on a node whose entry was already correct.
+  hosts: k8s_cluster
+  gather_facts: no
+  vars:
+    scenario_id: s21
+  tasks:
+    - name: Flush the VIP neighbour entry
+      command: "ip neigh flush {{ api_vip }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Verify every node can reach the API VIP again
+      # The property the rest of the suite depends on, asserted rather than
+      # assumed: a stranded node is invisible to a control-plane-only probe.
+      shell: curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://{{ api_vip }}:6443/healthz
+      register: s21_vip_reachable
+      until: s21_vip_reachable.stdout == '200'
+      retries: 12
+      delay: 5
+      changed_when: false
+
 - name: S21 — Invariant evaluation report
   hosts: "{{ groups['observer'][0] }}"
   gather_facts: no

@@ -1138,7 +1138,7 @@ rather than the normal path.
 
 ### D32 — S21 leaves stale VIP ARP entries, cutting a node off the API indefinitely
 
-Open. Found during the 2026-08-29/30 N=5 campaign, after S21 run_1.
+Fixed 2026-08-30. Found during the 2026-08-29/30 N=5 campaign, after S21 run_1.
 
 S21 blocks VRRP so two control-plane nodes claim `10.0.0.59` simultaneously.
 When the scenario ends and one holder wins, clients that learned the *other*
@@ -1173,10 +1173,18 @@ that do not come back), but a scenario can leave a *worker* cut off, and this
 one does. The probe should also count Ready nodes, or the record will keep
 saying healthy while a node is stranded.
 
-**Fix.** S21's teardown should force ARP re-resolution of the VIP on every
-node once the split is healed — `ip neigh flush <vip>` fleet-wide is the
-one-liner — and ideally assert afterwards that every node can reach the VIP,
-since that is the property the rest of the suite depends on.
+**Fixed, both halves.** S21 now ends with a fleet-wide `ip neigh flush
+{{ api_vip }}` followed by an assertion that every node reaches
+`https://<vip>:6443/healthz`, retried for a minute — the property the rest of
+the suite depends on, asserted rather than assumed. And
+`cluster_health_probe` in `scripts/repeat-scenario.sh` now counts Ready nodes
+against the inventory as well as probing each API server, so a stranded worker
+can no longer be recorded as a healthy cluster.
+
+It recurred on the very next S21 iteration with a different victim (worker1
+rather than worker2), which is what makes it worth fixing at the source rather
+than by hand: left alone it burns every remaining repetition of S21 and starts
+every scenario after it on a five-node cluster.
 
 ---
 
