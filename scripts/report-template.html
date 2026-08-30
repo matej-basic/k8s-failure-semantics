@@ -801,6 +801,60 @@ function naReasons(sc) {
 }
 
 // ── Overview view ────────────────────────────────────────────────────────────
+// The notice and the findings crumb are COMPUTED, not written down. Both used
+// to be prose describing the May 2026 sweep — "12 of 14 scenarios ... 82
+// invariant verdicts" — and they kept saying that after the data underneath
+// them had been replaced by the N=5 campaign. A narrative of measurement that
+// is typed by hand goes stale silently; one derived from the data cannot.
+function heatmapRows() {
+  const agg = DATA.aggregate;
+  if (!agg) return [];
+  const out = [];
+  (function walk(o) {
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (o && typeof o === "object") {
+      if (o.scenario && Object.prototype.hasOwnProperty.call(o, "I1")) out.push(o);
+      Object.values(o).forEach(walk);
+    }
+  })(agg);
+  return out;
+}
+
+function datasetLine() {
+  const rows = heatmapRows();
+  if (!rows.length) return "";
+  const ns = rows.map(r => Number(r.n) || 0).filter(Boolean);
+  const reps = ns.length ? Math.max(...ns) : 1;
+  const runs = ns.reduce((a, b) => a + b, 0);
+  const eff = rows.filter(r => r.run_validity === "FAULT_INEFFECTIVE").length;
+  return `${rows.length} scenarios &times; ${reps} repetitions = ${runs} runs`
+       + (eff ? `, of which ${eff} scenario${eff > 1 ? "s" : ""} `
+              + `(${rows.filter(r => r.run_validity === "FAULT_INEFFECTIVE").map(r => r.scenario.toUpperCase()).join(", ")}) `
+              + `are marked FAULT_INEFFECTIVE.` : ".");
+}
+
+function s18Runs() {
+  const r = heatmapRows().find(x => x.scenario === "s18");
+  return r && r.n ? r.n : "all";
+}
+
+function findingsCrumb() {
+  const rows = heatmapRows();
+  const c = {};
+  for (const r of rows) {
+    for (const inv of INVARIANT_IDS) {
+      const v = r[inv];
+      if (typeof v === "string") c[v] = (c[v] || 0) + 1;
+    }
+  }
+  const total = Object.values(c).reduce((a, b) => a + b, 0);
+  const part = ["VIOLATED", "PRESERVED", "NOT_APPLICABLE", "INSUFFICIENT_DATA"]
+    .filter(k => c[k])
+    .map(k => `${c[k]} ${k.toLowerCase().replace(/_/g, " ")}`)
+    .join(" · ");
+  return `${rows.length} scenarios · ${total} invariant verdicts · ${part}`;
+}
+
 function renderOverview() {
   const main = document.getElementById("main");
   const present = Object.keys(DATA.scenarios);
@@ -831,14 +885,38 @@ function renderOverview() {
   let html = `
     <h2>Overview</h2>
     <div class="stale-notice">
-      <b>These results predate the measurement fixes of Aug 27 2026.</b>
-      The narrative on this page was written against the May 2026 sweep, whose
-      checker ordered snapshots by filename, could not detect
-      <code>Ready=Unknown</code>, and probed the service from a vantage point
-      with no route to it. The I2, I5 and I6 columns of that sweep are
-      artifacts of those defects, not measurements: re-run the suite and
-      rebuild this report before citing any figure here. See
-      <code>REVIEW.md</code> (D1–D6) for what changed and why.
+      <b>How to read this dataset.</b>
+      ${datasetLine()} Collected after the measurement fixes recorded in
+      <code>REVIEW.md</code>, so the defects that made the May 2026 sweep
+      uninterpretable — snapshots ordered by filename, <code>Ready=Unknown</code>
+      undetectable, the service probed from a host with no route to it — do not
+      apply here. Four things to carry into any reading of the grid:
+      <ul style="margin:.5rem 0 0 1rem;padding:0">
+        <li><b>S18 measured nothing.</b> Its memory pressure never reaches
+            kubelet's eviction threshold, so every one of its
+            ${s18Runs()} repetition${s18Runs() === 1 ? "" : "s"} is
+            <code>FAULT_INEFFECTIVE</code> and its verdicts describe an
+            undisturbed node, not a finding about memory pressure. It also
+            carries fewer repetitions than the other scenarios — the batch was
+            stopped once the recalibration proved insufficient rather than
+            spend the lab on known-bad iterations. Cause not yet established
+            (D35).</li>
+        <li><b><code>NOT_APPLICABLE</code> and <code>INSUFFICIENT_DATA</code> are
+            not <code>PRESERVED</code>.</b> An invariant that cannot apply to a
+            fault class, and one with no evidence to evaluate, are counted
+            separately and deliberately — folding either into "preserved"
+            inflates the preserved count.</li>
+        <li><b>A proven fault with no violation is a gap in the invariant set,
+            not an absence of effect.</b> S21 puts two nodes on the API VIP
+            simultaneously and S22 freezes the container runtime; both are
+            confirmed <code>EFFECTIVE</code> and neither trips any invariant,
+            because no detector exists for those conditions.</li>
+        <li><b>Verdicts are per-batch, not per-run.</b> Each cell summarises
+            five repetitions; <code>runs_unreadable</code> in
+            <code>aggregate_report.json</code> records how many contributed no
+            evidence, and a verdict resting on two readable runs should be
+            quoted with that number.</li>
+      </ul>
     </div>
     <div class="crumb"><span>Results path:</span> <code>${escapeHtml(DATA.results_path)}</code></div>
     <div class="cards">
@@ -1286,16 +1364,36 @@ function renderFindings() {
   let html = `
     <h2>Findings — observed behaviour, May 20 sweep</h2>
     <div class="stale-notice">
-      <b>These results predate the measurement fixes of Aug 27 2026.</b>
-      The narrative on this page was written against the May 2026 sweep, whose
-      checker ordered snapshots by filename, could not detect
-      <code>Ready=Unknown</code>, and probed the service from a vantage point
-      with no route to it. The I2, I5 and I6 columns of that sweep are
-      artifacts of those defects, not measurements: re-run the suite and
-      rebuild this report before citing any figure here. See
-      <code>REVIEW.md</code> (D1–D6) for what changed and why.
+      <b>How to read this dataset.</b>
+      ${datasetLine()} Collected after the measurement fixes recorded in
+      <code>REVIEW.md</code>, so the defects that made the May 2026 sweep
+      uninterpretable — snapshots ordered by filename, <code>Ready=Unknown</code>
+      undetectable, the service probed from a host with no route to it — do not
+      apply here. Four things to carry into any reading of the grid:
+      <ul style="margin:.5rem 0 0 1rem;padding:0">
+        <li><b>S18 measured nothing.</b> Its memory pressure never reaches
+            kubelet's eviction threshold, so all ${s18Runs()} repetitions are
+            <code>FAULT_INEFFECTIVE</code> and its verdicts describe an
+            undisturbed node, not a finding about memory pressure. Cause not yet
+            established (D35).</li>
+        <li><b><code>NOT_APPLICABLE</code> and <code>INSUFFICIENT_DATA</code> are
+            not <code>PRESERVED</code>.</b> An invariant that cannot apply to a
+            fault class, and one with no evidence to evaluate, are counted
+            separately and deliberately — folding either into "preserved"
+            inflates the preserved count.</li>
+        <li><b>A proven fault with no violation is a gap in the invariant set,
+            not an absence of effect.</b> S21 puts two nodes on the API VIP
+            simultaneously and S22 freezes the container runtime; both are
+            confirmed <code>EFFECTIVE</code> and neither trips any invariant,
+            because no detector exists for those conditions.</li>
+        <li><b>Verdicts are per-batch, not per-run.</b> Each cell summarises
+            five repetitions; <code>runs_unreadable</code> in
+            <code>aggregate_report.json</code> records how many contributed no
+            evidence, and a verdict resting on two readable runs should be
+            quoted with that number.</li>
+      </ul>
     </div>
-    <div class="crumb">12 of 14 scenarios with full data · 82 invariant verdicts · 36 violated · 46 preserved · grounded in <code>results/*/invariant_report.json</code></div>
+    <div class="crumb">${findingsCrumb()} · grounded in <code>results/*/invariant_report.json</code></div>
 
     <div class="findings-toc">
       <a href="#/findings/sweep">What we measured against</a>
