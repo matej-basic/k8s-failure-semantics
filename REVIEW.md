@@ -1295,7 +1295,7 @@ first that measures.
 
 ### D35 — S18's memory pressure never reaches kubelet's eviction threshold
 
-Fixed 2026-08-30. S18 ran 5/5 in the N=5 campaign and fired **zero** efficacy
+**Partly fixed, still ineffective — root cause NOT established.** 2026-08-30. S18 ran 5/5 in the N=5 campaign and fired **zero** efficacy
 signals in every one; worker3 stayed `Ready=True` in every snapshot of every
 run.
 
@@ -1323,6 +1323,36 @@ S18 also now declares `efficacy_require: [placement_changed]`. `memory_pressure`
 carries no required signal by default, which is why five ineffective runs
 reported INEFFECTIVE without ever naming what was missing. Eviction shows up as
 pods leaving the target node, so that is the signal to assert.
+
+**The calibration fix was necessary but not sufficient.** Re-running S18 with
+it: stress-ng allocated 7141628K and completed its full 120 s
+(`successful run completed in 2 mins, 4.56 secs`), and still nothing happened —
+worker3 stayed `Ready=True`, pod count on it never moved from 2, and kubelet
+logged no eviction and no MemoryPressure. The assertion now at least names the
+missing signal (`missing_required: ["placement_changed"]`) instead of failing
+silently.
+
+Ruled out so far: swap (none configured), custom eviction thresholds (none in
+`/var/lib/kubelet/config.yaml`, so the 100Mi default applies), and stress-ng
+not running (it runs, allocates, and exits cleanly).
+
+**The open lead.** Kubelet derives `memory.available` from cAdvisor as
+capacity minus the root cgroup's working set — and on this node
+`/sys/fs/cgroup/memory.current` reads **0**. If that accounting is not exposed
+where cAdvisor expects it under cgroup v2, `memory.available` never falls no
+matter how much is allocated, and eviction cannot trigger at any allocation
+size. That would explain why both the old calibration (1057 MB headroom) and
+the new one (90 MB) produce identical non-results.
+
+Next step is to read what kubelet itself reports — `/stats/summary` on the
+kubelet's authenticated port, or the `node_memory_working_set_bytes` series
+from `/metrics/resource` — during pressure, rather than inferring from
+`/proc/meminfo`. Sizing the allocation from `/proc/meminfo` is what made the
+original calibration wrong, and it is the same mistake to keep tuning against
+the wrong quantity.
+
+Until then S18's data is five (now six) INEFFECTIVE runs. That is recorded
+honestly rather than presented as a finding about memory pressure.
 
 ---
 
