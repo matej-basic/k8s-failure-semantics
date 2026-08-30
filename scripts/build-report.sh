@@ -62,6 +62,25 @@ if os.path.isfile(agg_path):
     except Exception as e:
         data["aggregate"] = {"error": f"failed to parse: {e}"}
 
+# Per-scenario interpretations (results/interpretations/<sid>.json), each written
+# by a dedicated analysis pass over that scenario's raw runs. These carry the
+# data_interpretation / scientific_interpretation / per_invariant / per_run
+# narrative the report renders beside the measured verdicts. They are evidence
+# ABOUT the data, never a substitute for it: every claim in them is expected to
+# be traceable to a file under the scenario's own run directories.
+data["interpretations"] = {}
+interp_dir = os.path.join(root, "interpretations")
+if os.path.isdir(interp_dir):
+    for fn in sorted(os.listdir(interp_dir)):
+        if not fn.endswith(".json"):
+            continue
+        sid = fn[:-5]
+        try:
+            with open(os.path.join(interp_dir, fn)) as f:
+                data["interpretations"][sid] = json.load(f)
+        except Exception as e:
+            data["interpretations"][sid] = {"error": f"failed to parse: {e}"}
+
 for sc in sorted(os.listdir(root)):
     sc_path = os.path.join(root, sc)
     if not os.path.isdir(sc_path) or not sc.startswith("s"):

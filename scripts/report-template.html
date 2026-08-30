@@ -304,6 +304,27 @@
     padding: 1px 5px; border-radius: 3px; font-size: 11px;
   }
 
+  /* ── Interpretation ──────────────────────────────────────────────────
+     Rendered beside the measured verdict, never in a separate section, so a
+     verdict cannot be read without the reading that qualifies it. */
+  .interp { margin-top: 10px; padding: 9px 11px; border-radius: 5px;
+    background: rgba(187, 154, 247, 0.06); border-left: 3px solid var(--purple, #bb9af7);
+    font-size: 12.5px; line-height: 1.55; color: var(--fg-dim); }
+  .interp .interp-verdict { font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--fg-faint); margin-bottom: 4px; }
+  .interp .interp-verdict b { color: var(--fg); letter-spacing: 0; }
+  .interp .interp-meaning { color: var(--fg-dim); }
+  .interp .interp-ev { margin-top: 6px; font-family: ui-monospace, monospace;
+    font-size: 11.5px; color: var(--fg-faint); word-break: break-word; }
+  .interp .interp-ev .lbl { display: inline-block; text-transform: uppercase;
+    letter-spacing: 0.5px; font-family: inherit; font-size: 10px;
+    color: var(--fg-faint); margin-right: 6px; }
+  .interp-runnote { margin: 8px 0 4px; padding: 8px 11px; border-radius: 5px;
+    background: var(--bg-elev); border: 1px solid var(--border);
+    font-size: 12.5px; line-height: 1.55; color: var(--fg-dim); }
+  .interp-runnote .rn-head { font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--fg-faint); margin-bottom: 3px; }
+
   .caveats { max-width: 880px; color: var(--fg-dim); font-size: 13px; line-height: 1.6; }
   .caveats li { margin: 6px 0; }
   .caveats li b, .caveats li strong { color: var(--fg); font-weight: 600; }
@@ -1018,6 +1039,78 @@ function notApplicableWhy(inv) {
 }
 
 // ── Scenario view ────────────────────────────────────────────────────────────
+// ── Interpretation layer ────────────────────────────────────────────────
+// results/interpretations/<sid>.json, one per scenario, each produced by a
+// dedicated analysis pass over that scenario's raw runs. Two registers are kept
+// deliberately distinct: `data_interpretation` states only what the measured
+// numbers say, and `scientific_interpretation` states what may be concluded
+// from them. Keeping them apart is what lets a reader see where evidence stops
+// and inference starts — the same reason NOT_APPLICABLE and PRESERVED are
+// distinct verdicts rather than both being "fine".
+function interpFor(sc) {
+  const all = DATA.interpretations || {};
+  const ip = all[sc];
+  return (ip && !ip.error) ? ip : null;
+}
+
+function interpHeader(sc) {
+  const ip = interpFor(sc);
+  if (!ip) return "";
+  let h = "";
+  if (ip.data_interpretation) {
+    h += `<div class="recap observed"><span class="recap-label">What the data shows</span>${escapeHtml(ip.data_interpretation)}</div>`;
+  }
+  if (ip.scientific_interpretation) {
+    h += `<div class="recap hypothesised"><span class="recap-label">Scientific reading</span>${escapeHtml(ip.scientific_interpretation)}</div>`;
+  }
+  return h;
+}
+
+function interpInvariant(sc, id) {
+  const ip = interpFor(sc);
+  if (!ip || !ip.per_invariant) return "";
+  const e = ip.per_invariant[id];
+  if (!e) return "";
+  let h = `<div class="interp">`;
+  if (e.verdict) {
+    h += `<div class="interp-verdict">Interpreted verdict: <b>${escapeHtml(String(e.verdict))}</b></div>`;
+  }
+  if (e.meaning) h += `<div class="interp-meaning">${escapeHtml(e.meaning)}</div>`;
+  if (e.evidence) {
+    h += `<div class="interp-ev"><span class="lbl">Evidence</span>${escapeHtml(String(e.evidence))}</div>`;
+  }
+  return h + `</div>`;
+}
+
+function interpRunNote(sc, runKey) {
+  const ip = interpFor(sc);
+  if (!ip || !Array.isArray(ip.per_run)) return "";
+  const n = String(runKey).replace(/[^0-9]/g, "");
+  const e = ip.per_run.find(r => String(r.run) === n);
+  if (!e) return "";
+  const bits = [];
+  if (e.status) bits.push(`status: ${escapeHtml(String(e.status))}`);
+  if (e.duration_s !== undefined && e.duration_s !== null) bits.push(`duration: ${escapeHtml(String(e.duration_s))}s`);
+  if (e.started_degraded) bits.push(`started degraded`);
+  let h = `<div class="interp-runnote"><div class="rn-head">This run${bits.length ? " — " + bits.join(" · ") : ""}</div>`;
+  if (e.notes) h += escapeHtml(String(e.notes));
+  return h + `</div>`;
+}
+
+function interpFooter(sc) {
+  const ip = interpFor(sc);
+  if (!ip) return "";
+  const list = (title, arr, why) => {
+    if (!Array.isArray(arr) || !arr.length) return "";
+    return `<h3>${title}</h3><div class="caveats"${why ? ` title="${escapeHtml(why)}"` : ""}><ul>`
+      + arr.map(x => `<li>${escapeHtml(String(x))}</li>`).join("") + `</ul></div>`;
+  };
+  return list("Threats to validity", ip.threats_to_validity,
+              "Reasons a claim above could be wrong, stated by the analysis itself.")
+       + list("Caveats", ip.caveats,
+              "Known limits on what these runs can support.");
+}
+
 function renderScenario() {
   const main = document.getElementById("main");
   const sc = state.scenario;
@@ -1044,6 +1137,7 @@ function renderScenario() {
     <div class="crumb"><a href="#/">Overview</a> <span>›</span> ${sc.toUpperCase()}</div>
     <h2>${sc.toUpperCase()} — ${escapeHtml(meta.name)}</h2>
     ${meta.summary ? `<div class="scenario-blurb">${escapeHtml(meta.summary)} <a href="#/reference/${sc}">full description →</a></div>` : ""}
+    ${interpHeader(sc)}
     <div class="snap-meta">
       <b>Fault:</b> <span class="mono">${escapeHtml(meta.fault)}</span>
       <span class="sep">·</span>
@@ -1064,6 +1158,7 @@ function renderScenario() {
   }
 
   // ── Invariant report
+  html += interpRunNote(sc, state.run);
   html += `<h3>Invariant verdicts</h3>`;
   const ir = run.invariant_report;
   if (!ir) {
@@ -1114,7 +1209,8 @@ function renderScenario() {
           ${violationTiming(inv)}
         </div>
         ${def ? `<div class="desc">${escapeHtml(def.description)}</div>` : ""}
-        ${notApplicableWhy(inv)}`;
+        ${notApplicableWhy(inv)}
+        ${interpInvariant(sc, inv.invariant)}`;
       if ((inv.violations && inv.violations.length) || inv.note) {
         html += `<pre>${escapeHtml(JSON.stringify({
           violation_count: inv.violation_count,
@@ -1179,6 +1275,7 @@ function renderScenario() {
     }
   }
 
+  html += interpFooter(sc);
   main.innerHTML = html;
 }
 
