@@ -1188,6 +1188,44 @@ every scenario after it on a five-node cluster.
 
 ---
 
+### D33 — S26's node recovery is not fault-tolerant, so one bad run costs the whole scenario
+
+Open. Found in the N=5 campaign: S26 finished **1/5**, with runs 2–5 all failed.
+
+S26 deletes `worker1`'s Node object and relies on a later play to restart the
+kubelet so it re-registers (the D14 fix). Those are two separate plays, and
+nothing bridges them: if the run fails anywhere in between, the Node object
+stays deleted. The kubelet does not recover on its own — it wedges exactly as
+D14 documents, retrying status updates for an object that no longer exists:
+
+```
+kubelet_node_status.go:479 "Error updating node status, will retry"
+    err="error getting node \"worker1\": nodes \"worker1\" not found"
+nodelease.go:50 "Failed to get node when trying to set owner ref to the node lease"
+```
+
+The recovery machinery itself worked — `node_recovery_mode.json` from run_2
+records `kubelet_restart_required: true, reregistered_unassisted: false`, so
+the scenario correctly diagnosed what was needed. It just never got to do it.
+
+**The cost is disproportionate.** With the node gone, runs 3, 4 and 5 each
+failed their pre-flight in ~46 s. One mid-run failure took out four of five
+repetitions, and the cluster ran five-node until a manual
+`systemctl restart kubelet` on worker1 brought it back (6/6 Ready in 20 s).
+
+**Fix.** The kubelet restart must be unconditional on the failure path, not a
+later play: put it in an `always:` block scoped to the same play that deletes
+the Node object, so the substrate is restored whatever happens in between.
+The scenario's own trailing recovery play can stay as the measurement — it is
+the one that records *how* the node came back — but it should not be the only
+thing that can restore it.
+
+Worth noting for the paper as well: this is the same property S26 exists to
+demonstrate. A node whose identity is deleted does not come back by itself,
+and that is true of the harness's own recovery path, not just the cluster's.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
