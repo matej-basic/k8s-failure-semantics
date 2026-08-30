@@ -1710,3 +1710,124 @@ jq '.amplification_metrics' aggregate_report.json
 jq '.invariant_heatmap[] | select(.I1=="NO_DATA") | .scenario' aggregate_report.json
 ls s5 s6
 ```
+
+---
+
+## Defects found during the interpretation pass (2026-08-30)
+
+Found by 23 per-scenario interpretation agents reading the N=5 dataset
+(`run_id 20260829_121511`) against the checker source. Each was verified in the
+main thread before being recorded here.
+
+### D38 — `frequency.I4` contradicted the top-level I4 verdict
+**Status: FIXED** (`scripts/aggregate-results.sh`).
+The D34 fix corrected `final_state_of()` but not the `frequency` sub-block,
+which kept counting the old per-run I4 fields. s2 showed
+`frequency.I4 = {violated: 4, preserved: 0, violation_frequency: 1}` sitting
+directly beside top-level `I4: PRESERVED (I4_source: batch_recompute)`.
+Fix: `frequency.I4` is now marked provisional with `violation_frequency: null`,
+since I4 is a batch-level property and has no meaningful per-run frequency.
+
+### D39 — the D34 fix landed in only one of the two places that compute I4
+**Status: FIXED** (`scripts/check-invariants.sh`, `i4_final_state()`).
+`aggregate-results.sh:final_state_of()` was corrected to fingerprint on the
+Ready-node set / workload replica counts / healthy etcd count.
+`check-invariants.sh:i4_final_state()` was left fingerprinting on
+`.final_lease_holder` and `.control_plane.controller_manager_lease.holder`,
+which embed a per-acquisition UUID. Every per-run `invariant_report.json` in
+the dataset therefore carries a spurious I4 verdict that contradicts the batch
+verdict of record. Eight independent agents flagged the contradiction.
+Verified after the fix: all 5 s11 runs now fingerprint identically
+(`nodes[cp1,cp2,cp3,worker1,worker2,worker3] wl[nginx-stateless=3,postgres-stateful-0=1] etcd[5]`),
+agreeing with the aggregate's PRESERVED.
+**The committed dataset still contains the old per-run values** — they are stale
+by construction, not re-derivable without re-running the checker. The aggregate
+remains the verdict of record for I4.
+
+### D40 — detector blinding: PRESERVED returned while the evidence channel is dark
+**Status: OPEN. Highest-severity finding of this pass, and scientifically
+interesting in its own right.**
+I1 and I3 both read `.nodes[].containers`, collected via `crictl` on each node.
+When the injected fault is precisely what silences that interface, the field
+comes back as a well-formed empty list and both invariants return PRESERVED —
+not because the property held, but because the checker was blind for exactly
+the window in which a violation could exist.
+Measured across the whole dataset (a node that had containers pre-fault
+reporting zero afterwards): **30 snapshot-cells, confined to exactly two
+scenarios** — s22 (containerd freeze; worker1, 5 runs x 2 freeze snapshots) and
+s26 (node-object deletion; worker1, 5 runs x 4 snapshots). Both are the faults
+that attack the observation interface itself; no other scenario is affected.
+Correct behaviour is INSUFFICIENT_DATA, not PRESERVED. This is the same family
+as D2/D3/D10/D31/D34 (a detector that cannot fail) seen from the other side: a
+detector that cannot observe.
+
+### D41 — PRESERVED returned on zero probe samples
+**Status: OPEN.** Same family as D40, different mechanism: `check-invariants.sh`
+defaults to PRESERVED on an empty violation list, which is indistinguishable
+from total data loss. Affected cells: s1 run_4, s17 run_3, s17 run_4, s24 run_1
+(I1, `probe_samples: 0`). In s17 this inflates the preserved count for a batch
+in which runs 2-4 were a single cascading control-plane outage.
+
+### D42 — batch `run_validity` silently takes the last run's value
+**Status: OPEN** (`scripts/aggregate-results.sh`).
+The code forces FAULT_INEFFECTIVE only when *every* run is ineffective;
+otherwise it falls through to `$meta.run_validity`, where `$meta` is simply the
+last run in the batch — despite the code comment claiming "one effective
+repetition means the batch has something to say". s20 is labelled
+FAULT_INEFFECTIVE at batch level on a genuine 3-EFFECTIVE / 2-INEFFECTIVE
+split, because run_5 happened to be ineffective.
+
+### D43 — `check_i6` falls through to a vacuous PRESERVED when fault_class is unresolved
+**Status: OPEN.** s24 run_1 never wrote `scenario_meta.json`, so the
+NOT_APPLICABLE exclusion table could not match it and I6 was evaluated on 0
+snapshots, yielding PRESERVED. That single cell pulls the aggregate
+`invariant_heatmap[].I6` to PRESERVED even though 4/5 runs correctly report
+NOT_APPLICABLE. I9, excluded by the identical rule, aggregates correctly —
+which is how the inconsistency is visible at all.
+
+### D44 — bespoke per-scenario evidence files are empty or malformed
+**Status: OPEN.** Each of these is the scenario's own purpose-built measurement,
+and each is dead in all 5 runs:
+- s3 `revision_drift.json` — invalid JSON, empty value (`{"etcd_revision": , ...}`).
+  No reconciliation-lag figure is derivable.
+- s14 `rv_drift.json` — `controller_last_acted_rv` empty every run, so the
+  reported "drift" is just `current_rv`, which is meaningless.
+- s19 `api_divergence_during_split.json` = `{"cp1_view": null, "cp2_view": null}`
+  and `write_tests_during_split.json` = `[null, null]`, all 5 runs. Two causes,
+  both in the playbook: the `curl | jq` node-list query has no `pipefail`, so a
+  failed curl reads as success (empty stdin, rc 0, no output); and the write
+  test fails on `date +%s%3N` emitting a literal trailing `N`, breaking the
+  `$((END-START))` arithmetic. The direct cp1-vs-cp2 comparison S19 exists to
+  produce was never measured.
+- s25 `apf_evidence.json` — three empty tally arrays in run_4 only, traced to a
+  logged SSH timeout to cp1 (the host every other run delegates collection to).
+
+### D45 — I10 warning counts are censored lower bounds
+**Status: OPEN** (`roles/metrics-collect/tasks/snapshot.yml`).
+`new_warning_pairs` saturates at exactly 50 in every violated run because the
+snapshot task caps the event list at `.items[-50:]`. Reported I10 counts are
+lower bounds and must not be quoted as exact magnitudes or compared across runs.
+
+### D46 — a run that lost SSH mid-flight still reports `status: ok, rc: 0`
+**Status: OPEN.** s24 run_1 and s25 run_4 both logged `UNREACHABLE` to a control
+plane node partway through, aborting before evidence collection, yet
+`iteration_meta.json` records success. s24 run_1 wrote no snapshots and no
+`admission_comparison.json` at all; only the teardown `always` block ran.
+Effective N is 4, not 5, for those scenarios, and nothing in the metadata says so.
+
+### D47 — `check_i10` requires `post_*` snapshot labels
+**Status: OPEN.** s26 labels its post-fault snapshots `t_plus_*` and s17 emits no
+`post_*` label at all, so I10 is INSUFFICIENT_DATA in 5/5 runs of both — a
+naming mismatch, not an absence of post-fault data.
+
+### D48 — s11 run_5's invariant report contradicts its own snapshot
+**Status: OPEN, cause unknown.** `invariant_report.json` records I5 and I9
+VIOLATED, while `snapshot_post_reconnect_t15.json` from the same run shows all
+three API-server observers agreeing Ready=True and all five etcd members
+healthy. The report's mtime (23:19:01) precedes the snapshot's (23:40:31),
+unlike runs 1-4. Treated as unverifiable rather than as a finding.
+
+### D49 — README's scenario table disagrees with the injected fault class
+**Status: OPEN.** README lists S14 as `etcd_latency`; every run's own
+`invariant_report.json` reports `fault_class: api_watch_lag`. The runtime value
+is the correct one.
