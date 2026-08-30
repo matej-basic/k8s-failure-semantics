@@ -1136,6 +1136,50 @@ rather than the normal path.
 
 ---
 
+### D32 — S21 leaves stale VIP ARP entries, cutting a node off the API indefinitely
+
+Open. Found during the 2026-08-29/30 N=5 campaign, after S21 run_1.
+
+S21 blocks VRRP so two control-plane nodes claim `10.0.0.59` simultaneously.
+When the scenario ends and one holder wins, clients that learned the *other*
+holder's MAC keep it: the entry is `REACHABLE`, nothing re-resolves it, and
+keepalived's gratuitous ARP does not always reach every client.
+
+worker2 was left pointing the VIP at `00:50:56:85:2a:38` while the live holder
+was `00:50:56:85:7b:b7`. The symptom is confusing on purpose:
+
+```
+worker2 -> https://10.0.0.49:6443/healthz  (cp1 direct)  200
+worker2 -> https://10.0.0.59:6443/healthz  (the VIP)     000
+worker1, worker3 -> the VIP                              200
+```
+
+Every API server healthy, the VIP answering for everyone else, one node
+silently cut off. Its kubelet then cannot update node status
+(`Get "https://10.0.0.59:6443/api/v1/nodes/worker2": context deadline
+exceeded`), the node goes NotReady, and it stays that way — this is not a
+window that closes on its own.
+
+**Impact on a batch run.** Every subsequent S21 iteration fails its pre-flight
+in ~60 s because a node is NotReady, so the scenario burns its remaining
+repetitions without measuring anything. `ip neigh flush 10.0.0.59` on the
+affected node fixed it instantly and the node was Ready within 10 s.
+
+**Also a gap in the campaign's own health record.** `cluster_health.json`
+recorded `after: healthy` for that run, because `cluster_health_probe` asks
+each control-plane node for its own `/healthz` and all three were fine. The
+probe is deliberately control-plane-scoped (it was written to catch apiservers
+that do not come back), but a scenario can leave a *worker* cut off, and this
+one does. The probe should also count Ready nodes, or the record will keep
+saying healthy while a node is stranded.
+
+**Fix.** S21's teardown should force ARP re-resolution of the VIP on every
+node once the split is healed — `ip neigh flush <vip>` fleet-wide is the
+one-liner — and ideally assert afterwards that every node can reach the VIP,
+since that is the property the rest of the suite depends on.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
