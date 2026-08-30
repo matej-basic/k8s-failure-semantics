@@ -1356,6 +1356,45 @@ honestly rather than presented as a finding about memory pressure.
 
 ---
 
+### D36 — build-report.sh does not scale past N=1; at N=5 it would emit a ~230 MB page
+
+Open. Found when building the report over the completed N=5 dataset.
+
+`scripts/build-report.sh` embeds every snapshot's full JSON into one
+self-contained HTML file — which is exactly what makes it useful at N=1: no
+server, no CDN, drill down to any snapshot of any run, shareable as one file.
+The May 2026 report is 2.8 MB and browses comfortably.
+
+The N=5 dataset is a different order of magnitude:
+
+```
+1011 snapshot files x 247 KB median = 228 MB of JSON to embed
+results/ total                      = 641 MB (372 MB of it trace.jsonl)
+```
+
+The build ran 30 minutes pinned at 100 % CPU and was still serialising when it
+was stopped. Had it finished it would have produced a ~230 MB single page, one
+no browser opens comfortably — so the failure mode is not "slow", it is
+"produces something unusable, slowly".
+
+Nothing is lost by stopping it: the HTML is a *rendering* of
+`results/aggregate_report.json`, which builds over the same 115 runs in about
+five minutes and holds the whole analysis.
+
+**Fix — pick one.** (a) Embed only the aggregate plus each run's
+`invariant_report.json`, and load snapshots on demand from disk paths rather
+than inlining them; (b) at N>1, embed one representative iteration per
+scenario and link the rest; (c) keep the current behaviour behind a flag for
+single runs and default to a summary report for batches. (a) preserves the
+drill-down that makes the report worth having, at the cost of no longer being
+a single self-contained file.
+
+**Note on the existing `report.html`:** it is dated 2026-05-21 and was built
+from the archived May data. It has never been rebuilt from the 2026-08-29
+campaign, and should not be read as describing it.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
