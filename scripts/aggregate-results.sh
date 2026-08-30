@@ -181,23 +181,27 @@ ordered_snapshots() {  # $1 = single-run dir
 #      .control_plane.controller_manager_lease.holder
 # Empty output means unreadable; the caller counts that separately and keeps it
 # out of the distinct-state count.
+#
+# The fingerprint describes CLUSTER STATE, not lease identity. It used to be
+# the controller-manager lease holder, which is `<node>_<uuid>` with the uuid
+# minted per acquisition — so five repetitions produced five distinct strings
+# whether or not they converged, and I4 came back VIOLATED in 22 of 23
+# scenarios (REVIEW.md D34):
+#
+#   run_1 cp2_94b2cc66-…   run_3 cp2_d731d495-…   same node, different uuid
+#
+# Stripping the uuid would not have fixed it either: which control-plane node
+# wins a leader election after a fault is not what I4 asks. I4 asks whether
+# repetitions of one fault converge to the same cluster state.
+#
+# So: the Ready node set, the running workload set by REPLICA COUNT, and the
+# healthy etcd member count. Pod names carry a ReplicaSet hash and a random
+# suffix and are stripped to the workload — including them would reintroduce
+# exactly the defect above. Placement is deliberately NOT part of the
+# fingerprint: which worker hosts a replacement replica is scheduler
+# non-determinism, not a recovery-determinism violation.
 final_state_of() {  # $1 = single-run dir
-  local dir="$1" v snap last post label
-  if [ -f "$dir/run_summary.json" ]; then
-    v=$(jq -r '
-      (.final_lease_holder // null) as $h
-      | if ($h != null) and (($h | tostring) != "") and (($h | tostring) != "null")
-        then ($h | if type == "string" then . else tojson end)
-        else ( (.final_pod_placement // null)
-               | if type == "array"
-                 then ([ .[]? | ((.name // "?") + "@" + (.node // "?")) ] | sort | join(","))
-                 else "" end )
-        end' "$dir/run_summary.json" 2>/dev/null || echo "")
-    case "$v" in
-      ""|null|unknown) ;;
-      *) printf '%s\n' "$v"; return 0 ;;
-    esac
-  fi
+  local dir="$1" snap last post label
   last=""; post=""
   for snap in $(ordered_snapshots "$dir"); do
     last="$snap"
@@ -208,7 +212,24 @@ final_state_of() {  # $1 = single-run dir
   done
   snap="${post:-$last}"
   [ -n "$snap" ] || { printf '\n'; return 0; }
-  jq -r '.control_plane.controller_manager_lease.holder // ""' "$snap" 2>/dev/null || echo ""
+
+  # An unreadable control-plane view yields empty output, which the caller
+  # counts as runs_unreadable rather than as a state of its own — counting it
+  # as a distinct state is how an incomplete batch becomes a false VIOLATED.
+  jq -r '
+    if ((.control_plane.node_conditions // []) | length) == 0 then ""
+    else
+      ([ .control_plane.node_conditions[]?
+         | select((.conditions[]? | select(.type == "Ready") | .status) == "True")
+         | .name ] | sort | join(",")) as $nodes
+      | ([ .control_plane.pod_states[]?
+           | select(.phase == "Running")
+           | (.name | sub("-[a-z0-9]{8,10}-[a-z0-9]{5}$"; "")) ]
+         | group_by(.) | map("\(.[0])=\(length)") | sort | join(",")) as $wl
+      | ([ .etcd.member_status[]?
+           | select(((.Status.errors // []) | length) == 0) ] | length) as $etcd
+      | "nodes[\($nodes)] wl[\($wl)] etcd[\($etcd)]"
+    end' "$snap" 2>/dev/null || echo ""
 }
 
 # ── Cross-run recovery variance (I4's evidence) ───────────────────────────────

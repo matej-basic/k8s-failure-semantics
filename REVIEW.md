@@ -1226,9 +1226,9 @@ and that is true of the harness's own recovery path, not just the cluster's.
 
 ---
 
-### D34 — I4's state fingerprint embeds a per-acquisition UUID, so it reports VIOLATED almost everywhere
+### D34 — I4's state fingerprint embedded a per-acquisition UUID, reporting VIOLATED almost everywhere
 
-Open, and it invalidates the headline I4 result of the N=5 campaign.
+Fixed 2026-08-30. It had invalidated the headline I4 result of the N=5 campaign.
 
 With 115/115 iterations complete, I4 came back **VIOLATED in 22 of 23
 scenarios** — the one exception being S6. A verdict that uniform across
@@ -1265,14 +1265,31 @@ iterations the controller-manager never re-acquired, so the uuid happened to
 stay constant and I4 came back PRESERVED. The one scenario that "passes" does
 so by accident of timing, not because its recovery was more deterministic.
 
-**Fix.** Pick a fingerprint that describes cluster state rather than lease
-identity — Ready node set, workload placement by pod *owner* rather than pod
-name (pod names carry random suffixes and would reintroduce the same problem),
-etcd member set and health. If lease holder is kept at all, strip to the node
-component. Until then I4's verdict should be read as unevaluated: the whole
-N=5 I4 column is an artefact, and REVIEW.md's earlier claim that S6 produced
-"the first evaluable I4 in the suite's history" was premature — it produced
-the first I4 that *computed*, not the first that measured.
+**Fixed.** The fingerprint is now the Ready node set, the running workloads by
+**replica count**, and the healthy etcd member count. Pod names are stripped of
+their ReplicaSet hash and random suffix — including them would reintroduce the
+same defect. Placement is deliberately excluded: which worker hosts a
+replacement replica is scheduler non-determinism, not a recovery-determinism
+violation.
+
+Re-aggregating the same 115 runs turns a uniform artefact into a result that
+discriminates:
+
+| | before | after |
+|---|---|---|
+| PRESERVED | 1 (S6, by accident) | 20 |
+| VIOLATED | 22 | 3 — S1, S3, S4 |
+
+S1 (symmetric control-plane partition), S3 (etcd latency) and S4 (clock skew)
+are the three whose repetitions genuinely ended in different cluster states.
+That is a claim worth making; "22 of 23 recover non-deterministically" was not.
+
+Two cautions for reading the new column. Some scenarios carry unreadable runs
+(S17 has 3 of 5), so a PRESERVED there rests on two readable repetitions, not
+five — `runs_unreadable` is reported alongside and should be quoted with it.
+And the earlier claim that S6 produced "the first evaluable I4 in the suite's
+history" was premature: it produced the first I4 that *computed*. This is the
+first that measures.
 
 ---
 
