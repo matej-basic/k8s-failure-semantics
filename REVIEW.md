@@ -1356,9 +1356,9 @@ honestly rather than presented as a finding about memory pressure.
 
 ---
 
-### D36 — build-report.sh does not scale past N=1; at N=5 it would emit a ~230 MB page
+### D36 — build-report.sh did not scale past N=1; at N=5 it would have emitted a ~230 MB page
 
-Open. Found when building the report over the completed N=5 dataset.
+Fixed 2026-08-30. Found when building the report over the completed N=5 dataset.
 
 `scripts/build-report.sh` embeds every snapshot's full JSON into one
 self-contained HTML file — which is exactly what makes it useful at N=1: no
@@ -1381,13 +1381,33 @@ Nothing is lost by stopping it: the HTML is a *rendering* of
 `results/aggregate_report.json`, which builds over the same 115 runs in about
 five minutes and holds the whole analysis.
 
-**Fix — pick one.** (a) Embed only the aggregate plus each run's
-`invariant_report.json`, and load snapshots on demand from disk paths rather
-than inlining them; (b) at N>1, embed one representative iteration per
-scenario and link the rest; (c) keep the current behaviour behind a flag for
-single runs and default to a summary report for batches. (a) preserves the
-drill-down that makes the report worth having, at the cost of no longer being
-a single self-contained file.
+**Fixed**, with (a) and (b) combined, once it was established that the raw
+results ship alongside the report rather than the page having to carry
+everything:
+
+1. **Drop what is never rendered.** `disagreement` is 122.7 KB of a 267 KB
+   snapshot — 46 % — and appears in `report-template.html` only in prose, never
+   as a data reference; `observer_answers` and `trace_meta` have no references
+   at all. All three stay on disk and are simply not inlined. `warning_events`
+   is capped at the 25 most recent, with `warning_events_truncated` recording
+   the true count.
+2. **Embed the first iteration of each scenario; fetch the rest.** Later
+   iterations carry a *relative* path and are loaded on demand, so the pair
+   (`report.html` + `results/`) is portable. `REPORT_FULL_SNAPSHOTS=1` restores
+   full inlining.
+
+Result: **5.8 MB, built in about two minutes**, against a projected ~230 MB
+that never finished. 883 lazy references, all relative and resolvable; 128
+snapshots embedded for offline drill-down; zero `disagreement` blobs; the
+aggregate with all 23 I4 verdicts intact.
+
+**One constraint this introduces.** Browsers block `fetch()` on `file://`, so
+opening the report directly from disk shows the embedded first iteration of
+every scenario but cannot load the others. The page says so explicitly when a
+fetch fails, and names the fix: serve the directory
+(`python3 -m http.server`) and open it over HTTP. Everything the heatmap and
+the per-invariant pages need is embedded either way — only raw-snapshot
+drill-down beyond the first iteration requires the server.
 
 **Note on the existing `report.html`:** it is dated 2026-05-21 and was built
 from the archived May data. It has never been rebuilt from the 2026-08-29

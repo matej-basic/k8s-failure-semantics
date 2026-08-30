@@ -997,7 +997,27 @@ function renderScenario() {
     html += `</div>`;
 
     if (state.snapshot && run.snapshots[state.snapshot]) {
-      html += renderSnapshot(run.snapshots[state.snapshot]);
+      const snapObj = run.snapshots[state.snapshot];
+      if (snapObj && snapObj._lazy) {
+        ensureSnapshot(run, state.snapshot);
+        html += '<div class="muted" style="padding:1rem">Loading snapshot '
+             +  escapeHtml(state.snapshot) + ' from <code>'
+             +  escapeHtml(snapObj._path) + '</code>…</div>';
+      } else if (snapObj && snapObj._load_error) {
+        html += '<div class="muted" style="padding:1rem">'
+             +  '<strong>Could not load this snapshot.</strong><br>'
+             +  escapeHtml(snapObj._load_error) + '<br><br>'
+             +  'Snapshots beyond the first iteration of each scenario are read from '
+             +  '<code>' + escapeHtml(snapObj._path) + '</code> rather than embedded, '
+             +  'so the results directory must sit beside this file AND be served over '
+             +  'HTTP — browsers block <code>fetch()</code> on <code>file://</code>. '
+             +  'From the directory holding this report:<br>'
+             +  '<code>python3 -m http.server</code> then open '
+             +  '<code>http://localhost:8000/' + escapeHtml(REPORT_FILENAME) + '</code>.'
+             +  '</div>';
+      } else {
+        html += renderSnapshot(snapObj);
+      }
     }
   }
 
@@ -1018,6 +1038,28 @@ function orderSnapLabels(labels) {
 }
 
 // ── Snapshot detail ──────────────────────────────────────────────────────────
+// Snapshots beyond the first iteration of each scenario are not embedded --
+// the 2026-08-29 N=5 dataset is 1011 snapshots at a 247 KB median, and
+// inlining them all produced a ~230 MB page (REVIEW.md D36). They carry a
+// relative path instead and are fetched on demand, which needs the results
+// directory beside this file and an HTTP origin; file:// is blocked by CORS
+// and surfaces as _load_error with instructions.
+const REPORT_FILENAME = (location.pathname.split('/').pop() || 'report.html');
+
+async function ensureSnapshot(run, label) {
+  const s = run.snapshots[label];
+  if (!s || !s._lazy || s._loading) return;
+  s._loading = true;
+  try {
+    const resp = await fetch(s._path);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' for ' + s._path);
+    run.snapshots[label] = await resp.json();
+  } catch (e) {
+    run.snapshots[label] = { _load_error: String(e && e.message || e), _path: s._path };
+  }
+  render();
+}
+
 function renderSnapshot(snap) {
   let html = `<div class="snap-meta">
     <b>Label:</b> <span class="mono">${escapeHtml(snap.snapshot_label || "?")}</span>

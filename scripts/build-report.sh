@@ -107,15 +107,63 @@ for sc in sorted(os.listdir(root)):
         else:
             expanded.append((run, run_path))
 
-    for run, run_path in expanded:
+    # ── What gets embedded, and why not everything ────────────────────────
+    # This report inlines snapshots so it stays one self-contained file. That
+    # is right at N=1 and does not survive N=5: the 2026-08-29 campaign left
+    # 1011 snapshots at a 247 KB median, so embedding them all meant ~228 MB
+    # of JSON. The build ran 30 minutes at 100 % CPU and would have produced a
+    # page no browser opens (REVIEW.md D36).
+    #
+    # Two reductions, in order of how much they buy:
+    #
+    # 1. Drop fields the template never reads. `disagreement` is 122.7 KB of a
+    #    267 KB snapshot — 46 % — and appears in report-template.html only in
+    #    prose, never as a data reference. `observer_answers` and `trace_meta`
+    #    have no references at all. All three stay on disk; they are simply
+    #    not inlined. warning_events is kept but capped, since only the recent
+    #    ones are ever looked at.
+    #
+    # 2. Embed full snapshots for the FIRST iteration of each scenario only.
+    #    Later iterations carry their invariant_report, which is what the
+    #    heatmap and per-invariant pages actually consume; the drill-down that
+    #    needs raw snapshots is preserved for one representative run per
+    #    scenario. Set REPORT_FULL_SNAPSHOTS=1 to inline every iteration and
+    #    accept the size.
+    DROP_FIELDS = ("disagreement", "observer_answers", "trace_meta")
+    WARNING_EVENT_CAP = 25
+    full_snapshots = os.environ.get("REPORT_FULL_SNAPSHOTS") == "1"
+
+    def slim(snap):
+        for k in DROP_FIELDS:
+            snap.pop(k, None)
+        cp = snap.get("control_plane")
+        if isinstance(cp, dict):
+            we = cp.get("warning_events")
+            if isinstance(we, list) and len(we) > WARNING_EVENT_CAP:
+                cp["warning_events"] = we[-WARNING_EVENT_CAP:]
+                cp["warning_events_truncated"] = len(we)
+        return snap
+
+    for idx, (run, run_path) in enumerate(expanded):
+        embed_snaps = full_snapshots or idx == 0
         snaps = {}
         for fn in sorted(os.listdir(run_path)):
             full = os.path.join(run_path, fn)
             if fn.startswith("snapshot_") and fn.endswith(".json"):
                 label = fn[len("snapshot_"):-len(".json")]
+                if not embed_snaps:
+                    # Relative to the report, so the pair (report.html +
+                    # results/) is portable: the raw data ships alongside and
+                    # the page fetches from it. Absolute paths would only work
+                    # on the machine that built the report.
+                    snaps[label] = {
+                        "_lazy": True,
+                        "_path": os.path.relpath(full, os.path.dirname(root)),
+                    }
+                    continue
                 try:
                     with open(full) as f:
-                        snaps[label] = json.load(f)
+                        snaps[label] = slim(json.load(f))
                 except Exception as e:
                     snaps[label] = {"_parse_error": str(e)}
         invariant_report = None
