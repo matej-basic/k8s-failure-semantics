@@ -1453,41 +1453,104 @@ function renderReference() {
 // Generated from the May 20 2026 sweep, 12/14 scenarios, 82 invariant verdicts.
 // Cross-references invariants and scenarios so links into the Reference and
 // Scenario pages keep working.
+// ── Findings ────────────────────────────────────────────────────────────
+// Every count on this page is computed from DATA.aggregate at render time.
+// The previous version hardcoded the figures from the May 2026 single-run
+// sweep, and they did not survive the measurement fixes in REVIEW.md: I6 was
+// reported VIOLATED in 12 of 12 scenarios, but that was the D1 filename-
+// ordering defect making snapshot revisions appear to regress. With snapshots
+// ordered by timestamp, I6 is violated nowhere. Hardcoding findings is how a
+// corrected pipeline keeps publishing an uncorrected claim.
+function findingsStats() {
+  const hm = ((DATA.aggregate || {}).invariant_heatmap) || [];
+  const out = {};
+  for (const id of ["I1","I2","I3","I4","I5","I6","I9","I10"]) {
+    const rec = { viol: [], pres: [], na: [], insuf: [], detinv: [], total: 0 };
+    for (const row of hm) {
+      const v = row[id];
+      if (v === undefined || v === null) continue;
+      rec.total++;
+      if (v === "VIOLATED") rec.viol.push(row.scenario);
+      else if (v === "PRESERVED") rec.pres.push(row.scenario);
+      else if (v === "NOT_APPLICABLE") rec.na.push(row.scenario);
+      else if (v === "INSUFFICIENT_DATA") rec.insuf.push(row.scenario);
+      else if (v === "DETECTOR_INVALID") rec.detinv.push(row.scenario);
+    }
+    out[id] = rec;
+  }
+  return out;
+}
+
 function renderFindings() {
   const main = document.getElementById("main");
   const I = id => `<a href="#/reference/${id}">${id}</a>`;
   const S = id => `<a href="#/reference/${id}">${id.toUpperCase()}</a>`;
   const sdata = id => `<a href="#/scenario/${id}">${id.toUpperCase()}</a>`;
+  const ST = findingsStats();
+  const agg = DATA.aggregate || {};
+  const su = agg.summary || {};
+  const hm = agg.invariant_heatmap || [];
+  const scen = hm.length;
+  // Scenario links for a verdict bucket, in numeric order.
+  const list = arr => (arr || []).slice().sort((a,b) =>
+      (parseInt(a.replace(/\D/g,""),10)||0) - (parseInt(b.replace(/\D/g,""),10)||0))
+    .map(sdata).join(", ") || "none";
+  // A badge whose class follows what the data actually says.
+  const bar = id => {
+    const st = ST[id] || { viol: [], total: 0 };
+    const cls = st.viol.length === 0 ? "ok" : (st.viol.length >= st.total / 2 ? "err" : "warn");
+    let extra = "";
+    if (st.na.length) extra += ` · ${st.na.length} n/a`;
+    if (st.insuf.length) extra += ` · ${st.insuf.length} insuf`;
+    return `<span class="badge ${cls}">VIOLATED ${st.viol.length}/${st.total}${extra}</span>`;
+  };
+  // Repetitions in THIS campaign, from the aggregate's own per-scenario n.
+  // DATA.scenarios carries every run ever collected — the May sweep and the
+  // August shake-downs included — so counting its run keys gives 186, not the
+  // 111 repetitions these findings are computed from.
+  const runsTotal = hm.reduce((n, row) => n + (row.n || 0), 0);
+
   let html = `
-    <h2>Findings — observed behaviour, May 20 sweep</h2>
+    <h2>Findings — ${scen}-scenario sweep, ${runsTotal} runs</h2>
     <div class="stale-notice">
       <b>How to read this dataset.</b>
       ${datasetLine()} Collected after the measurement fixes recorded in
-      <code>REVIEW.md</code>, so the defects that made the May 2026 sweep
-      uninterpretable — snapshots ordered by filename, <code>Ready=Unknown</code>
-      undetectable, the service probed from a host with no route to it — do not
-      apply here. Four things to carry into any reading of the grid:
+      <code>REVIEW.md</code>. Those fixes changed the findings, not just the
+      plumbing: with snapshots ordered by timestamp rather than filename (D1)
+      and <code>Ready=Unknown</code> made detectable (D2/D3), the previously
+      headline result — ${I("I6")} violated in every scenario — disappears
+      entirely, and the violations move to ${I("I2")} and ${I("I3")}. Every
+      number on this page is computed from
+      <code>results/aggregate_report.json</code> at render time.
+      Five things to carry into any reading of the grid:
       <ul style="margin:.5rem 0 0 1rem;padding:0">
         <li><b>S18 measured nothing.</b> Its memory pressure never reaches
             kubelet's eviction threshold, so all ${s18Runs()} repetitions are
             <code>FAULT_INEFFECTIVE</code> and its verdicts describe an
-            undisturbed node, not a finding about memory pressure. Cause not yet
-            established (D35).</li>
+            undisturbed node, not a finding about memory pressure (D35).</li>
         <li><b><code>NOT_APPLICABLE</code> and <code>INSUFFICIENT_DATA</code> are
             not <code>PRESERVED</code>.</b> An invariant that cannot apply to a
             fault class, and one with no evidence to evaluate, are counted
             separately and deliberately — folding either into "preserved"
-            inflates the preserved count.</li>
-        <li><b>A proven fault with no violation is a gap in the invariant set,
-            not an absence of effect.</b> S21 puts two nodes on the API VIP
-            simultaneously and S22 freezes the container runtime; both are
-            confirmed <code>EFFECTIVE</code> and neither trips any invariant,
-            because no detector exists for those conditions.</li>
-        <li><b>Verdicts are per-batch, not per-run.</b> Each cell summarises
-            five repetitions; <code>runs_unreadable</code> in
-            <code>aggregate_report.json</code> records how many contributed no
-            evidence, and a verdict resting on two readable runs should be
-            quoted with that number.</li>
+            inflates the preserved count. Of ${su.denominator ? su.denominator.cells_total : "—"}
+            cells, only ${su.denominator ? su.denominator.counted : "—"} are evaluable.</li>
+        <li><b>Some <code>PRESERVED</code> verdicts are the fault blinding the
+            detector.</b> ${I("I1")} and ${I("I3")} both read
+            <code>.nodes[].containers</code> via crictl. ${sdata("s22")} freezes
+            containerd and ${sdata("s26")} deletes the Node object, so that field
+            returns a well-formed empty list for the target node throughout the
+            fault window — 30 snapshot-cells, confined to those two scenarios,
+            which are exactly the faults that attack the observation interface.
+            Those cells should read <code>INSUFFICIENT_DATA</code> (D40).</li>
+        <li><b>${I("I4")} is a property of a batch, not a run.</b> Use the
+            heatmap value (<code>I4_source: batch_recompute</code>). The per-run
+            I4 inside each <code>invariant_report.json</code> is stale — it
+            fingerprints a lease-holder string containing a per-acquisition UUID,
+            so identical recoveries compare as different (D39).</li>
+        <li><b>Verdicts are per-batch.</b> Each cell summarises five repetitions;
+            <code>runs_unreadable</code> records how many contributed no evidence,
+            and a verdict resting on two readable runs should be quoted with that
+            number.</li>
       </ul>
     </div>
     <div class="crumb">${findingsCrumb()} · grounded in <code>results/*/invariant_report.json</code></div>
@@ -1501,151 +1564,328 @@ function renderFindings() {
     </div>
 
     <h3 id="finding-sweep">What we measured against</h3>
-    <p>Substrate: 3 dedicated etcd members, 3 control-plane nodes behind a keepalived VIP, 3 workers running <code>nginx-stateless</code> (3 replicas) and <code>postgres-stateful</code> (1 replica), all on a single /24 with Calico CNI. Observer is a macOS laptop running ansible-playbook against the cluster over SSH.</p>
-    <p>Sweep coverage — 12 of 14 paper scenarios with full snapshot sets and invariant reports:</p>
+    <p>Substrate: <b>5 dedicated etcd members</b>, 3 control-plane nodes behind a
+       keepalived VIP (10.0.0.59), 3 workers running <code>nginx-stateless</code>
+       (3 replicas) and <code>postgres-stateful</code> (1 replica), on a single
+       /24 with Calico CNI — 11 vSphere VMs in all. The observer is the machine
+       running <code>ansible-playbook</code> against the cluster over SSH; no
+       observer VM is provisioned, which is itself part of the thesis.</p>
+    <p>Coverage: <b>${scen} scenarios, ${runsTotal} runs</b>, five repetitions
+       each except ${sdata("s18")}. Scenario count and repetition count below are
+       read from the dataset, not asserted:</p>
     <table class="findings-coverage">
-      <thead><tr><th>Scenario</th><th>Description</th><th>Snapshots</th></tr></thead>
+      <thead><tr><th>Scenario</th><th>Fault</th><th>Runs</th><th>Snapshots (latest run)</th></tr></thead>
       <tbody>
-        <tr><td>${sdata("s1")}</td><td>symmetric control-plane partition</td><td>7</td></tr>
-        <tr><td>${sdata("s2")}</td><td>asymmetric worker isolation</td><td>8</td></tr>
-        <tr><td>${sdata("s3")}</td><td>etcd write-latency degradation</td><td>7</td></tr>
-        <tr><td>${sdata("s4")}</td><td>clock skew on cp1</td><td>6</td></tr>
-        <tr><td>${sdata("s8")}</td><td>partition + storage lag (composed)</td><td>7</td></tr>
-        <tr><td>${sdata("s11")}</td><td>kubelet partition / pod lifecycle</td><td>7</td></tr>
-        <tr><td>${sdata("s12")}</td><td>leader election storm</td><td>7</td></tr>
-        <tr><td>${sdata("s14")}</td><td>stale informer cache</td><td>5</td></tr>
-        <tr><td>${sdata("s15")}</td><td>graceful termination race</td><td>4</td></tr>
-        <tr><td>${sdata("s17")}</td><td>etcd compaction + watch history gap</td><td>6</td></tr>
-        <tr><td>${sdata("s18")}</td><td>node pressure eviction race</td><td>7</td></tr>
-        <tr><td>${sdata("s19")}</td><td>split etcd quorum</td><td>5</td></tr>
+        ${hm.slice().sort((a,b) =>
+            (parseInt(String(a.scenario).replace(/\D/g,""),10)||0) -
+            (parseInt(String(b.scenario).replace(/\D/g,""),10)||0))
+          .map(row => {
+            const sc = row.scenario;
+            const d = (DATA.scenarios || {})[sc];
+            // Newest run key: run_ids are timestamps, so lexical order is
+            // chronological. Taking the first would report the May 2026 sweep.
+            const runKeys = d ? Object.keys(d.runs || {}).sort() : [];
+            // Newest run that actually captured snapshots. S18's last iteration
+            // aborted with only an ansible.log, and reporting 0 there would read
+            // as "no observations exist" rather than "this one run collected none".
+            let snaps = 0;
+            for (let x = runKeys.length - 1; x >= 0; x--) {
+              const cand = Object.keys((d.runs[runKeys[x]] || {}).snapshots || {}).length;
+              if (cand) { snaps = cand; break; }
+            }
+            const meta = CATALOG[sc] || {};
+            const ip = interpFor(sc);
+            const fault = (ip && ip.fault) || meta.fault || "—";
+            // fault_efficacy is an object ({verdict, fired, missing_required}),
+            // not a string — stringifying it directly prints [object Object].
+            const eff = (row.fault_efficacy && row.fault_efficacy.verdict)
+                        || row.run_validity || "";
+            const effCell = eff && eff !== "EFFECTIVE" && eff !== "OK"
+              ? ` <span class="badge na" title="The fault produced no observable change; these verdicts describe an undisturbed cluster.">${escapeHtml(eff)}</span>`
+              : "";
+            return `<tr><td>${sdata(sc)}${effCell}</td><td><code>${escapeHtml(String(fault))}</code></td>` +
+                   `<td>${row.n || 0}</td><td>${snaps}</td></tr>`;
+          }).join("")}
       </tbody>
     </table>
-    <p class="muted">${S("s5")} (all-CP API blackhole) and ${S("s6")} (5-iteration repeat) were excluded for runtime/burst-budget reasons.</p>
+    <p class="muted"><b>On the <code>INEFFECTIVE</code> labels.</b> The batch-level
+       efficacy label is not a batch computation: it is forced only when
+       <em>every</em> repetition was ineffective, and otherwise falls through to
+       whichever run happened to be last (D42). ${sdata("s12")} and
+       ${sdata("s20")} are labelled <code>INEFFECTIVE</code> here on genuine
+       splits — ${sdata("s20")} was 3 effective of 5, and ${sdata("s12")} landed
+       its fault only in the repetition where the isolated node actually held the
+       controller-manager lease. Read those two per-run, not per-batch.
+       ${sdata("s18")} is the honest case: ineffective in every repetition.</p>
 
     <h3 id="finding-invariants">Per-invariant findings</h3>
 
     <div class="finding-inv" id="finding-I1">
-      <div class="finding-inv-head"><span class="id">${I("I1")}</span><span class="name">Exclusive authority</span><span class="badge ok">PRESERVED · 12/12</span></div>
-      <p><b>What we measured.</b> Every snapshot in every scenario had exactly one <code>controller-manager</code> and <code>scheduler</code> <code>holderIdentity</code>; no duplicate StatefulSet pod identities ever appeared on two nodes at once. Strongest data point: ${sdata("s12")} (election storm) — flap-induced re-elections at sub-second cadence produced 0 ms measurable overlap within the 500 ms polling resolution. ${sdata("s18")} (eviction race) also held — kubelet's eviction and the scheduler's replacement coordinate via the eviction status update, contradicting the "two control loops race observer-blind" hypothesis. ${sdata("s4")} (clock skew) held too: locally-evaluated <code>leaseDurationSeconds</code> did not produce dual-authority windows.</p>
-      <p><b>Production translation.</b> When a HA controller with <code>leaderElect: true</code> has a sidecar that wedges, you do not have two replicas writing to the same CR simultaneously. The Lease API's <code>holderIdentity</code> is an honest exclusivity signal at human timescales.</p>
-      <p><b>Caveat.</b> I1 is structural — it says no two simultaneous holders. It says nothing about whether the holder is acting on a stale view; that is ${I("I5")}.</p>
+      <div class="finding-inv-head"><span class="id">${I("I1")}</span><span class="name">Exclusive authority</span>${bar("I1")}</div>
+      <p><b>What we measured.</b> Exactly one <code>controller-manager</code> and
+         <code>scheduler</code> <code>holderIdentity</code> in every snapshot of
+         every scenario but one. The exception is decisive:
+         ${list(ST.I1.viol)} violates I1 in <b>5 of 5 repetitions</b>
+         (<code>violation_frequency: 1</code>) — asymmetric worker isolation
+         produces unfenced concurrent writes, with two distinct writer UIDs
+         alternating over ~600 records against the same object. This is not a
+         race won occasionally; it reproduces every time.</p>
+      <p><b>Why this matters.</b> The earlier single-run sweep reported I1
+         PRESERVED everywhere and concluded that "the Lease API's
+         <code>holderIdentity</code> is an honest exclusivity signal". That
+         conclusion was an artifact of not repeating the experiment. Leader
+         election is not the only authority path: a partitioned writer that never
+         loses its lease is still fenced by nothing.</p>
+      <p><b>Caveat.</b> I1 is structural — it says no two simultaneous holders.
+         It says nothing about whether the holder is acting on a stale view; that
+         is ${I("I5")}. And in ${sdata("s22")}/${sdata("s26")} its PRESERVED is
+         detector blinding, not a check (D40).</p>
     </div>
 
     <div class="finding-inv" id="finding-I2">
-      <div class="finding-inv-head"><span class="id">${I("I2")}</span><span class="name">Reachability publication</span><span class="badge err">VIOLATED · 11/12</span></div>
-      <p><b>What we measured.</b> In 11 scenarios the <code>Endpoints</code> object kept publishing pod IPs while external probes could not reach them. ${sdata("s2")} was cleanest: 8 of 8 fault-window snapshots violated while ${I("I1")} held throughout. ${sdata("s15")} quantified the gap in milliseconds — pod stayed in the endpoint subset for hundreds of ms after deletion, with real traffic landing on it. ${sdata("s1")} is the only scenario where I2 held; the symmetric partition with cp2 as observation vantage kept publication consistent.</p>
-      <p><b>Production translation — three concrete shapes:</b></p>
-      <ol>
-        <li><b>One-way network change on a worker.</b> kubelet still heartbeats (the other direction works). Control plane keeps the pod in <code>Endpoints</code>. <code>curl</code> hits it and times out. This is ${sdata("s2")}; the 8-of-8 violation rate says it happens in <em>every</em> fault-window snapshot, not as a rare race.</li>
-        <li><b>Rolling deployment.</b> New pod added to <code>Endpoints</code> before readiness, OR old pod stays in <code>Endpoints</code> after SIGTERM. Both are ${sdata("s15")}. Default <code>terminationGracePeriodSeconds: 30</code> is longer than endpoint propagation; the gap is observable.</li>
-        <li><b>etcd slow.</b> During ${sdata("s3")} (800 ms ± 200 ms write latency), <code>EndpointSlice</code> updates lagged actual workload state for the entire fault window.</li>
-      </ol>
-      <p><b>What this means for your services.</b> Do not trust <code>Endpoints</code>/<code>EndpointSlice</code> as a synonym for "this backend will answer now." Use a client-side load balancer with circuit-breaking (Envoy, gRPC pick-first with health) or add <code>lifecycle.preStop.exec.command: ["sleep","10"]</code> to give the endpoints controller time to remove the pod before the container stops serving.</p>
+      <div class="finding-inv-head"><span class="id">${I("I2")}</span><span class="name">Reachability publication</span>${bar("I2")}</div>
+      <p><b>What we measured.</b> The <code>Endpoints</code> object kept
+         publishing pod IPs while probes could not reach them, in
+         ${ST.I2.viol.length} of ${ST.I2.total} scenarios: ${list(ST.I2.viol)}.
+         This is the most frequently violated invariant in the sweep and the
+         empirical core of the observer-relativity claim.</p>
+      <p><b>Duration is the interesting variable, and it spans two orders of
+         magnitude.</b> Measured outage windows: ${sdata("s20")} 7–12 s,
+         ${sdata("s5")} 27–30 s, ${sdata("s1")} 48 s, ${sdata("s3")} 50 s,
+         ${sdata("s4")} 55–93 s, ${sdata("s17")} 57–82 s, ${sdata("s2")}
+         111–117 s, ${sdata("s6")} 160–176 s, ${sdata("s19")} 186 s,
+         ${sdata("s11")} 240–247 s, ${sdata("s8")} 255–261 s. The tight
+         within-scenario spread (${sdata("s11")}: 240, 240, 242, 244, 247 s)
+         against the wide across-scenario spread says the duration is a property
+         of the fault class, not of chance — which is what makes it quotable.</p>
+      <p><b>Production translation.</b> Do not treat
+         <code>Endpoints</code>/<code>EndpointSlice</code> as a synonym for "this
+         backend will answer now". Use client-side load balancing with
+         circuit-breaking (Envoy outlier detection, gRPC health), and add a
+         <code>preStop</code> sleep so the endpoints controller can remove the pod
+         before the container stops serving. You can shrink the unsafe window;
+         these numbers say you cannot close it.</p>
     </div>
 
     <div class="finding-inv" id="finding-I3">
-      <div class="finding-inv-head"><span class="id">${I("I3")}</span><span class="name">Failure declaration consistency</span><span class="badge ok">PRESERVED · 12/12</span></div>
-      <p><b>What we measured.</b> When the API said a node was <code>NotReady</code>, the node's own crictl view agreed: pods were stopped or stopping. The framework's I3 check (<code>NotReady-in-API AND CONTAINER_RUNNING-locally</code>) never fired.</p>
-      <p><b>This is partly a framework limitation, not a positive result.</b> ${sdata("s11")} was designed to expose I3 — partition the kubelet from the API server with workloads running. PRESERVED because the kubelet's own readiness propagation stops the pods (via the runtime) before crictl can record divergent state. To force a measurable I3 violation you'd need a workload that survives the kubelet's shutdown signal, or a longer fault window past the runtime's container-stop grace.</p>
-      <p><b>Production translation.</b> A node reported <code>NotReady</code> by <code>kubectl get nodes</code> really is stopping its workloads — you do not have a node lying about its containers. But eviction takes minutes; if you hand work to nodes by name, the work in flight on a NotReady node may still complete and write to your database. Idempotency at the workload layer matters; <code>NotReady</code> is not "the workload is gone."</p>
+      <div class="finding-inv-head"><span class="id">${I("I3")}</span><span class="name">Failure declaration consistency</span>${bar("I3")}</div>
+      <p><b>What we measured.</b> The API declared a node failed or uncertain
+         while that node's own crictl view showed containers still running, in
+         ${ST.I3.viol.length} of ${ST.I3.total} scenarios: ${list(ST.I3.viol)}.</p>
+      <p><b>This reverses the earlier result, and the reversal is the point.</b>
+         The single-run sweep reported I3 PRESERVED in 12 of 12 and explained it
+         away as a framework limitation. The explanation was wrong: the detector
+         could not represent <code>Ready=Unknown</code> (D2/D3), so the most
+         common declaration state in a partition was invisible to it. With that
+         fixed, I3 is violated about as often as I2 — the canonical "API says
+         NotReady, node says Running" divergence is not rare, it was unmeasurable.</p>
+      <p><b>Production translation.</b> A node reported <code>NotReady</code> is
+         <em>not</em> a node whose workloads have stopped. Work in flight can
+         still complete and still write to your database, for minutes. Idempotency
+         at the workload layer is the mitigation; <code>NotReady</code> is not
+         "the workload is gone".</p>
     </div>
 
     <div class="finding-inv" id="finding-I4">
-      <div class="finding-inv-head"><span class="id">${I("I4")}</span><span class="name">Recovery coherence</span><span class="badge warn">INSUFFICIENT_DATA · 12/12</span></div>
-      <p><b>What we measured.</b> Nothing. I4 is cross-run by construction — it asks whether independent repetitions of the same fault converge to the same post-fault state — so single-run scenarios correctly return INSUFFICIENT_DATA. Only ${S("s6")} (5-iteration repeat) could evaluate it, and ${S("s6")} was excluded from this sweep.</p>
-      <p><b>Outstanding work.</b> Running ${S("s6")} will populate <code>aggregate_report.json</code>'s <code>recovery_variance_s6</code> block. Until then, recovery determinism is hypothesis, not measurement.</p>
+      <div class="finding-inv-head"><span class="id">${I("I4")}</span><span class="name">Recovery coherence</span>${bar("I4")}</div>
+      <p><b>What we measured.</b> With N=5 repetitions this invariant is finally
+         evaluable, and it mostly holds: recovery converges to one final cluster
+         state in ${ST.I4.pres.length} of ${ST.I4.total} scenarios. It does not in
+         ${list(ST.I4.viol)}; ${list(ST.I4.insuf)} has too few repetitions to say.</p>
+      <p><b>Read this verdict only from the heatmap.</b> The fingerprint compares
+         the Ready node set, the running workload set by replica count, and the
+         healthy etcd member count — deliberately not pod placement, which is
+         scheduler non-determinism rather than a recovery failure. The per-run I4
+         field in each <code>invariant_report.json</code> predates that fix and is
+         stale (D39).</p>
     </div>
 
     <div class="finding-inv" id="finding-I5">
-      <div class="finding-inv-head"><span class="id">${I("I5")}</span><span class="name">Observation-action consistency</span><span class="badge err">VIOLATED · 11/12</span></div>
-      <p><b>What we measured.</b> In 11 scenarios the etcd revision advanced by &gt;500 between consecutive snapshots without a matching change in pod state or lease holder — the framework's signature for "controllers reconciling against state the cluster cannot commit against." Violation rate was 7 of 7 fault-window snapshots in ${sdata("s2")}, ${sdata("s3")}, ${sdata("s11")}, ${sdata("s12")}, ${sdata("s18")}; 8 of 8 in ${sdata("s2")}; 6 of 6 in ${sdata("s17")}. ${sdata("s1")} was the only scenario where I5 was relatively quiet (only 4 violations).</p>
-      <p><b>Production translation — the "Kubernetes is loud during outages" symptom:</b></p>
-      <ol>
-        <li>The etcd revision keeps climbing — every controller retries (kube-controller-manager, scheduler, your custom operator).</li>
-        <li>The cluster's <em>actual</em> state does not change — the workload is partitioned/slow, nothing moves.</li>
-        <li>Your monitoring on apiserver request rate spikes 10–100× on the affected resource while nothing operational improves.</li>
-      </ol>
-      <p>This is what "kubectl is slow during the outage" really is — not a broken apiserver but a 100×-loaded one, against the same objects. ${sdata("s3")} measured this directly: 7 of 7 violations for the full fault window. Mitigation for custom controllers: backoff with jitter and circuit-break on repeated retry.</p>
+      <div class="finding-inv-head"><span class="id">${I("I5")}</span><span class="name">Observation-action consistency</span>${bar("I5")}</div>
+      <p><b>What we measured.</b> Disagreement between the three API servers about
+         the same object, in only ${ST.I5.viol.length} of ${ST.I5.total}
+         scenarios: ${list(ST.I5.viol)}.</p>
+      <p><b>A large downward correction.</b> The earlier sweep reported I5
+         violated in 11 of 12 and built a "reconciliation amplification" narrative
+         on it. That signal was an etcd-revision delta threshold crossed by
+         ordinary cluster activity, not by disagreement. Measured as actual
+         inter-observer disagreement, it is uncommon.</p>
+      <p><b>The detector has a known blind spot,</b> and it matters for the
+         paper's own thesis: I5 fires only when two observers both return
+         populated, differing answers. An observer that cannot answer at all does
+         not count as disagreement. ${sdata("s28")} shows real cross-API-server
+         divergence during its re-seed window that I5 does not flag, and
+         ${sdata("s19")} carries a per-snapshot <code>.disagreement</code> matrix
+         showing two live API servers on opposite sides of a split returning
+         different values — evidence for the strongest claim in the paper, which
+         no current invariant reads.</p>
     </div>
 
     <div class="finding-inv" id="finding-I6">
-      <div class="finding-inv-head"><span class="id">${I("I6")}</span><span class="name">Watch progress monotonicity</span><span class="badge err">VIOLATED · 12/12 · <em>extension</em></span></div>
-      <p><b>What we measured.</b> In every scenario the observed etcd revision <em>decreased</em> between at least one pair of consecutive snapshots — 3 times in S1/S2/S3/S4/S8/S11, 2 in S12/S18/S19, once in S14/S15/S17. The paper's original ${I("I5")} catches forward revision delta (reconciliation amplification). I6 catches the inverse — backward movement — which signals a watch reset, a stale read from a minority etcd member, or a relist after compaction.</p>
-      <p><b>This is the most paper-relevant finding the original I1–I5 frame did not capture.</b> Across 12 scenarios with 12 different fault mechanisms, every single one produced at least one snapshot where the cluster's observed revision regressed. Mechanism varies (apiserver caches at different revisions in S3/S14; relist after partition in S1/S17; minority-etcd stale read in S19) but the observable is the same: <em>watch revisions are not monotonic from any single observer's perspective</em>.</p>
-      <p><b>Production translation — "informer caches reporting different things on different controllers" during incidents:</b></p>
-      <ol>
-        <li>Two controllers — say <code>kube-controller-manager</code> on cp2 and <code>cert-manager</code> on a worker — both watch the same Deployment.</li>
-        <li>A network blip resets one watch and forces a relist. For ~100 ms to a few seconds, the two controllers have different views (3 replicas vs 5). Each takes actions consistent with its view.</li>
-        <li><code>kubectl get deployment</code> from your laptop returns yet a third value because your request hits a third apiserver with a cache at yet another revision.</li>
-      </ol>
-      <p>Observable in production via <code>apiserver_watch_events_sizes</code> drift between apiserver instances. Mitigation: design controllers to be idempotent across watch resets (recommended), or leader-elect cluster-scoped controllers to observe via one apiserver.</p>
+      <div class="finding-inv-head"><span class="id">${I("I6")}</span><span class="name">Watch progress monotonicity</span>${bar("I6")}</div>
+      <p><b>What we measured: nothing regressed.</b> The observed etcd revision is
+         monotonic in all ${ST.I6.pres.length} scenarios where this invariant
+         applies; it is <code>NOT_APPLICABLE</code> in the other ${ST.I6.na.length},
+         whose fault classes cannot move a logical revision counter backwards.</p>
+      <p><b>This retracts the previous headline finding.</b> The earlier sweep
+         called I6 "the most paper-relevant finding the original I1–I5 frame did
+         not capture", reporting a revision regression in all 12 scenarios. It was
+         an artifact: snapshots were ordered by filename, so
+         <code>snapshot_t_plus_120</code> sorted before <code>snapshot_t_plus_30</code>
+         and revisions appeared to run backwards (D1). Ordered by timestamp, the
+         effect vanishes. etcd's revision counter is monotonic, as its design
+         requires.</p>
+      <p><b>What survives.</b> The <em>question</em> I6 asks is still the right
+         one — but the observable is a client-visible watch gap, not a decreasing
+         revision. ${sdata("s28")} measures that directly: replaying an identical
+         continuation token yields no gap immediately after compaction and a gap
+         ~150–200 s later, on all three API servers in all five runs.</p>
     </div>
 
     <div class="finding-inv" id="finding-I9">
-      <div class="finding-inv-head"><span class="id">${I("I9")}</span><span class="name">Quorum continuity</span><span class="badge ok">PRESERVED · 12/12 · <em>extension</em></span></div>
-      <p><b>What we measured.</b> Across every snapshot of every scenario, all 3 etcd members responded to <code>endpoint status</code>. Substrate kept majority throughout, even during ${sdata("s19")} (which <em>splits</em> etcd into majority/minority — the majority side stayed available).</p>
-      <p><b>This is the silent positive result that makes everything else meaningful.</b> Without I9, the paper's argument would be ambiguous: when I1 holds, is it because Kubernetes' exclusivity guarantee works, or because etcd lost quorum and stopped accepting writes? With I9 in hand, every other verdict in this sweep is an <em>observable-layer</em> failure, not a substrate failure. The cluster's authoritative state was always coherent; what's incoherent is each observer's view of it.</p>
-      <p><b>Production translation.</b> etcd is stable in practice. Famous "etcd lost quorum" outages are real but rare; they need catastrophic events (datacenter loss, disk full, OOM-killed etcd). Day-to-day faults — pod evictions, node reboots, network blips — keep quorum intact. <strong>Monitor etcd quorum (<code>etcd_server_has_leader</code>, <code>etcd_server_is_leader</code>, <code>etcd_network_peer_round_trip_time_seconds</code>) as a primary alert; treat I2/I5/I6 violations as expected during transient faults, not as emergencies.</strong></p>
+      <div class="finding-inv-head"><span class="id">${I("I9")}</span><span class="name">Quorum continuity</span>${bar("I9")}</div>
+      <p><b>What we measured.</b> The 5-member etcd cluster held quorum in
+         ${ST.I9.pres.length} of the ${ST.I9.total - ST.I9.na.length} scenarios
+         where quorum can be exercised at all (${ST.I9.na.length} are
+         <code>NOT_APPLICABLE</code>). The single violation is ${list(ST.I9.viol)},
+         which splits etcd deliberately — and even there the majority side stayed
+         available.</p>
+      <p><b>This is the silent positive result that makes everything else
+         meaningful.</b> Without it the argument would be ambiguous: when I1
+         holds, is that Kubernetes' exclusivity guarantee working, or etcd having
+         stopped accepting writes? With I9 in hand, every other verdict is an
+         <em>observable-layer</em> failure, not a substrate failure. The
+         authoritative state stayed coherent; the views of it did not.</p>
     </div>
 
     <div class="finding-inv" id="finding-I10">
-      <div class="finding-inv-head"><span class="id">${I("I10")}</span><span class="name">Reconciliation termination</span><span class="badge ok">PRESERVED · 9/12 · <em>extension</em></span></div>
-      <p><b>What we measured.</b> In 9 scenarios, between the first and last post-fault snapshots, no <em>new</em> <code>(involvedObject.name, reason)</code> Warning pairs appeared — the cluster stopped emitting fresh complaints about the affected workload within the observation window. ${sdata("s15")} was the lone violation: warnings about the terminating pod's endpoint membership kept appearing throughout the 60 s tail, never settling. ${sdata("s17")} and ${sdata("s19")} tails were too short to evaluate cleanly (INSUFFICIENT_DATA).</p>
-      <p><b>Production translation.</b> Cluster faults usually self-resolve. The cluster grumbles for a while (counts of <code>BackOff</code>, <code>Unhealthy</code>, <code>FailedScheduling</code> climb), then the same set of complaints stops coming. "Warning events stopped appearing about object X" is a reasonable proxy for "the cluster has accepted the new state."</p>
-      <p><b>${sdata("s15")} is the cautionary case.</b> Default-graceful termination never quite settles within a 60 s observation window. Production analogue: you delete a pod, and for ~30–60 seconds after the pod is gone you still see endpoint-controller warnings about it. Mitigation: longer <code>preStop</code> hooks, shorter <code>terminationGracePeriodSeconds</code>, or accept that termination is observably noisy and tune alerts accordingly.</p>
+      <div class="finding-inv-head"><span class="id">${I("I10")}</span><span class="name">Reconciliation termination</span>${bar("I10")}</div>
+      <p><b>What we measured.</b> Fresh Warning events kept appearing after the
+         fault was lifted in ${ST.I10.viol.length} of ${ST.I10.total} scenarios:
+         ${list(ST.I10.viol)}. ${ST.I10.insuf.length} are
+         <code>INSUFFICIENT_DATA</code> (${list(ST.I10.insuf)}).</p>
+      <p><b>Two measurement limits, both load-bearing.</b> The event counts
+         saturate at exactly 50 because the snapshot task caps the event list at
+         <code>.items[-50:]</code> — every "50 new warning pairs" is a censored
+         lower bound and must not be compared across runs (D45). And the
+         <code>INSUFFICIENT_DATA</code> cells are largely a naming mismatch: the
+         check requires <code>post_*</code> snapshot labels, which
+         ${sdata("s26")} does not use (D47). Neither is evidence about the
+         cluster.</p>
+      <p><b>Production translation.</b> Cluster faults usually self-resolve, and
+         "warning events about object X stopped arriving" is a reasonable proxy
+         for "the cluster has accepted the new state" — but note it failed to
+         settle within the observation window in a third of scenarios here.</p>
     </div>
 
     <h3 id="finding-synthesis">Cross-scenario synthesis</h3>
-    <p>Sorting invariants by violation rate produces a clean ranking that maps directly to a single paper-level claim:</p>
+    <p>Sorted by violation rate, computed from the heatmap:</p>
     <table class="findings-synth">
-      <thead><tr><th>Invariant</th><th>Layer</th><th>Violated</th><th>Verdict</th></tr></thead>
+      <thead><tr><th>Invariant</th><th>Layer</th><th>Violated</th><th>Reading</th></tr></thead>
       <tbody>
-        <tr><td>${I("I1")} authority</td><td>structural</td><td>0/12</td><td>Kubernetes' exclusivity guarantee is real</td></tr>
-        <tr><td>${I("I3")} failure declaration</td><td>structural</td><td>0/12</td><td>Declaration-vs-reality agreement holds</td></tr>
-        <tr><td>${I("I9")} quorum</td><td>substrate</td><td>0/12</td><td>etcd consensus is stable</td></tr>
-        <tr><td>${I("I10")} termination</td><td>observer</td><td>1/12</td><td>Reconciliation usually converges</td></tr>
-        <tr><td>${I("I4")} recovery coherence</td><td>cross-run</td><td>INSUF</td><td>Not yet measured</td></tr>
-        <tr><td>${I("I2")} reachability publication</td><td>observer</td><td>11/12</td><td><strong>Reachability is observer-relative</strong></td></tr>
-        <tr><td>${I("I5")} observation-action</td><td>observer</td><td>11/12</td><td><strong>Controllers act on stale views</strong></td></tr>
-        <tr><td>${I("I6")} watch monotonicity</td><td>observer</td><td>12/12</td><td><strong>Cluster state is non-monotonic per observer</strong></td></tr>
+        ${[["I2","observer","Reachability is observer-relative"],
+           ["I3","observer","Declaration diverges from local reality"],
+           ["I10","observer","Reconciliation often fails to settle in-window"],
+           ["I4","cross-run","Recovery is usually, not always, deterministic"],
+           ["I5","observer","Inter-observer disagreement is real but uncommon"],
+           ["I1","structural","Exclusivity holds except when unfenced"],
+           ["I9","substrate","etcd consensus is stable"],
+           ["I6","observer","Revision monotonicity holds"]]
+          .map(([id, layer, verdict]) => {
+            const st = ST[id];
+            const strong = st.viol.length >= st.total / 3;
+            return `<tr><td>${I(id)}</td><td>${layer}</td>` +
+                   `<td>${st.viol.length}/${st.total}</td>` +
+                   `<td>${strong ? "<strong>" + verdict + "</strong>" : verdict}</td></tr>`;
+          }).join("")}
       </tbody>
     </table>
-    <p><b>The paper's central claim is empirically airtight:</b> the structural and substrate invariants (I1, I3, I9) hold robustly, while the observer-relative invariants (I2, I5, I6) fail under every interesting fault. The cluster's authoritative state is coherent; what's incoherent is each observer's view of it.</p>
+    <p><b>The central claim survives the corrections, in a narrower and better
+       form.</b> The substrate invariant (${I("I9")}) and the structural ones
+       (${I("I1")}, ${I("I6")}) hold almost everywhere, while the
+       publication-layer invariants (${I("I2")}, ${I("I3")}) fail in roughly half
+       of all scenarios. The cluster's authoritative state stays coherent; what
+       diverges is what each observer is told about it. Note that two of the
+       three claims the earlier sweep rested on (${I("I5")}, ${I("I6")}) did not
+       survive measurement fixes — the conclusion held, but not on the evidence
+       originally cited for it.</p>
 
     <h3 id="finding-production">A typical production incident through this frame</h3>
     <div class="incident">
-      <div class="incident-event"><strong>17:32</strong> — an L4 load balancer in front of <code>payments-api</code> Service starts logging 504s at ~3% rate. Customer reports come in. Latency p99 is unchanged. PagerDuty fires.</div>
-      <p><strong>What our measurements say is happening:</strong></p>
+      <div class="incident-event"><strong>17:32</strong> — an L4 load balancer in front of <code>payments-api</code> starts logging 504s at ~3%. Customer reports come in. Latency p99 is unchanged. PagerDuty fires.</div>
+      <p><strong>What these measurements say is happening:</strong></p>
       <ol>
-        <li><b>The 504 rate is real.</b> ${I("I2")} is violated somewhere — almost certainly a rolling deployment, a node draining, or an unhealthy pod that hasn't yet been removed from the endpoint subset. ${sdata("s15")} says this is the cluster's <em>default</em> behaviour, not a malfunction.</li>
-        <li><b>Dashboards disagree.</b> Grafana panels pulled from different apiserver instances — or cached views like <code>kubectl</code> vs the Watch API — show different <code>Endpoints</code> membership. ${I("I6")} says this is expected: watch progress is non-monotonic across observers.</li>
-        <li><b>Your custom operator is retrying.</b> <code>apiserver_request_total{verb="patch",resource="services"}</code> spikes 10× on the affected Service. ${I("I5")} says this is the framework: the operator reconciles against publication state; publication state is briefly wrong; the operator keeps retrying. Retries do not move the cluster — they are amplification.</li>
-        <li><b>etcd is <em>fine</em>.</b> <code>etcd_server_has_leader=1</code>, proposals committed climbing normally, peer RTT normal. ${I("I9")} says the substrate is healthy. Do not chase etcd; the problem is in the publication layer.</li>
-        <li><b><code>kubectl get nodes</code> is normal.</b> All 6 nodes Ready. ${I("I3")} says: the cluster's view of node health and reality agree. The unhealthy pod is on a healthy node; it's just not yet removed from the endpoint subset.</li>
+        <li><b>The 504 rate is real.</b> ${I("I2")} is violated somewhere — a
+            rolling deployment, a node draining, or a pod not yet removed from the
+            endpoint subset. Violated in ${ST.I2.viol.length} of ${ST.I2.total}
+            scenarios here, with windows from 7 s to 261 s depending on the fault
+            class.</li>
+        <li><b>Check whether a node went <code>NotReady</code>.</b> If so,
+            ${I("I3")} says its containers may still be running and still writing.
+            Violated in ${ST.I3.viol.length} of ${ST.I3.total} scenarios — the
+            node's own view and the API's disagree far more often than the
+            "cluster declares failure" mental model suggests.</li>
+        <li><b>etcd is almost certainly fine.</b> ${I("I9")} was violated in only
+            ${ST.I9.viol.length} scenario, and only one that splits etcd on
+            purpose. Do not chase etcd; the problem is in the publication layer.</li>
+        <li><b>Dashboards disagreeing across apiservers is possible but not the
+            default.</b> ${I("I5")} fired in only ${ST.I5.viol.length} of
+            ${ST.I5.total} scenarios. Earlier guidance here claimed this was
+            near-universal; that was a measurement artifact. Do not reach for it
+            as the first explanation.</li>
+        <li><b>Expect noise after recovery.</b> ${I("I10")} failed to settle
+            in-window in ${ST.I10.viol.length} of ${ST.I10.total} scenarios, so
+            warnings continuing for a minute or two after the fault clears is
+            normal, not a second incident.</li>
       </ol>
       <p class="do"><strong>What you actually do:</strong></p>
       <ul class="do-list">
-        <li>Don't restart the apiserver or etcd. ${I("I9")} + ${I("I3")} say they're fine.</li>
-        <li>Don't restart the operator. ${I("I5")} says it'll just resume amplifying — let the watch settle.</li>
-        <li>Wait 60–120 seconds. ${I("I10")} (PRESERVED in 9 of 12) says the cluster will stop emitting fresh warnings within this window.</li>
-        <li>Add a <code>preStop: sleep 10</code> to the deployment template before next deploy. ${I("I2")} is observer-relative; you can shrink the unsafe window, not eliminate it.</li>
-        <li>Check that your client library has circuit-breaking. If your downstream services have Envoy outlier detection, the L4 504 rate stops translating into application errors at all.</li>
+        <li>Don't restart the apiserver or etcd — ${I("I9")} says the substrate is healthy.</li>
+        <li>Wait 60–120 s for warnings to stop arriving, then re-evaluate.</li>
+        <li>Add <code>preStop: sleep 10</code> before the next deploy. ${I("I2")}
+            is observer-relative; you shrink the unsafe window, you don't close it.</li>
+        <li>Make the workload idempotent. ${I("I3")} says a <code>NotReady</code>
+            node's work can still land in your database.</li>
+        <li>Check your clients circuit-break. With Envoy outlier detection the L4
+            504s stop becoming application errors.</li>
       </ul>
       <p class="dont"><strong>What you should NOT do:</strong></p>
       <ul class="dont-list">
-        <li>Bump replicas to 10 — the 3-pod endpoint update is the bottleneck, not capacity.</li>
-        <li>Page the cluster team — ${I("I9")} says they have no etcd issue to debug.</li>
-        <li>Investigate kube-controller-manager logs — ${I("I5")} says it's doing exactly what it should, just loudly.</li>
+        <li>Bump replicas — endpoint propagation is the bottleneck, not capacity.</li>
+        <li>Page the cluster team about etcd — ${I("I9")} says there is nothing there to debug.</li>
+        <li>Assume a <code>NotReady</code> node has stopped doing work.</li>
       </ul>
     </div>
 
     <h3 id="finding-caveats">Caveats</h3>
     <ol class="caveats">
-      <li><b>${S("s5")} and ${S("s6")} unmeasured.</b> ${I("I4")} has no verdict yet. Multi-controller amplification under simultaneous-blackhole conditions also unmeasured.</li>
-      <li><b>${sdata("s11")}'s ${I("I3")}=PRESERVED is a framework limitation, not a positive result.</b> The canonical "API says NotReady, node says Running" demonstration didn't fire because the kubelet stops pods via readiness propagation before crictl can capture divergent state.</li>
-      <li><b>${sdata("s8")}'s "composition is sub-linear" finding</b> is at the fault intensity used here. Stronger composition (S3-grade latency + S19-grade quorum split) might produce non-linear effects we didn't see.</li>
-      <li><b>Observer reach is limited.</b> Mid-fault snapshots have null cp-side fields because the apiserver VIP is unreachable from the isolated side of a partition. Consistent with the paper's thesis (you cannot observe what you cannot reach) but the dataset has known holes during peak fault.</li>
-      <li><b>All measurements are from a 6-node cluster with 3 etcd members.</b> Production clusters with 5+ etcd, regional spread, or different CNI/runtime choices will move quantitative results — but the directional ones (I2/I5/I6 violated; I1/I3/I9 preserved) should be robust.</li>
+      <li><b>Some PRESERVED verdicts are blind, not negative.</b> In
+          ${sdata("s22")} and ${sdata("s26")}, ${I("I1")} and ${I("I3")} read an
+          evidence channel the fault itself silences — 30 snapshot-cells that
+          should be <code>INSUFFICIENT_DATA</code> (D40). Recorded, not yet fixed.</li>
+      <li><b>Four scenarios' purpose-built evidence files are empty in all five
+          runs.</b> ${sdata("s3")}'s <code>revision_drift.json</code> is invalid
+          JSON, ${sdata("s14")}'s <code>rv_drift.json</code> never records the
+          controller's last-acted revision, and ${sdata("s19")}'s direct
+          cp1-vs-cp2 comparison — the measurement that scenario exists to produce
+          — is null everywhere, from a missing <code>pipefail</code> and a broken
+          <code>date +%s%3N</code> (D44).</li>
+      <li><b>Two runs report success after losing SSH mid-flight.</b>
+          ${sdata("s24")} run 1 and ${sdata("s25")} run 4 record
+          <code>status: ok</code> having collected no evidence; their effective N
+          is 4, and nothing in the metadata says so (D46).</li>
+      <li><b>${I("I10")} counts are censored at 50</b> by the snapshot event cap,
+          so they are lower bounds and not comparable across runs (D45).</li>
+      <li><b>Observer reach is limited.</b> Mid-fault snapshots carry null
+          control-plane fields when the API VIP is unreachable from the isolated
+          side. This is consistent with the thesis — you cannot observe what you
+          cannot reach — but it means the dataset has known holes at peak fault,
+          and those holes are not randomly distributed.</li>
+      <li><b>One cluster, one topology, N=5.</b> 6 Kubernetes nodes, 5 etcd
+          members, single /24, Calico, containerd. Quantitative results will move
+          with topology; the directional ones should be robust. No fault
+          magnitude was swept — each scenario tests one intensity, so nothing
+          here supports a dose-response claim.</li>
     </ol>
   `;
   main.innerHTML = html;
