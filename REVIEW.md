@@ -1226,6 +1226,56 @@ and that is true of the harness's own recovery path, not just the cluster's.
 
 ---
 
+### D34 — I4's state fingerprint embeds a per-acquisition UUID, so it reports VIOLATED almost everywhere
+
+Open, and it invalidates the headline I4 result of the N=5 campaign.
+
+With 115/115 iterations complete, I4 came back **VIOLATED in 22 of 23
+scenarios** — the one exception being S6. A verdict that uniform across
+unrelated fault classes is a detector, not a finding.
+
+`final_state_of()` in `scripts/aggregate-results.sh` fingerprints a run's final
+state as the controller-manager lease holder, read from the last post-fault
+snapshot. That value is `<node>_<uuid>`, and the uuid is minted per lease
+acquisition. S2's five repetitions:
+
+```
+run_1  cp2_94b2cc66-8280-49a4-9e16-0f3280724abd
+run_2  cp3_bba6c760-afce-461d-9977-86823b17eb06
+run_3  cp2_d731d495-a563-4f57-a601-1673101130b6   same node as run_1
+run_4  cp1_92f0814f-8fc7-44e0-81e2-e25725d27155
+run_5  cp1_e203766b-6f5a-4600-8db2-f8cd6613f6ad   same node as run_4
+```
+
+Five distinct strings from five runs, guaranteed: the uuid differs even when
+the same node holds the lease. `unique_final_states: 5`, `i4_verdict:
+VIOLATED`, note "repetitions of one fault reached 5 different final states".
+They did not.
+
+**Two defects, stacked.** Strip the uuid and the node still varies
+(cp2, cp3, cp2, cp1, cp1) — but "which control-plane node won a leader
+election after the fault" is not what I4 asks. I4 is about whether repetitions
+of one fault converge to the same *cluster* state; the identity of the lease
+holder is incidental to that, and treating it as the fingerprint conflates a
+routine election outcome with a recovery-determinism violation.
+
+**Why S6 is the exception, and why that is not reassuring.** S6 writes its own
+`run_summary.json` with `final_lease_holder`, and across its five internal
+iterations the controller-manager never re-acquired, so the uuid happened to
+stay constant and I4 came back PRESERVED. The one scenario that "passes" does
+so by accident of timing, not because its recovery was more deterministic.
+
+**Fix.** Pick a fingerprint that describes cluster state rather than lease
+identity — Ready node set, workload placement by pod *owner* rather than pod
+name (pod names carry random suffixes and would reintroduce the same problem),
+etcd member set and health. If lease holder is kept at all, strip to the node
+component. Until then I4's verdict should be read as unevaluated: the whole
+N=5 I4 column is an artefact, and REVIEW.md's earlier claim that S6 produced
+"the first evaluable I4 in the suite's history" was premature — it produced
+the first I4 that *computed*, not the first that measured.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
