@@ -63,3 +63,7 @@ tmp/
 /results/
 /report.html
 /results.zip
+
+# Shareable report archives are built on demand, not tracked.
+*.zip
+README-report.txt

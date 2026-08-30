@@ -453,6 +453,78 @@ const CATALOG = {
     description: "iptables splits the etcd cluster so a minority side keeps its leader briefly but cannot commit. Measures whether the API server on the minority side serves stale reads, and how long until clients see the new leader on the majority side.",
     recap: "Observed across 5 snapshots: I2 5 of 5 and I5 5 of 5 violated — the minority-side apiserver served stale reads against its local etcd member while the majority advanced. I6 2 times (revision regression visible on rejoin). I1 PRESERVED — the minority side did not briefly claim authority over an object the majority had already mutated; the dual-write check stayed empty. I9 confirms the majority kept quorum throughout. I10 INSUFFICIENT_DATA (the post-fault tail did not separate relist from settled state). The most direct test of observer-relative authority under partition: I2 and I5 violations bound the practical stale-read window the paper cites against the assumption that linearisable reads are automatic on the apiserver.",
   },
+  s20: {
+    name: "Pod-network partition, management network intact",
+    fault: "pod_network_partition",
+    invariants: ["I2"],
+    summary: "Blocks only the pod network between one worker and the rest; kubelet heartbeats continue over the management NIC.",
+    description: "Every VM has two NICs: ens192 on the management network 10.0.0.0/24 and ens224 on the pod network 192.168.200.0/24. Blocking only 192.168.200.0/24 leaves the kubelet heartbeating normally, so every node reports Ready and the API server sees a healthy cluster while the data plane is dead.",
+    recap: "The sharpest observer-relative split the lab produces, and it costs one iptables rule. I2 violated with a measured duration; the node-level invariants stay clean, a signature no other scenario produces."
+  },
+  s21: {
+    name: "Keepalived VIP split-brain",
+    fault: "vrrp_vip_split",
+    invariants: ["I1"],
+    summary: "Blocks VRRP so two control-plane nodes hold the API VIP simultaneously.",
+    description: "Dual authority at the network layer rather than the pod layer, using the keepalived already installed by roles/k8s-install. Measures which API server each client reaches and whether two clients disagree about the same object at the same instant.",
+    recap: "Fault confirmed every run (split_observed, two simultaneous VIP holders) yet no invariant fires: the suite has no detector for a VIP split. EFFECTIVE with no violations is a gap in the invariant set, not an absence of effect. Its teardown now flushes the VIP ARP entry fleet-wide (REVIEW.md D32)."
+  },
+  s22: {
+    name: "containerd / kubelet freeze (SIGSTOP)",
+    fault: "process_freeze",
+    invariants: [],
+    summary: "SIGSTOPs containerd or the kubelet on one worker, holds it, then SIGCONTs.",
+    description: "An omission failure rather than crash-stop: nothing starts or stops, and unlike a kill the process resumes with stale in-memory state and a backlog of missed watch events. Lets results be organised by classical failure semantics (crash / omission / timing / arbitrary).",
+    recap: "target_process_frozen fires — the SIGSTOPped unit is observed in kernel state T. Like S21, the fault is proven and no invariant detects it."
+  },
+  s23: {
+    name: "etcd NOSPACE — read-only cluster, every observer green",
+    fault: "etcd_nospace",
+    invariants: ["I5","I6","I10"],
+    summary: "Lowers one member's backend quota below its current size until the NOSPACE alarm arms.",
+    description: "The cluster goes read-only while every API server continues serving reads and every health check stays green. One of the most common real etcd outages.",
+    recap: "Both proposed signals now fire (etcd_alarm_armed, cluster_writes_rejected): the alarm arms and at least one API server rejects a write while it is armed. Earlier runs aborted before injection on an etcdctl environment-variable conflict (REVIEW.md D12)."
+  },
+  s24: {
+    name: "Admission webhook timeout (Fail vs Ignore)",
+    fault: "admission_webhook_timeout",
+    invariants: [],
+    summary: "Registers a validating webhook pointing at a black-holed endpoint, under both failurePolicy values.",
+    description: "A completely healthy cluster that cannot act. Run twice — failurePolicy Fail then Ignore — so the same fault produces opposite failure semantics selected by one field.",
+    recap: "The contrast reproduces: under Fail the intercepted CREATE is rejected after the webhook timeout (~10.2 s); under Ignore the same request is admitted. A control write unaffected by the webhook completes in ~244 ms."
+  },
+  s25: {
+    name: "API priority-and-fairness starvation",
+    fault: "apf_priority_starvation",
+    invariants: [],
+    summary: "Floods the API server from a low-priority client until APF sheds its requests.",
+    description: "Every node Ready, etcd healthy, control loops contending. Tests whether the invariants can distinguish cannot-observe from observed-and-chose-not-to-act.",
+    recap: "apf_starvation_observed fires: the flood accrued 4,895 HTTP 429s against 88,047 200s, so APF actively shed load. Reaching that took five separate fixes before the scenario injected anything at all (REVIEW.md D13, D15, D17, D18) and a sixth to the concurrency share (D19)."
+  },
+  s26: {
+    name: "Node object deleted, kubelet alive",
+    fault: "node_object_deleted",
+    invariants: ["I1"],
+    summary: "Deletes a Node object without touching the machine; the kubelet re-registers under the same name.",
+    description: "Identity re-creation with a live substrate — a different mechanism for I1 than S2's force-delete, and one that needs no operator footgun to reach.",
+    recap: "node_identity_recreated fires: the node returns under the same name with a different UID. The finding is sharper than expected — the kubelet does NOT re-register on its own, it wedges retrying status updates for an object that no longer exists and needs a restart (REVIEW.md D14)."
+  },
+  s27: {
+    name: "Negative and substrate clock skew",
+    fault: "clock_skew_negative",
+    invariants: ["I1","I3"],
+    summary: "Skews a clock backwards, and skews etcd members relative to the API servers.",
+    description: "Backwards skew makes renewTime appear to be in the future and breaks lease-expiry arithmetic in the opposite direction from S4; skewing etcd relative to the API servers moves the effect to the storage layer rather than the controller layer.",
+    recap: "clock_offset_applied fires with the offset still measured mid-window. I3 violated: the node is declared uncertain while its containers keep running."
+  },
+  s28: {
+    name: "Stale etcd member rejoining after compaction",
+    fault: "etcd_stale_member",
+    invariants: ["I5"],
+    summary: "Isolates a member past the leader's compaction point, then restores connectivity.",
+    description: "Extends S17 into the recovery phase: the member cannot catch up and must be re-seeded. What the API servers do during that window is exactly the watch-gap question S17 opens and does not close.",
+    recap: "etcd_members_dropped fires — the isolated member falls out of the responding set and is re-seeded on reconnection."
+  },
 };
 
 // ── Invariant glossary ───────────────────────────────────────────────────────
@@ -589,7 +661,15 @@ function renderNav() {
   group.textContent = "Scenarios";
   nav.appendChild(group);
 
-  const scenarioIds = Object.keys(CATALOG);
+  // Union of the catalogue and whatever the data actually contains, ordered
+  // numerically. CATALOG used to be the sole source, and it listed s1-s19
+  // only: S20-S28 were collected, embedded in this very file, and silently
+  // absent from the navigation, so every report ever built stopped at S19
+  // (REVIEW.md D37). A scenario present in the data must never be
+  // unreachable because someone forgot to describe it.
+  const scenarioIds = Array.from(
+    new Set([...Object.keys(CATALOG), ...Object.keys(DATA.scenarios || {})])
+  ).sort((a, b) => (parseInt(a.slice(1), 10) || 0) - (parseInt(b.slice(1), 10) || 0));
   for (const sc of scenarioIds) {
     const hasData = DATA.scenarios[sc];
     const btn = document.createElement("button");

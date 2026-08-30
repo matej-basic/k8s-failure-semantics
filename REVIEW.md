@@ -1415,6 +1415,42 @@ campaign, and should not be read as describing it.
 
 ---
 
+### D37 — the report's navigation is a hardcoded catalogue, and it stopped at S19
+
+Fixed 2026-08-30. Reported by the operator: "S19 is the last scenario presented
+in the HTML, there are no others."
+
+`scripts/report-template.html` built its scenario list from a hardcoded
+`CATALOG` object — `const scenarioIds = Object.keys(CATALOG)` — and that object
+listed **s1–s19 only**. S20–S28 were never added when those scenarios were
+written.
+
+The data was never missing. All 23 scenarios were collected, aggregated, and
+embedded in the very file that would not show them: the built report contained
+`"s20": {"runs": …}` through `"s28"` and the nav simply never offered a way to
+reach them. Every report this project has produced has silently omitted the
+nine gray-failure scenarios — including the archived May one.
+
+**Fixed twice over**, because the prose and the reachability are separate
+concerns:
+
+1. **Structurally.** The nav now iterates the *union* of `CATALOG` keys and
+   `DATA.scenarios` keys, ordered numerically (so s2 sorts before s11, which
+   the old lexical key order did not). A scenario present in the data can no
+   longer be unreachable because nobody described it — the worst case is now a
+   nav entry without prose, not a missing scenario.
+2. **Editorially.** S20–S28 now have catalogue entries — name, fault class,
+   invariants, summary, description, and a recap of what the N=5 campaign
+   actually observed — written from the scenario headers, the README index,
+   and the measured results.
+
+Worth noting what this cost: the omission was invisible from inside the
+pipeline. `aggregate-results.sh` reported all 23, the heatmap data was correct,
+and the file was the right size. Only opening the report and counting the nav
+entries reveals it, which is why it survived until someone did.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena
