@@ -1293,6 +1293,39 @@ first that measures.
 
 ---
 
+### D35 — S18's memory pressure never reaches kubelet's eviction threshold
+
+Fixed 2026-08-30. S18 ran 5/5 in the N=5 campaign and fired **zero** efficacy
+signals in every one; worker3 stayed `Ready=True` in every snapshot of every
+run.
+
+`roles/fault-inject/tasks/memory-pressure.yml` allocated a *percentage* of what
+was free:
+
+```awk
+/MemAvailable/ {print int($2 * 0.85) "K"}
+```
+
+On a 7 GB worker that allocates ~6.1 GB and leaves **1057 MB** free. Kubelet's
+default hard eviction threshold is `memory.available<100Mi`, so the fault never
+got within a factor of ten of triggering anything — no MemoryPressure
+condition, no eviction, no rescheduling. Five repetitions of an undisturbed
+node.
+
+**Fix.** Target a fixed headroom *below* the threshold rather than a fraction
+above it: `memory_pressure_headroom_kb`, default 90 MB, so the same node now
+allocates ~7.1 GB and leaves 90 MB against a 100 MiB threshold. The value is
+deliberately not tighter — kubelet needs a window to observe the condition and
+act before the kernel OOM-killer takes sshd or kubelet, and a node killed
+outright is a broken run rather than a finding.
+
+S18 also now declares `efficacy_require: [placement_changed]`. `memory_pressure`
+carries no required signal by default, which is why five ineffective runs
+reported INEFFECTIVE without ever naming what was missing. Eviction shows up as
+pods leaving the target node, so that is the signal to assert.
+
+---
+
 ## 2. Methodology
 
 ### M1 — Sampling resolution is coarser than the phenomena

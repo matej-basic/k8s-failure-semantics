@@ -12,7 +12,21 @@
     duration_seconds: "{{ duration_seconds | default(fault_duration) }}"
 
 - name: Get available memory on target
-  shell: awk '/MemAvailable/ {print int($2 * 0.85) "K"}' /proc/meminfo
+  # Leave a fixed headroom BELOW kubelet's eviction threshold, not a percentage
+  # above it. This took 85% of MemAvailable, which on a 7 GB worker leaves
+  # ~1060 MB free — and kubelet's default hard threshold is
+  # memory.available<100Mi, so the pressure never got within 10x of triggering
+  # anything. S18 ran five times, fired ZERO efficacy signals, and worker3
+  # stayed Ready in every snapshot of every run (REVIEW.md D35).
+  #
+  # memory_pressure_headroom_kb (default 90 MB) sits just under the 100Mi
+  # threshold: enough for kubelet to observe MemoryPressure and start evicting,
+  # while not so aggressive that the kernel OOM-killer takes sshd or kubelet
+  # before kubelet acts. Raise it if a node ever gets OOM-killed outright —
+  # that is a broken run, not a finding.
+  shell: |
+    awk -v hk={{ memory_pressure_headroom_kb | default(92160) }} \
+      '/MemAvailable/ { v = $2 - hk; if (v < 0) v = 0; print int(v) "K" }' /proc/meminfo
   register: avail_mem
   when: inventory_hostname == target_host
 
@@ -26,5 +40,5 @@
 
 - name: Log memory pressure injected
   debug:
-    msg: "FAULT INJECTED: memory pressure (~85% RAM) on {{ target_host }} for {{ duration_seconds }}s"
+    msg: "FAULT INJECTED: memory pressure ({{ avail_mem.stdout }}, leaving {{ memory_pressure_headroom_kb | default(92160) }}K under kubelet's eviction threshold) on {{ target_host }} for {{ duration_seconds }}s"
   when: inventory_hostname == target_host

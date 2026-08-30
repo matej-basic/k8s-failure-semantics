@@ -131,6 +131,13 @@
     fault_type: memory_pressure
     target_host: worker3
     duration_seconds: 120
+    # What this fault must observably do. memory_pressure carries no required
+    # signal by default, so a run where stress-ng allocated too little to cross
+    # kubelet's eviction threshold fired nothing and was still reported
+    # INEFFECTIVE without saying why — five times over (REVIEW.md D35).
+    # Eviction shows up as pods leaving the target node.
+    efficacy_require:
+      - placement_changed
   roles:
     - role: fault-inject
 
