@@ -531,35 +531,29 @@ check_i3() {
 # in its note.
 
 # Final post-fault state of ONE run directory, as a single comparable string.
-# Generic across scenarios, in preference order:
-#   1. run_summary.json .final_lease_holder  — S6 writes it; any scenario may
-#   2. run_summary.json .final_pod_placement — canonicalised name@node list,
-#      used only when there is no lease holder to compare
-#   3. the chronologically last snapshot whose .snapshot_label starts with
-#      "post_", else the chronologically last snapshot, read at
-#      .control_plane.controller_manager_lease.holder
+#
+# D34/D40: this MUST stay byte-identical in meaning to final_state_of() in
+# aggregate-results.sh. It previously fingerprinted on
+# .control_plane.controller_manager_lease.holder (and run_summary.json
+# .final_lease_holder), which embeds a per-acquisition UUID: two runs that
+# recovered to exactly the same cluster state still produced two different
+# strings, so I4 read VIOLATED almost everywhere it was computed. The D34 fix
+# corrected aggregate-results.sh only, which left every per-run I4 field in the
+# dataset disagreeing with the batch verdict of record. Both now compute the
+# same fingerprint.
+#
+# The fingerprint is the Ready node set, the running workload set by REPLICA
+# COUNT (pod names are stripped of their ReplicaSet hash and random suffix),
+# and the healthy etcd member count. Placement is deliberately NOT included:
+# which worker hosts a replacement replica is scheduler non-determinism, not a
+# recovery-determinism violation.
+#
 # Prints the empty string when nothing readable is there; the caller maps that
 # (and a literal "unknown") to unreadable and keeps it OUT of the distinct-state
 # count — counting "unknown" as a state of its own is what made an incomplete
 # batch read as non-deterministic recovery.
 i4_final_state() {
-  local dir="$1" v snap last post label
-  if [ -f "$dir/run_summary.json" ]; then
-    v=$(jq -r '
-      (.final_lease_holder // null) as $h
-      | if ($h != null) and (($h | tostring) != "") and (($h | tostring) != "null")
-        then ($h | if type == "string" then . else tojson end)
-        else ( (.final_pod_placement // null)
-               | if type == "array"
-                 then ([ .[]? | ((.name // "?") + "@" + (.node // "?")) ] | sort | join(","))
-                 else "" end )
-        end' "$dir/run_summary.json" 2>/dev/null || echo "")
-    case "$v" in
-      ""|null|unknown) ;;
-      *) printf '%s\n' "$v"; return 0 ;;
-    esac
-  fi
-
+  local dir="$1" snap last post label
   last=""; post=""
   for snap in $(snapshots_in "$dir"); do
     last="$snap"
@@ -570,7 +564,21 @@ i4_final_state() {
   done
   snap="${post:-$last}"
   [ -n "$snap" ] || { printf '\n'; return 0; }
-  snap_field "$snap" '.control_plane.controller_manager_lease.holder // ""'
+
+  jq -r '
+    if ((.control_plane.node_conditions // []) | length) == 0 then ""
+    else
+      ([ .control_plane.node_conditions[]?
+         | select((.conditions[]? | select(.type == "Ready") | .status) == "True")
+         | .name ] | sort | join(",")) as $nodes
+      | ([ .control_plane.pod_states[]?
+           | select(.phase == "Running")
+           | (.name | sub("-[a-z0-9]{8,10}-[a-z0-9]{5}$"; "")) ]
+         | group_by(.) | map("\(.[0])=\(length)") | sort | join(",")) as $wl
+      | ([ .etcd.member_status[]?
+           | select(((.Status.errors // []) | length) == 0) ] | length) as $etcd
+      | "nodes[\($nodes)] wl[\($wl)] etcd[\($etcd)]"
+    end' "$snap" 2>/dev/null || echo ""
 }
 
 # Sibling iteration directories of a batch root: run_<K> holding at least one

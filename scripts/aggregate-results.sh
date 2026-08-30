@@ -409,7 +409,26 @@ collect_verdicts() {
                                   (if ($viol + $pres) > 0
                                    then (($viol * 10000 / ($viol + $pres) | round) / 10000)
                                    else null end) } } )
-            | from_entries ) as $freq
+            | from_entries
+            # I4 is computed ACROSS the batch, not per run. Each iteration own
+            # invariant_report.json carries a provisional I4 that predates the
+            # D34 fingerprint fix and is spuriously VIOLATED almost everywhere.
+            # Tallying those provisional values here produced a frequency block
+            # contradicting the corrected verdict beside it: s2 showed
+            # I4 = PRESERVED next to frequency.I4 violated 4, frequency 1.
+            # A reader quoting the frequency would get it exactly backwards
+            # (REVIEW.md D38).
+            #
+            # The counts are kept, because "4 of 5 iterations disagreed under
+            # the old fingerprint" is a real observation about that fingerprint,
+            # but they are marked provisional and carry no violation_frequency,
+            # so nothing downstream can mistake them for the verdict. The
+            # verdict of record is the scalar I4 field, from recovery_variance.
+            | (if has("I4")
+               then .I4 |= (. + { provisional: true,
+                                  violation_frequency: null,
+                                  note: "Per-run I4 predates the D34 fingerprint fix and is provisional. The verdict of record is the scalar I4 field, computed across the batch from recovery_variance." })
+               else . end) ) as $freq
 
         | ([ $recovery[] | select(.scenario == $sc) ] | first) as $rv
         | ($meta.invariants // []) as $inv
