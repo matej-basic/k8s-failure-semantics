@@ -1745,8 +1745,9 @@ by construction, not re-derivable without re-running the checker. The aggregate
 remains the verdict of record for I4.
 
 ### D40 — detector blinding: PRESERVED returned while the evidence channel is dark
-**Status: OPEN. Highest-severity finding of this pass, and scientifically
-interesting in its own right.**
+**Status: FIXED 2026-08-30** (`scripts/check-invariants.sh`, `dark_evidence_cells`).
+Highest-severity finding of this pass, and scientifically interesting in its
+own right.
 I1 and I3 both read `.nodes[].containers`, collected via `crictl` on each node.
 When the injected fault is precisely what silences that interface, the field
 comes back as a well-formed empty list and both invariants return PRESERVED —
@@ -1821,7 +1822,11 @@ Effective N is 4, not 5, for those scenarios, and nothing in the metadata says s
 naming mismatch, not an absence of post-fault data.
 
 ### D48 — s11 run_5's invariant report contradicts its own snapshot
-**Status: OPEN, cause unknown.** `invariant_report.json` records I5 and I9
+**Status: RESOLVED 2026-08-30** by regenerating every per-run report from the
+snapshots on disk. s11 run_5 I5 now reads PRESERVED, matching its own
+`snapshot_post_reconnect_t15.json` (6 Ready nodes, 5 healthy etcd members). The
+stale report was the artefact; the snapshots were right.
+Original entry: `invariant_report.json` records I5 and I9
 VIOLATED, while `snapshot_post_reconnect_t15.json` from the same run shows all
 three API-server observers agreeing Ready=True and all five etcd members
 healthy. The report's mtime (23:19:01) precedes the snapshot's (23:40:31),
@@ -1831,3 +1836,300 @@ unlike runs 1-4. Treated as unverifiable rather than as a finding.
 **Status: OPEN.** README lists S14 as `etcd_latency`; every run's own
 `invariant_report.json` reports `fault_class: api_watch_lag`. The runtime value
 is the correct one.
+
+### D50 — I2 counts a correct Kubernetes behaviour as a violation
+
+**Status: OPEN.** Found while tracing the evidence for the I2 headline figure.
+
+`check_i2` has two independent clauses, and only the second tests the invariant
+as defined:
+
+- **Clause A** — `[.[] | .notReadyAddresses // [] | length] | add > 0`. An
+  address sitting in `notReadyAddresses` is one the endpoints controller has
+  marked **not ready**, so kube-proxy is not routing to it. That is the
+  publication layer working correctly. I2 is "reachability publication": the
+  violation it exists to catch is an address published as *ready* while
+  unreachable. Clause A fires on the opposite condition.
+- **Clause B** — `probe_code != 200` while endpoints are listed. This is the
+  real thing.
+
+Effect on the headline number. I2 reads VIOLATED in 11 of 23 scenarios, but
+clause B fires in only three — s1 (run_5), s4 (run_4) and s20 (runs 1-3), five
+run-instances in total, each with `httpCode: 0` against a listed endpoint. The
+remaining eight scenarios (s2, s3, s5, s6, s8, s11, s17, s19) violate on clause A
+alone. In s8 run_1's cited violation snapshot the external probe returned
+`httpCode: 200` — traffic was flowing normally at the instant recorded as an I2
+violation.
+
+The `duration_s` attached to a clause-A run therefore measures how long
+`notReadyAddresses` was non-empty, not the length of any outage, and must not be
+quoted as one. This compounds the s20 observation already recorded, that I2's
+duration tracks endpoint-readiness flaps rather than the probe failure that
+actually violated the invariant.
+
+**Fix.** Split the verdict: clause B is I2. Clause A, if it is worth keeping at
+all, is a separate observation about publication churn and needs its own name and
+its own denominator. Until then, the defensible claim from this dataset is
+"published-but-unreachable observed in 3 of 23 scenarios", not 11.
+
+### D51 — S28's `compaction_log_hits` greps the wrong systemd unit
+
+**Status: OPEN.** `scenarios/s28/playbook.yml:794` counts compaction errors with
+`journalctl -u kubelet`. The API server runs as a static pod, not under the
+kubelet unit, so the field reads 0 in all 15 host-runs regardless of what the
+API servers actually logged. It is not evidence of absence and must not be cited
+as such. The same window's `apiserver_reseed_window_logs.txt` does contain the
+errors (11-61 matching lines per run), collected by a different task.
+
+### D52 — S28's API-server log capture overlaps adjacent runs
+
+**Status: OPEN.** The log task collects with `--since=25m` while iterations are
+spaced roughly 16 minutes apart, so each run's
+`apiserver_reseed_window_logs.txt` contains the preceding run's events — run 3's
+file carries run 2's compacted-error trio. Any per-run count taken from these
+files must be time-windowed against that run's own snapshot timestamps, or it
+double-counts.
+
+### D53 — S28's stated premise is contradicted by S28's own data
+
+**Status: OPEN. This is a finding, not only a defect.**
+`scenarios/s28/playbook.yml:317-320` asserts that replaying a pagination
+continuation token "cannot be satisfied from the API server's watch cache — it
+goes through to etcd — so it is caused by our compaction and nothing else". The
+measured behaviour contradicts it: immediately after compaction all three API
+servers return 200 to a token whose embedded revision is 3723-3799 revisions
+below the compacted floor, while the same API servers are simultaneously
+returning `OutOfRange … required revision has been compacted` to other clients.
+etcd had applied the compaction; the API server answered anyway.
+
+The scenario was designed around an assumption about where the request is
+served, and the assumption is wrong. Any claim built on this scenario must
+re-derive that premise rather than inherit it.
+
+**Related correction.** `results/interpretations/s28.json` reports the delay
+before the gap becomes visible as "~150-200 s". That is the sum of the
+playbook's nominal waits, not a measurement. Measured from each run's
+`pre_reconnect` snapshot to the compacted-error trio in the API-server logs, the
+interval is 347, 357, 349, 349 and 348 s — roughly 350 s, about twice the quoted
+figure. Also `compaction_margin_revisions` has median 3732, not 3733, and it
+measures the floor minus the *member's frozen revision*, which is not the
+token's own margin (3723-3799); the interpretation conflates the two.
+
+### D54 — S21's fault-efficacy gate requires nothing
+
+**Status: OPEN.** `results/s21/.../scenario_meta.json` carries
+`efficacy: {"target_node": "", "require": []}`, against S2's
+`require: ["target_node_status_changed", "placement_changed"]`. With an empty
+requirement list the gate cannot fail, so S21's `EFFECTIVE` verdict is a
+fallback rather than an assertion — a run in which the VIP never actually split
+would still be counted as an effective repetition.
+
+The split did in fact occur in all five runs, evidenced independently by
+`vip_split_summary.json` (`max_simultaneous_vip_holders: 2`,
+`split_observed: true`) and by two distinct API-server certificates answering
+the VIP. So no published verdict is wrong. But S21 is the control arm of the
+consensus-boundary argument, and a control arm whose efficacy gate asserts
+nothing is not sound: `vip_holders_multiple` must be moved into `require` before
+the scenario is re-run for that paper.
+
+Same family as D6's fault-efficacy assertion — the mechanism exists, and this
+scenario was registered without using it.
+
+
+---
+
+## Dataset regeneration, 2026-08-30
+
+Every per-run `invariant_report.json` in run `20260829_121511` (111 runs) was
+regenerated from the snapshots already on disk, with the corrected checker. This
+is offline work — no lab access, no re-run of any scenario — and it closed three
+defects at once:
+
+- **D39** the per-run I4 fingerprint, which had been corrected only in the
+  aggregate, so per-run values contradicted the batch verdict of record;
+- **D40** detector blinding, which now yields `INSUFFICIENT_DATA` naming the
+  dark cells rather than `PRESERVED`;
+- **D48** the s11 run_5 report that disagreed with its own snapshot.
+
+Effect on the headline figures:
+
+| | Before | After |
+|---|---|---|
+| Evaluable cells | 137 | 133 |
+| Preserved | 100 | 97 |
+| Violated | 37 | 36 |
+| Insufficient data | 4 | 8 |
+| Not applicable | 24 | 24 |
+| Violation rate | 27% | 27% |
+
+Heatmap changes: `s22` I1 and I3, and `s26` I1 and I3, PRESERVED ->
+INSUFFICIENT_DATA (the 30 dark snapshot-cells, 5 runs x 2 for s22 and 5 runs x 4
+for s26); `s11` I5 VIOLATED -> PRESERVED (D48).
+
+**The rate does not move.** 37/137 is 27.0%, 36/133 is 27.1%. This is worth
+stating explicitly in any write-up: removing the unobservable cells corrects the
+denominator without changing the headline, so the earlier figure was not
+inflated by the defect even though it was computed over a population that
+included cells no detector could have judged.
+
+### D55 — an interrupted S19 leaves the cluster broken in two invisible ways
+
+**Status: OPEN. Lab-safety defect, found the hard way.**
+
+S19 injects in two places, and neither is self-healing if the run is killed
+before its teardown:
+
+1. **Peer-port DROP rules** carrying the comment
+   `fault-inject-quorum-split-s19`, in both the INPUT and OUTPUT chains of the
+   minority etcd members. A sweep that only checks INPUT reports the fleet
+   clean while three OUTPUT rules remain.
+2. **`--etcd-servers` repointed to a single member** in the kube-apiserver
+   static-pod manifest, on *both* cp1 and cp2 (`scenarios/s19/playbook.yml:116`
+   rewrites the whole flag with `sed`). The `.bak` it leaves beside the manifest
+   is written *after* the first edit in a repeated run, so it does not
+   necessarily hold the original value — on cp1 the backup was itself pinned to
+   one member.
+
+Neither is visible from Kubernetes while the majority side is healthy: nodes
+stay Ready, reads and writes both succeed through the surviving API servers, and
+nothing in `kubectl` indicates a half-split etcd. The failure only surfaced when
+the minority member later became the one an API server depended on: cp1's
+apiserver crash-looped 114 times against an etcd it could not reach, keepalived
+kept the VIP on cp1 regardless, and the VIP refused connections while cp2 and
+cp3 served normally.
+
+**Fixes needed.** Move the teardown into a `block/always` so a killed run still
+unwinds it; sweep all chains, not just INPUT, when checking for leftovers; write
+the manifest backup once, guarded on its absence, and restore from it rather
+than re-deriving the member list.
+
+**Recovery, for whoever hits this next.** `scripts/revert-baseline.sh --yes`
+fixes all of it in one step provided the baseline predates the S19 run — it
+restores the manifests and clears the rules together. Hand-repairing the
+manifest is possible but touches system files on live control-plane nodes, and
+the member list must be taken from an untouched peer (cp3 here), not from the
+`.bak`.
+
+### D56 — the campaign recovery script could not distinguish "clean" from "unreachable"
+
+**Status: FIXED** (`scratchpad/i11-recover.sh`).
+The first version of the post-kill recovery script ran its iptables and etcd
+alarm checks over SSH and treated empty output as "nothing wrong". During the
+lab outage every host was unreachable, every check returned empty, and it
+reported a clean fleet — while six `fault-inject` rules sat on etcd1 and etcd2.
+
+This is the same defect class the whole review has been correcting: D3 (a probe
+that could never succeed), D40 (a detector reading a channel the fault had
+silenced), and now a repair tool that could never report a fault. Reachability
+is now established first and an unreachable fleet exits non-zero, so silence can
+no longer be read as health.
+
+---
+
+## Independent review of the archive (2026-08-31)
+
+An external reviewer went through the shipped archive as a scientist would,
+recomputing the headline numbers from the raw runs. Its three highest-impact
+findings were verified in the main thread and all three held exactly.
+
+### D57 — I10 was measuring collector failure, not reconciliation
+**Status: FIXED** (`scripts/check-invariants.sh`, `check_i10`).
+The set difference read the baseline through `(.control_plane.warning_events // [])`,
+so a snapshot whose control-plane bundle came back **null** was treated as a
+snapshot with no warnings, and every event in the final snapshot counted as new.
+
+The evidence separates the two populations almost perfectly. Of the 16 I10
+VIOLATED cells in run 20260829_121511, **13 compared against a null baseline**
+and reported 29-50 new pairs; the **3** with a readable baseline reported
+exactly **1** each:
+
+| Baseline | Cells | new_warning_pairs |
+|---|---|---|
+| null | 13 (s1x2, s3x3, s4x3, s8x1, s14x3, s27x1) | 29-50 |
+| populated | 3 (s8/run_4, s11/run_3, s15/run_2) | 1, 1, 1 |
+
+This contaminated **6 of the 36 headline violations**. I10 now returns
+INSUFFICIENT_DATA when either compared snapshot has a null `warning_events`,
+naming which one. Verified: s8/run_4 keeps its genuine violation.
+
+### D58 — a run with no snapshots emitted five PRESERVED verdicts
+**Status: FIXED** (`scripts/check-invariants.sh`, `blank_if_no_snapshots`).
+`s24/20260829_121511/run_1` lost SSH mid-run, collected **zero** snapshots, and
+still recorded `run_validity: OK` with `snapshots_evaluated: 0` — yet I1, I2,
+I3, I4 and I6 all returned PRESERVED over empty violation lists. Because 4 of 5
+runs correctly reported I6 as NOT_APPLICABLE, that single vacuous run flipped
+the s24 I6 scalar to PRESERVED and inserted a cell into the denominator the
+report itself declares excluded.
+
+Every invariant now degrades to INSUFFICIENT_DATA when a run has no snapshots.
+An empty violation list is not a passing check when there was nothing to check.
+
+### D59 — DETECTOR_INVALID was reported as zero while 7 cells were disqualified
+**Status: FIXED** (`scripts/aggregate-results.sh`).
+A scenario scalar is never DETECTOR_INVALID — the rollup resolves to VIOLATED or
+PRESERVED first — so the counter, computed over scalars, always read 0. Seven
+per-run cells had genuinely failed baseline calibration: s8/run_4 I3,
+s14/run_4 I3, s15/run_2 I2, s15/run_3 I2, s17/run_2 I2 and I3, s23/run_2 I5.
+`s15.I2` read PRESERVED off three runs while two showed the detector misfiring
+before any fault. Now counted from the per-run frequency tallies.
+
+### D60 — the exclusion ledger did not sum to the grid
+**Status: FIXED.** `not_applicable` was counted over every row while the other
+exclusions were counted post-exclusion, so the decomposition came to 212 against
+a 207-cell grid, double-counting the 5 NOT_APPLICABLE cells inside
+fault-ineffective scenarios. Now 132 + 28 + 20 + 27 = 207.
+
+### D61 — the headline rate described a population it was not computed over
+**Status: FIXED.** `summary.denominator.definition` described a per-run
+population; the number published was per-scenario, where a cell is VIOLATED if
+**any** repetition violated it. The two differ substantially, and nearly half
+the violations are minority events — 10 of the original 36 rested on one
+repetition of five. Both are now published: `violation_rate_pct` (scenario
+scalars) beside `violation_rate_pct_by_run` with its own population block, and
+the definition string says which is which.
+
+### D62 — the report shipped stale prose contradicting the data beside it
+**Status: FIXED** (`scripts/report-template.html`).
+The per-scenario `recap` fields in CATALOG described the May 2026 single-run
+sweep and kept describing it after the data underneath was replaced. The
+reference page asserted that S5 and S6 were never run (both have n=5), that S1
+was the only scenario where I2 held (S1's I2 is VIOLATED), that I5 was violated
+7 of 7 in S3 (PRESERVED), and that S15 was the only I10 violation (there were
+eight). All 23 fields are removed and the recap is now derived from the
+per-scenario interpretation written against this dataset.
+
+This is the second time hand-written narrative in this file went stale silently;
+the overview was converted to computed text for the same reason. Rewriting the
+prose would only have reset the clock on the same defect.
+
+### Effect on the published figures
+
+| | Before review | After |
+|---|---|---|
+| Violated (scenario cells) | 36 | 31 |
+| Preserved | 97 | 101 |
+| NOT_APPLICABLE | 24 | 20 |
+| Detectors invalidated | 0 | 7 |
+| Ledger | 212 vs 207 grid | 207 = 207 |
+| Violation rate | 27% | **23%** scenario-level, **15%** run-level |
+
+### Still open from the review
+
+- **D63 — two of I11's three negative arms cannot fail.** The s21 probe never
+  addresses the VIP (`10.0.0.59`) whose split it is meant to be robust to — all
+  120 attempts target the API servers directly — and s24's canary lives in
+  `default` while the webhook gates `s24-webhook-probe`, so PRESERVED is
+  guaranteed by construction. Only s19 is a discriminating negative. The
+  validation is therefore one positive, one real negative, and two scope
+  confirmations, and should be described that way rather than as four arms.
+  Closing it needs a canary inside the gated namespace and one probe routed
+  through the VIP.
+- **`i11_validation.json` records `calibration: clean`** with no backing field
+  in any run report. The claim is true — verified from raw `pre_fault`
+  snapshots, all 3 servers `write_accepted: true` in all 20 runs — but it is
+  currently unfalsifiable from the artifact that asserts it.
+- **I4 pseudo-replication**: the per-run block is the batch computation
+  duplicated across runs and counted as n=5.
+- Six empty or malformed purpose-built evidence files (D44 covers four).
+- All `duration_s` values are trace-derived and the traces are excluded from the
+  archive, so no timing figure is verifiable from the archive alone.
