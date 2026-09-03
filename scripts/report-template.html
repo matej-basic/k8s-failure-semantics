@@ -596,6 +596,12 @@ const INVARIANTS = {
     violation: "At any snapshot, fewer than ⌈n/2⌉+1 etcd members respond to etcdctl endpoint status. Cluster size n is inferred as the maximum members observed across the run.",
     origin: "extension",
   },
+  I11: {
+    name: "Declared health implies progress",
+    description: "Every other invariant here asks whether the cluster's state is consistent. None asks whether it can still do anything. I11 closes that gap: it fires when every health signal the cluster publishes about itself is green — all Nodes Ready, a majority of etcd members agreeing on a raft leader, at least one API server serving reads — and a write canary is nonetheless refused. Scope is deliberate and cluster-wide: a fault that gates one namespace while everything else commits is real, but is a different property, and I11 correctly stays silent there.",
+    violation: "At a snapshot, every Node is Ready, a strict majority of etcd members report a non-zero leader, at least one API server answers reads, and no API server accepts a write to the canary object. Consensus AVAILABILITY is tested, not member health: under an etcd NOSPACE alarm every member reports an error while raft is healthy and the refusal is a quota policy, whereas a genuine quorum split leaves a minority without a leader and refusing its writes is correct.",
+    origin: "extension",
+  },
   I10: {
     name: "Reconciliation termination",
     description: "After fault removal, the cluster stops emitting new Warning events about the affected workload within the observation window. Asks 'did recovery converge at all?' as opposed to I4's 'did recovery converge to the same place?'. Catches the silent oscillation failure mode where the cluster appears structurally healthy but is still firing reconciliation events forever.",
@@ -1366,6 +1372,21 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
+// Per-scenario recap, derived from the interpretation written against THIS
+// dataset. CATALOG still carries `recap:` fields describing the May 2026
+// single-run sweep; they are DELIBERATELY UNREAD. They kept asserting things the
+// data beside them contradicted — that S5 and S6 were never run, that S1 was the
+// only scenario where I2 held, that I5 was violated 7 of 7 in S3 — because a
+// narrative typed by hand goes stale silently while one derived from the data
+// cannot. Do not reintroduce them into the render; delete them only with a
+// parser that understands multi-line JS string values.
+function scenarioRecap(sid, cls, label) {
+  const ip = interpFor(sid);
+  const text = ip && ip.data_interpretation;
+  if (!text) return "";
+  return `<div class="${cls}"><span class="recap-label">${label}</span> ${escapeHtml(text)}</div>`;
+}
+
 function renderReference() {
   const main = document.getElementById("main");
   let html = `
@@ -1428,7 +1449,7 @@ function renderReference() {
       <div class="ref-body">
         <p><b>${escapeHtml(sc.summary)}</b></p>
         <p>${escapeHtml(sc.description)}</p>
-        ${sc.recap ? `<div class="${recapClass}"><span class="recap-label">${recapLabel}</span> ${escapeHtml(sc.recap)}</div>` : ""}
+        ${scenarioRecap(sid, recapClass, recapLabel)}
         <div class="kv">
           <div class="k">Fault type</div><div class="v">${escapeHtml(sc.fault)}</div>
           <div class="k">Invariants evaluated</div><div class="v plain">${invLinks}</div>
@@ -1464,7 +1485,7 @@ function renderReference() {
 function findingsStats() {
   const hm = ((DATA.aggregate || {}).invariant_heatmap) || [];
   const out = {};
-  for (const id of ["I1","I2","I3","I4","I5","I6","I9","I10"]) {
+  for (const id of ["I1","I2","I3","I4","I5","I6","I9","I10","I11"]) {
     const rec = { viol: [], pres: [], na: [], insuf: [], detinv: [], total: 0 };
     for (const row of hm) {
       const v = row[id];
@@ -1778,6 +1799,35 @@ function renderFindings() {
          settle within the observation window in a third of scenarios here.</p>
     </div>
 
+    <div class="finding-inv" id="finding-I11">
+      <div class="finding-inv-head"><span class="id">${I("I11")}</span><span class="name">Declared health implies progress</span>${bar("I11")}</div>
+      <p><b>Why it exists.</b> Every other invariant here asks whether state is
+         consistent; none asks whether the cluster can still act. ${sdata("s23")}
+         fills etcd's quota: six nodes Ready, five etcd members agreeing on a
+         leader, reads served — and every write refused. I1–I10 report a healthy
+         cluster, correctly, because by their definitions it is one.</p>
+      <p><b>What it measures.</b> The violation is the contradiction — health
+         green, writes refused — not the refusal. The discriminator is consensus
+         <em>availability</em>, not member health: NOSPACE marks every member
+         unhealthy while raft is fine and the refusal is policy, whereas a real
+         quorum split leaves a minority without a leader, where refusing writes
+         is correct.</p>
+      <p><b>Validation, and its limits.</b> Added after this campaign, so it reads
+         <code>INSUFFICIENT_DATA</code> for every scenario here — those runs carry
+         no canary. Exercised separately at N=5 per arm
+         (<code>results/i11_validation.json</code>): VIOLATED on ${sdata("s23")},
+         PRESERVED on ${sdata("s19")}, ${sdata("s21")} and ${sdata("s24")}. Only
+         ${sdata("s19")} is a <em>discriminating</em> negative — there the probe
+         saw some servers refuse while others accepted. In ${sdata("s21")} the
+         probe never addresses the split VIP, and in ${sdata("s24")} the canary
+         sits outside the gated namespace, so both confirm the scope claim by
+         construction rather than testing it.</p>
+      <p><b>How it was built.</b> The first version required a majority of etcd
+         members to be error-free and reported PRESERVED on its own positive
+         control, because NOSPACE marks every member unhealthy. An invariant that
+         cannot fail its positive control has been assembled, not validated.</p>
+    </div>
+
     <h3 id="finding-synthesis">Cross-scenario synthesis</h3>
     <p>Sorted by violation rate, computed from the heatmap:</p>
     <table class="findings-synth">
@@ -1790,7 +1840,8 @@ function renderFindings() {
            ["I5","observer","Inter-observer disagreement is real but uncommon"],
            ["I1","structural","Exclusivity holds except when unfenced"],
            ["I9","substrate","etcd consensus is stable"],
-           ["I6","observer","Revision monotonicity holds"]]
+           ["I6","observer","Revision monotonicity holds"],
+           ["I11","liveness","Health can be green while the cluster cannot commit"]]
           .map(([id, layer, verdict]) => {
             const st = ST[id];
             const strong = st.viol.length >= st.total / 3;
