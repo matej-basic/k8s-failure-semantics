@@ -93,6 +93,22 @@ latest_batch() {  # $1 = scenario
   local sc="$1" name dirs d fallback=""
   local base="$BASE/$sc"
   [ -d "$base" ] || return 0
+
+  # An explicit pin wins. Batch names are sorted lexically below, so a run_id
+  # that does not start with a date — the I11 validation batch is `i11_...` —
+  # sorts above every dated campaign and silently becomes the batch of record
+  # for the scenarios it touched. That is how one aggregate came to report 19
+  # scenarios from one experiment and 4 from another, with the violation rate
+  # moving as a result. Set K8SFS_BATCH to pin the campaign; scenarios that do
+  # not have it fall through to the normal newest-batch rule.
+  if [ -n "${K8SFS_BATCH:-}" ] && [ -d "$base/${K8SFS_BATCH}" ]; then
+    dirs=$(batch_run_dirs "$sc" "$K8SFS_BATCH")
+    if [ -n "$dirs" ]; then
+      for d in $dirs; do
+        if report_of "$d" >/dev/null 2>&1; then printf '%s\n' "$K8SFS_BATCH"; return 0; fi
+      done
+    fi
+  fi
   for name in $(ls -1 "$base" 2>/dev/null | LC_ALL=C sort -r); do
     [ -d "$base/$name" ] || continue
     dirs=$(batch_run_dirs "$sc" "$name")
@@ -359,12 +375,12 @@ collect_verdicts() {
       # One jq over EVERY iteration report of the batch, in numeric run order.
       # A single run is a batch of one and takes the identical path, which is
       # why the scalar row it produces is byte-for-byte what it always was.
-      row=$(jq -s --arg sc "$sc" --arg layout "$layout" \
+      row=$(jq -s --arg sc "$sc" --arg layout "$layout" --arg rid "$rid" \
                   --argjson planned "$planned" --argjson recovery "$RECOVERY" '
         . as $reports
         | ($reports | length) as $n
         | ($reports | last) as $meta
-        | ["I1","I2","I3","I4","I5","I6","I9","I10"] as $ids
+        | ["I1","I2","I3","I4","I5","I6","I9","I10","I11"] as $ids
         # verdict tables, one object per iteration: {"I1": "PRESERVED", …}
         | [ $reports[] | (.invariants // []) | map({key: .invariant, value: .verdict}) | from_entries ] as $byrun
 
@@ -434,6 +450,7 @@ collect_verdicts() {
         | ($meta.invariants // []) as $inv
         | ({
             scenario: $sc,
+             run_id: $rid,
             layout: $layout,
             n: $n,
             n_planned: $planned,
@@ -477,7 +494,7 @@ collect_verdicts() {
           else . + {I4_source: "per_run"} end
       ' $reports 2>/dev/null || \
       jq -n --arg sc "$sc" \
-        '{scenario: $sc, run_validity: "PARSE_ERROR", fault_class: null, fault_efficacy: null, not_applicable: {}, layout: "unknown", n: 0, n_planned: 0, frequency: {}, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR"}')
+        '{scenario: $sc, run_validity: "PARSE_ERROR", fault_class: null, fault_efficacy: null, not_applicable: {}, layout: "unknown", n: 0, n_planned: 0, frequency: {}, I1: "PARSE_ERROR", I2: "PARSE_ERROR", I3: "PARSE_ERROR", I4: "PARSE_ERROR", I5: "PARSE_ERROR", I6: "PARSE_ERROR", I9: "PARSE_ERROR", I10: "PARSE_ERROR", I11: "PARSE_ERROR"}')
     fi
 
     out=$(printf '%s' "$out" | jq --argjson row "$row" '. + [$row]')
@@ -669,17 +686,25 @@ REPETITION=$(printf '%s' "$BATCHES" | jq -c '{
 # Each exclusion is reported as its own count, so the rate can be recomputed by
 # hand from the published numbers.
 VALID_VERDICTS=$(echo "$VERDICTS" | jq '[.[] | select((.run_validity // "UNKNOWN") != "FAULT_INEFFECTIVE" and (.run_validity // "UNKNOWN") != "NOT_RUN")]')
-CELLS='[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10]'
+CELLS='[.[].I1, .[].I2, .[].I3, .[].I4, .[].I5, .[].I6, .[].I9, .[].I10, .[].I11]'
 
 TOTAL_PRESERVED=$(echo "$VALID_VERDICTS" | jq "$CELLS"' | map(select(. == "PRESERVED")) | length')
 TOTAL_VIOLATED=$(echo "$VALID_VERDICTS"  | jq "$CELLS"' | map(select(. == "VIOLATED")) | length')
 TOTAL_INSUFFICIENT=$(echo "$VALID_VERDICTS" | jq "$CELLS"' | map(select(. == "INSUFFICIENT_DATA")) | length')
 # The three exclusions are counted over EVERY row, not just the valid ones, so
 # the published numbers add up to the full grid.
-TOTAL_INVALID=$(echo "$VERDICTS" | jq "$CELLS"' | map(select(. == "DETECTOR_INVALID")) | length')
-TOTAL_NA=$(echo "$VERDICTS"      | jq "$CELLS"' | map(select(. == "NOT_APPLICABLE")) | length')
+TOTAL_INVALID=$(echo "$VERDICTS" | jq '[ .[] | (.frequency // {}) | to_entries[] | .value.detector_invalid // 0 ] | add // 0')
+# The same population one level down: every per-run invariant cell, not the
+# scenario scalars. A scenario cell is VIOLATED if ANY of its repetitions
+# violated, so the scenario rate is a maximum over repetitions and runs high;
+# a cell that violated once in five reads identically to one that violated five
+# times. Publishing both, with the per-cell fractions already in `frequency`,
+# is what lets a reader tell those apart.
+RUN_VIOLATED=$(echo "$VALID_VERDICTS" | jq '[ .[] | (.frequency // {}) | to_entries[] | .value.violated  // 0 ] | add // 0')
+RUN_PRESERVED=$(echo "$VALID_VERDICTS" | jq '[ .[] | (.frequency // {}) | to_entries[] | .value.preserved // 0 ] | add // 0')
+TOTAL_NA=$(echo "$VALID_VERDICTS" | jq "$CELLS"' | map(select(. == "NOT_APPLICABLE")) | length')
 CELLS_TOTAL=$(echo "$VERDICTS"   | jq "$CELLS"' | length')
-CELLS_INEFFECTIVE_RUNS=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length * 8')
+CELLS_INEFFECTIVE_RUNS=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length * 9')
 RUNS_INEFFECTIVE=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "FAULT_INEFFECTIVE")] | length')
 RUNS_NOT_RUN=$(echo "$VERDICTS" | jq '[.[] | select(.run_validity == "NOT_RUN")] | length')
 # Which invariant x fault-class cells were ruled out, so a reader can audit the
@@ -703,6 +728,8 @@ jq -n \
   --argjson notapplicable "$TOTAL_NA" \
   --argjson na_breakdown "$NA_BREAKDOWN" \
   --argjson cells_total "$CELLS_TOTAL" \
+  --argjson run_violated "$RUN_VIOLATED" \
+  --argjson run_preserved "$RUN_PRESERVED" \
   --argjson cells_ineffective "$CELLS_INEFFECTIVE_RUNS" \
   --argjson ineffective "$RUNS_INEFFECTIVE" \
   --argjson notrun "$RUNS_NOT_RUN" \
@@ -720,12 +747,18 @@ jq -n \
       violation_rate_pct: (if ($preserved + $violated) > 0
         then ($violated * 100 / ($preserved + $violated) | round)
         else 0 end),
+      violation_rate_pct_by_run: (if ($run_preserved + $run_violated) > 0
+        then ($run_violated * 100 / ($run_preserved + $run_violated) | round)
+        else null end),
+      by_run_population: { violated: $run_violated, preserved: $run_preserved,
+        evaluable: ($run_violated + $run_preserved),
+        note: "Every per-run invariant cell from effective scenarios. The headline violation_rate_pct is computed over scenario scalars, where one violating repetition makes the whole cell VIOLATED; this is the same evidence counted per repetition." },
       # The denominator, spelled out. cells_total is the full grid
       # (scenarios x invariants); every exclusion below is subtracted from it
       # and what remains is what the rate is computed over, so the number can
       # be re-derived by hand and cannot quietly change meaning again.
       denominator: {
-        definition: "invariant cells whose verdict is PRESERVED or VIOLATED, from runs whose fault produced an observable change",
+        definition: "SCENARIO-level invariant cells whose verdict is PRESERVED or VIOLATED, from scenarios whose fault produced an observable change. A scenario cell is VIOLATED if ANY repetition violated it, so this rate is a maximum over repetitions and is higher than the per-run rate; see violation_rate_pct_by_run for the run-level population and each heatmap row frequency block for the per-cell violated/evaluable fractions.",
         cells_total: $cells_total,
         counted: ($preserved + $violated),
         excluded: {
