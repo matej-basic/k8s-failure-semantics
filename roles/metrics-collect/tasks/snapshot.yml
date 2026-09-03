@@ -827,7 +827,12 @@
     TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     OUT=""
 
-    for ep in {{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list | join(' ') }}; do
+    # Each API server directly by IP, AND the API VIP. The VIP matters: S21
+    # splits it so two nodes answer the same address, and a probe that only ever
+    # addresses the backends never traverses the faulted component — it cannot
+    # come out any way but PRESERVED, which makes it a confirmation rather than
+    # a test (REVIEW.md D63).
+    for ep in {{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list | join(' ') }} {{ api_vip }}; do
       SRV="https://${ep}:6443"
 
       # Read first: distinguishes "cannot reach this API server" from
@@ -863,10 +868,56 @@
           latency_ms: $l, error: (if $e == "" then null else ($e | .[0:400]) end)}'),"
     done
 
-    printf '%s' "{\"canary\": \"$CANARY_NS/$CANARY_NAME\", \"probe_source\": \"in_cluster\", \"ts\": \"$TS\", \"attempts\": [${OUT%,}]}" \
+    # A scenario may declare a namespace its fault deliberately gates
+    # (liveness_scoped_ns). That write is recorded SEPARATELY and is deliberately
+    # NOT part of any_write_accepted: I11 is a claim about cluster-wide write
+    # liveness, and folding a scoped refusal into it would make the invariant
+    # fire on exactly the case its scope excludes. Recording it is what turns
+    # S24 from "the canary was never gated, so of course I11 stayed silent" into
+    # "the gated namespace was provably blocked while the cluster still
+    # committed" — the difference between confirming the scope claim and testing
+    # it (REVIEW.md D63).
+    SCOPED_NS="{{ liveness_scoped_ns | default('') }}"
+    SCOPED_LABEL="{{ liveness_scoped_label | default('') }}"
+    SCOPED="null"
+    if [ -n "$SCOPED_NS" ]; then
+      S_NAME="scoped-canary-$(date +%s)"
+      # The label matters. A scenario may gate its namespace with an
+      # objectSelector as well as a namespaceSelector — S24 does both — so an
+      # unlabelled object sails through and the probe would report the namespace
+      # as writable while it is, for the objects the fault targets, not.
+      S_ERR=$(kubectl --request-timeout=15s -n "$SCOPED_NS" \
+                create configmap "$S_NAME" \
+                --from-literal=liveness-probe="$TS" 2>&1)
+      S_RC=$?
+      if [ "$S_RC" -eq 0 ] && [ -n "$SCOPED_LABEL" ]; then
+        kubectl --request-timeout=10s -n "$SCOPED_NS" delete configmap "$S_NAME" >/dev/null 2>&1
+        S_ERR=$(kubectl --request-timeout=15s -n "$SCOPED_NS" create -f - <<YAML 2>&1
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $S_NAME
+  labels:
+    ${SCOPED_LABEL%%=*}: "${SCOPED_LABEL#*=}"
+data:
+  liveness-probe: "$TS"
+YAML
+        )
+        S_RC=$?
+      fi
+      if [ "$S_RC" -eq 0 ]; then S_OK=true; S_ERR=""; else S_OK=false; fi
+      SCOPED=$(jq -cn --arg ns "$SCOPED_NS" --arg lbl "$SCOPED_LABEL" --argjson ok "$S_OK" --arg e "$S_ERR" \
+        '{namespace: $ns, label: (if $lbl == "" then null else $lbl end),
+          write_accepted: $ok,
+          error: (if $e == "" then null else ($e | .[0:400]) end),
+          note: "Recorded only. Not part of any_write_accepted: I11 is a cluster-wide claim, and a scoped refusal is a different property."}')
+    fi
+
+    printf '%s' "{\"canary\": \"$CANARY_NS/$CANARY_NAME\", \"probe_source\": \"in_cluster\", \"ts\": \"$TS\", \"scoped\": $SCOPED, \"attempts\": [${OUT%,}]}" \
       | jq -c '. + { any_write_accepted: ([.attempts[] | select(.write_accepted)] | length > 0),
                      any_read_ok:        ([.attempts[] | select(.read_ok)] | length > 0),
-                     servers_probed:     (.attempts | length) }'
+                     servers_probed:     (.attempts | length),
+                     vip_probed:         ([.attempts[] | select(.server == "{{ api_vip }}")] | length > 0) }'
   register: write_probe
   delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
   run_once: true

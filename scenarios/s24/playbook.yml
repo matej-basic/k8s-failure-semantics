@@ -120,6 +120,14 @@
     # The blast-radius fence. This namespace is created by the scenario,
     # carries the probe label, and is deleted unconditionally in `always`.
     s24_probe_ns: s24-webhook-probe
+    # Hand the write-liveness canary the namespace this fault deliberately
+    # gates, and the label its objectSelector matches. The canary itself stays
+    # in `default` and remains the cluster-wide signal; this second write is
+    # recorded beside it so the run shows the gated namespace was provably
+    # blocked WHILE the cluster still committed. Without it, I11 staying
+    # PRESERVED here proves nothing — the probe was never gated (REVIEW.md D63).
+    liveness_scoped_ns: s24-webhook-probe
+    liveness_scoped_label: "s24-admission-probe=true"
     s24_probe_label_key: s24-admission-probe
 
     s24_webhook_name: s24-blackhole-webhook

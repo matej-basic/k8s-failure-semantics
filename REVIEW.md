@@ -2115,7 +2115,9 @@ prose would only have reset the clock on the same defect.
 
 ### Still open from the review
 
-- **D63 — two of I11's three negative arms cannot fail.** The s21 probe never
+- **D63 — two of I11's three negative arms cannot fail. FIXED in the probe
+  2026-09-03; the existing batch is unchanged and now describes itself
+  correctly.** The s21 probe never
   addresses the VIP (`10.0.0.59`) whose split it is meant to be robust to — all
   120 attempts target the API servers directly — and s24's canary lives in
   `default` while the webhook gates `s24-webhook-probe`, so PRESERVED is
@@ -2133,3 +2135,42 @@ prose would only have reset the clock on the same defect.
 - Six empty or malformed purpose-built evidence files (D44 covers four).
 - All `duration_s` values are trace-derived and the traces are excluded from the
   archive, so no timing figure is verifiable from the archive alone.
+
+
+### D63 — resolution
+
+The two arms that could not fail were a probe-design defect, not a verdict
+defect: the invariant was right, the experiment could not have contradicted it.
+Both are fixed in `roles/metrics-collect/tasks/snapshot.yml`.
+
+**The VIP is now on the measured path.** The write canary addressed only
+`groups['control_plane']` by IP, so S21 — whose entire fault is that two nodes
+answer one virtual address — was never probed through the address it splits. The
+endpoint list now includes `{{ api_vip }}`, and each snapshot records
+`vip_probed` so a reader can tell whether a given run exercised it.
+
+**A scenario can declare the namespace its fault gates.** S24 gates
+`s24-webhook-probe` behind a webhook with both a namespaceSelector and an
+objectSelector, while the canary lived in `default` — so PRESERVED was
+guaranteed. `liveness_scoped_ns` and `liveness_scoped_label` let a scenario name
+that namespace and the label the objectSelector matches; S24 now sets both. The
+scoped write is recorded in `write_probe.scoped` and is deliberately **excluded**
+from `any_write_accepted`: I11 is a cluster-wide claim, and folding a scoped
+refusal into it would make the invariant fire on precisely the case its scope
+excludes. Recording it is what turns "the canary was never gated, so of course
+I11 stayed silent" into "the gated namespace was provably blocked while the
+cluster still committed".
+
+**The existing batch was not re-run.** `results/i11_validation.json` now labels
+each arm `discriminating` or `scope_confirmation` with the reason, so the
+artifact states what it can support: one positive and one negative arm that
+could have failed and did not (s23, s19), and two that confirm the scope claim
+by construction (s21, s24). The report's I11 card says the same. Re-running
+either scenario with the corrected probe would move it to discriminating.
+
+**Calibration is now derived rather than asserted.** The artifact previously
+recorded `calibration: "clean"` with no backing field anywhere in the run
+reports — true, but unfalsifiable from the data that asserted it. It is now
+computed from each run's `snapshot_pre_fault.json`
+`write_probe.attempts[].write_accepted`, with the source path and the number of
+runs checked recorded alongside: 5 runs per arm, all clean.
