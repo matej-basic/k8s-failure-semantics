@@ -295,6 +295,51 @@ finalize() {  # $1 = invariant id, $2 = invariant JSON
 # distinct name; that needs a desired-vs-actual replica count comparison and
 # is left as a follow-up.
 
+# ── D40: is the evidence channel dark? ────────────────────────────────────────
+# I1 and I3 both decide from .nodes[].containers, gathered by running crictl on
+# each node. When the injected fault is precisely what silences that interface —
+# S22 freezes containerd, S26 deletes the Node object — the field comes back as
+# a well-formed EMPTY LIST for the target node. The containers did not stop; the
+# channel went dark, and it went dark because that is what the fault does.
+#
+# Returning PRESERVED there says "checked and consistent" when the truth is
+# "could not look". The signature is specific and not confusable with a node
+# that genuinely drained: a node that had containers at baseline reports exactly
+# zero, rather than a shortened list, while the rest of the fleet is unaffected.
+#
+# Emits a JSON array of {node,snapshot} for every such cell. The caller may not
+# turn a dark channel into PRESERVED; a VIOLATED finding still stands, because
+# evidence of a violation is evidence regardless of what else went unobserved.
+dark_evidence_cells() {
+  local snap label base first="" out=""
+  for snap in $(snapshots); do
+    [ -n "$first" ] || first="$snap"
+  done
+  first=""
+  for snap in $(snapshots); do
+    if [ -z "$first" ]; then first="$snap"; continue; fi
+    label=$(snap_field "$snap" '.snapshot_label // ""')
+    base=$(jq -rn --slurpfile b "$first" --slurpfile c "$snap" '
+      def counts: [ .nodes[]? | { h: .host,
+                                  n: ( .containers
+                                       | if type == "string" then (fromjson? // []) else (. // []) end
+                                       | length ) } ];
+      ($b[0] | counts) as $B
+      | ($c[0] | counts) as $C
+      | [ $B[] | select(.n > 0) | .h ] as $had
+      | [ $C[] | select(.n == 0) | .h ] as $none
+      | [ $had[] | select(. as $h | $none | index($h)) ]
+      | join(",")' 2>/dev/null || echo "")
+    if [ -n "$base" ]; then
+      local h
+      for h in $(printf '%s' "$base" | tr ',' ' '); do
+        out="$out{\"node\": \"$h\", \"snapshot\": \"$label\"},"
+      done
+    fi
+  done
+  if [ -n "$out" ]; then printf '[%s]' "${out%,}"; else printf '[]'; fi
+}
+
 check_i1() {
   local violations=()
   local detail=()
@@ -335,7 +380,12 @@ check_i1() {
   done
 
   if [ ${#violations[@]} -eq 0 ]; then
-    echo '{"invariant": "I1", "name": "exclusive_authority", "verdict": "PRESERVED", "violations": []}'
+    DARK=$(dark_evidence_cells)
+    if [ "$DARK" != "[]" ]; then
+      echo "{\"invariant\": \"I1\", \"name\": \"exclusive_authority\", \"verdict\": \"INSUFFICIENT_DATA\", \"evidence_dark_cells\": $DARK, \"note\": \"No duplicate identity was seen, but .nodes[].containers was empty for a node that had containers at baseline, so the evidence channel this invariant reads was unavailable during the fault window. Not a PRESERVED verdict (REVIEW.md D40).\", \"violations\": []}"
+    else
+      echo '{"invariant": "I1", "name": "exclusive_authority", "verdict": "PRESERVED", "violations": []}'
+    fi
   else
     DETAILS=$(IFS=','; echo "[${detail[*]}]")
     echo "{\"invariant\": \"I1\", \"name\": \"exclusive_authority\", \"verdict\": \"VIOLATED\", \"violation_count\": ${#violations[@]}, \"violations\": $DETAILS}"
@@ -486,7 +536,12 @@ check_i3() {
   done
 
   if [ ${#violations[@]} -eq 0 ]; then
-    echo '{"invariant": "I3", "name": "failure_declaration_consistency", "verdict": "PRESERVED", "violations": []}'
+    DARK=$(dark_evidence_cells)
+    if [ "$DARK" != "[]" ]; then
+      echo "{\"invariant\": \"I3\", \"name\": \"failure_declaration_consistency\", \"verdict\": \"INSUFFICIENT_DATA\", \"evidence_dark_cells\": $DARK, \"note\": \"No declared-failed node was seen still running containers, but crictl reported zero containers for a node that had them at baseline, so this invariant could not observe the window it is meant to judge. Not a PRESERVED verdict (REVIEW.md D40).\", \"violations\": []}"
+    else
+      echo '{"invariant": "I3", "name": "failure_declaration_consistency", "verdict": "PRESERVED", "violations": []}'
+    fi
   else
     DETAILS=$(IFS=','; echo "[${detail[*]}]")
     BREAKDOWN=$(echo "$DETAILS" | jq -c '
@@ -969,6 +1024,21 @@ check_i10() {
   last_label=$(snap_field "$last" '.snapshot_label')
   last_ts=$(snap_field "$last" '.timestamp')
 
+  # A null warning_events is NOT an empty one. The set difference below reads
+  # the baseline through `// []`, so a snapshot whose control-plane bundle came
+  # back null reports every event in the final snapshot as newly appeared. That
+  # is not "reconciliation failed to terminate", it is "we saw nothing, then we
+  # saw events" — and it accounted for 13 of the 16 I10 violations in the
+  # 20260829 campaign, every one of them reporting 29-50 new pairs, while the
+  # three violations with a readable baseline all reported exactly 1.
+  local first_null last_null
+  first_null=$(snap_field "$first" 'if (.control_plane.warning_events == null) then "null" else "ok" end')
+  last_null=$(snap_field "$last"  'if (.control_plane.warning_events == null) then "null" else "ok" end')
+  if [ "$first_null" = "null" ] || [ "$last_null" = "null" ]; then
+    echo "{\"invariant\": \"I10\", \"name\": \"reconciliation_termination\", \"verdict\": \"INSUFFICIENT_DATA\", \"note\": \"control_plane.warning_events was null in one of the two compared post-fault snapshots, so a set difference cannot distinguish new warnings from unobserved ones\", \"first\": \"$first_label\", \"first_events\": \"$first_null\", \"last\": \"$last_label\", \"last_events\": \"$last_null\", \"violations\": []}"
+    return
+  fi
+
   # Set-difference of (involvedObject.name, reason) tuples — last minus first.
   # Two reads of jq because the snapshots may be in separate files.
   local new_pairs
@@ -1415,12 +1485,117 @@ SNAP_COUNT=$(snapshots | wc -l | tr -d ' ')
 # scenario of the May 2026 sweep. I4, I6 and I10 need at least two snapshots
 # by construction, so they have no baseline verdict and are not gated; the
 # ordering fix is what corrects I6.
+# ── I11 — declared health implies progress ────────────────────────────────────
+# Every other invariant here asks about consistency. None asks whether the
+# cluster can still do anything. S23 is the case that motivated this: the etcd
+# NOSPACE alarm arms, all six nodes stay Ready, quorum holds, reads keep being
+# served, every write is refused — and I1-I10 report a healthy cluster, because
+# by their definitions it is one.
+#
+# The violation is NOT "a write failed". During a genuine quorum split a refused
+# write is CORRECT, and an invariant that fired there would be measuring
+# unavailability rather than the thing worth naming. What this catches is the
+# CONTRADICTION: every health signal the cluster publishes about itself is
+# green, and it still cannot commit.
+#
+# Green means all of: every Node in the control-plane view is Ready=True; the
+# healthy etcd member count is a strict majority of the expected members; and at
+# least one API server still answers reads. If reads fail too, this observer has
+# lost the cluster — a lost vantage point, not a liveness violation.
+#
+# Scope, stated deliberately: this is CLUSTER-WIDE write liveness. S24 gates one
+# labelled namespace behind a failing admission webhook while everything else
+# commits normally, and I11 correctly reports PRESERVED there. Scoped
+# unavailability is real but is a different property, and S24 measures it with
+# its own Fail/Ignore contrast.
+check_i11() {
+  local violations=() detail=() samples=0 nogreen=0 snap label ts state wp
+  for snap in $(snapshots); do
+    label=$(snap_field "$snap" '.snapshot_label // ""')
+    ts=$(snap_field "$snap" '.timestamp // ""')
+    state=$(jq -r '
+      def ready_n:  [ .control_plane.node_conditions[]?
+                      | select((.conditions[]? | select(.type == "Ready") | .status) == "True") ] | length;
+      def total_n:  (.control_plane.node_conditions // []) | length;
+      # Consensus AVAILABILITY, not member health. These are different things
+      # and conflating them is what made the first version of this check miss
+      # its own positive control. Under S23 every member carries a NOSPACE
+      # alarm, so an error-free count reads 0 of 5 — yet all five report the
+      # same raft leader, consensus is perfectly healthy, and the writes are
+      # refused by a quota policy rather than by an inability to agree. Under
+      # S19 the split leaves 2 members reporting leader 0 while 3 agree on one,
+      # so a majority can still commit and refusing a minority-side write is
+      # correct. A majority reporting a leader is therefore the right test for
+      # "the cluster could commit if it chose to".
+      def leaders:  [ .etcd.member_status[]? | select((.Status.leader // 0) != 0) ] | length;
+      def etcd_ok:  [ .etcd.member_status[]? | select(((.Status.errors // []) | length) == 0) ] | length;
+      def expected: (.etcd.expected_members // 0);
+      (.write_probe // null) as $wp
+      | if ($wp == null) or (($wp | type) != "object") then "nodata"
+        else
+          ((total_n > 0) and (ready_n == total_n))                              as $nodes_green
+          | ((expected == 0) or ((leaders * 2) > expected))                     as $quorum_ok
+          | (if ($wp.any_read_ok // false) then true else false end)            as $reads
+          | (if ($wp.any_write_accepted // false) then true else false end)     as $writes
+          | if ($nodes_green and $quorum_ok and $reads and ($writes | not))
+            then "violation"
+            elif $writes then "ok"
+            else "not_green" end
+        end' "$snap" 2>/dev/null || echo "nodata")
+    case "$state" in
+      nodata) continue ;;
+      violation)
+        samples=$((samples + 1))
+        wp=$(snap_field "$snap" '.write_probe')
+        violations+=("$label")
+        detail+=("$(jq -cn --arg l "$label" --arg t "$ts" --argjson wp "$wp" \
+          '{snapshot: $l, ts: $t,
+            servers_probed: ($wp.servers_probed // 0),
+            any_read_ok: (if ($wp | has("any_read_ok")) then $wp.any_read_ok else null end),
+            any_write_accepted: (if ($wp | has("any_write_accepted")) then $wp.any_write_accepted else null end),
+            errors: [ $wp.attempts[]? | select(.error != null) | {server: .server, error: .error} ]}')") ;;
+      not_green) samples=$((samples + 1)); nogreen=$((nogreen + 1)) ;;
+      *) samples=$((samples + 1)) ;;
+    esac
+  done
+
+  if [ "$samples" -eq 0 ]; then
+    echo '{"invariant": "I11", "name": "declared_health_implies_progress", "verdict": "INSUFFICIENT_DATA", "probe_samples": 0, "note": "No snapshot in this run carries a .write_probe. The run predates the write-liveness canary; I11 cannot be evaluated retrospectively.", "violations": []}'
+  elif [ ${#violations[@]} -eq 0 ]; then
+    echo "{\"invariant\": \"I11\", \"name\": \"declared_health_implies_progress\", \"verdict\": \"PRESERVED\", \"probe_samples\": $samples, \"snapshots_not_green\": $nogreen, \"violations\": []}"
+  else
+    local D
+    D=$(printf '%s\n' "${detail[@]}" | jq -cs .)
+    echo "{\"invariant\": \"I11\", \"name\": \"declared_health_implies_progress\", \"verdict\": \"VIOLATED\", \"violation_count\": ${#violations[@]}, \"probe_samples\": $samples, \"snapshots_not_green\": $nogreen, \"violations\": $D}"
+  fi
+}
+
+# A run that produced no snapshots cannot preserve anything. s24 run_1 in the
+# 20260829 campaign collected zero snapshots after an SSH failure, still recorded
+# run_validity OK, and emitted PRESERVED for I1, I2, I3, I4 and I6 over empty
+# evidence — which flipped s24's I6 scalar from NOT_APPLICABLE to PRESERVED and
+# put a cell into the denominator the report itself declares excluded. An empty
+# violations list is not a passing check when there was nothing to check.
+NO_SNAPSHOTS=0
+if [ -z "$(snapshots)" ]; then NO_SNAPSHOTS=1; fi
+
+blank_if_no_snapshots() {  # $1 = invariant JSON
+  if [ "$NO_SNAPSHOTS" != "1" ]; then printf '%s' "$1"; return; fi
+  printf '%s' "$1" | jq -c '
+    if .verdict == "PRESERVED"
+    then { invariant, name, verdict: "INSUFFICIENT_DATA",
+           note: "this run collected no snapshots, so the invariant had no evidence to evaluate; PRESERVED over an empty violation list would assert a check that never ran",
+           violations: [] }
+    else . end'
+}
+
 CALIBRATION_MODE=1
 CAL_I1=$(check_i1)
 CAL_I2=$(check_i2)
 CAL_I3=$(check_i3)
 CAL_I5=$(check_i5)
 CAL_I9=$(check_i9)
+CAL_I11=$(check_i11)
 CALIBRATION_MODE=0
 
 apply_gate() {
@@ -1448,14 +1623,15 @@ apply_gate() {
 # usable and before finalize().
 resolve_fault_class
 
-I1=$(finalize I1 "$(apply_gate "$(check_i1)" "$CAL_I1")")
-I2=$(finalize I2 "$(apply_gate "$(check_i2)" "$CAL_I2")")
-I3=$(finalize I3 "$(apply_gate "$(check_i3)" "$CAL_I3")")
-I4=$(finalize I4 "$(check_i4)")
-I5=$(finalize I5 "$(apply_gate "$(check_i5)" "$CAL_I5")")
-I6=$(finalize I6 "$(check_i6)")
-I9=$(finalize I9 "$(apply_gate "$(check_i9)" "$CAL_I9")")
-I10=$(finalize I10 "$(check_i10)")
+I1=$(blank_if_no_snapshots "$(finalize I1 "$(apply_gate "$(check_i1)" "$CAL_I1")")")
+I2=$(blank_if_no_snapshots "$(finalize I2 "$(apply_gate "$(check_i2)" "$CAL_I2")")")
+I3=$(blank_if_no_snapshots "$(finalize I3 "$(apply_gate "$(check_i3)" "$CAL_I3")")")
+I4=$(blank_if_no_snapshots "$(finalize I4 "$(check_i4)")")
+I5=$(blank_if_no_snapshots "$(finalize I5 "$(apply_gate "$(check_i5)" "$CAL_I5")")")
+I6=$(blank_if_no_snapshots "$(finalize I6 "$(check_i6)")")
+I9=$(blank_if_no_snapshots "$(finalize I9 "$(apply_gate "$(check_i9)" "$CAL_I9")")")
+I10=$(blank_if_no_snapshots "$(finalize I10 "$(check_i10)")")
+I11=$(blank_if_no_snapshots "$(finalize I11 "$(apply_gate "$(check_i11)" "$CAL_I11")")")
 
 EFFICACY=$(fault_efficacy)
 TIMING=$(divergence_timing "$I1" "$I2" "$I3" "$I4" "$I5" "$I6" "$I9" "$I10")
@@ -1474,9 +1650,10 @@ jq -n \
   --argjson i6 "$I6" \
   --argjson i9 "$I9" \
   --argjson i10 "$I10" \
+  --argjson i11 "$I11" \
   --argjson efficacy "$EFFICACY" \
   --argjson timing "$TIMING" \
-  '[$i1,$i2,$i3,$i4,$i5,$i6,$i9,$i10] as $all |
+  '[$i1,$i2,$i3,$i4,$i5,$i6,$i9,$i10,$i11] as $all |
    {
     scenario_id: $scenario,
     run_id: $run,

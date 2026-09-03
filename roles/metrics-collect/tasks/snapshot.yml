@@ -797,6 +797,82 @@
   ignore_errors: yes
   ignore_unreachable: yes
 
+# ── Write-liveness canary (I11) ───────────────────────────────────────────────
+# Every other observation in this snapshot is a READ. A cluster can answer every
+# read correctly, report every node Ready and hold quorum, and still accept no
+# writes at all — S23 does exactly that: the etcd NOSPACE alarm arms, reads keep
+# being served, all six nodes stay Ready, and every write is refused. Nothing in
+# I1-I10 can express that, because every one of them asks about consistency and
+# none asks about progress.
+#
+# So: attempt one small write against EACH API server directly by IP, bypassing
+# the VIP, and record whether it was accepted. An UPDATE (annotate) rather than
+# a CREATE, deliberately — CREATE is what admission webhooks most often scope
+# themselves to, and this probe is meant to measure whether the cluster can
+# commit at all, not whether one namespace is gated.
+#
+# The canary is created if missing, so the probe is self-healing across a
+# baseline revert. A write that fails because the canary does not exist AND
+# cannot be created is still a failed write, which is the correct reading.
+#
+# read_ok is recorded alongside: "reads work, writes do not" is the signature
+# I11 looks for, and a probe where BOTH fail means the API server is simply
+# unreachable from here, which is not a liveness violation but a lost observer.
+- name: Probe write liveness against each API server
+  shell: |
+    set -u
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    CANARY_NS="default"
+    CANARY_NAME="liveness-canary"
+    TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    OUT=""
+
+    for ep in {{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list | join(' ') }}; do
+      SRV="https://${ep}:6443"
+
+      # Read first: distinguishes "cannot reach this API server" from
+      # "this API server will not accept a write".
+      if kubectl --server="$SRV" --insecure-skip-tls-verify=false \
+           --request-timeout=10s -n "$CANARY_NS" get configmap "$CANARY_NAME" \
+           >/dev/null 2>&1; then
+        READ_OK=true
+      else
+        # It may simply not exist yet. A successful list proves the read path.
+        if kubectl --server="$SRV" --request-timeout=10s -n "$CANARY_NS" \
+             get configmap >/dev/null 2>&1; then READ_OK=true; else READ_OK=false; fi
+      fi
+
+      START=$(date +%s%N)
+      ERR=$(kubectl --server="$SRV" --request-timeout=15s -n "$CANARY_NS" \
+              annotate configmap "$CANARY_NAME" "liveness-probe=$TS" --overwrite 2>&1)
+      RC=$?
+      if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qi "not found"; then
+        ERR=$(kubectl --server="$SRV" --request-timeout=15s -n "$CANARY_NS" \
+                create configmap "$CANARY_NAME" \
+                --from-literal=liveness-probe="$TS" 2>&1)
+        RC=$?
+      fi
+      END=$(date +%s%N)
+      LAT=$(( (END - START) / 1000000 ))
+
+      if [ "$RC" -eq 0 ]; then WRITE_OK=true; ERR=""; else WRITE_OK=false; fi
+
+      OUT="$OUT$(jq -cn --arg s "$ep" --arg srv "$SRV" --argjson w "$WRITE_OK" \
+                       --argjson r "$READ_OK" --argjson l "$LAT" --arg e "$ERR" \
+        '{server: $s, endpoint: $srv, write_accepted: $w, read_ok: $r,
+          latency_ms: $l, error: (if $e == "" then null else ($e | .[0:400]) end)}'),"
+    done
+
+    printf '%s' "{\"canary\": \"$CANARY_NS/$CANARY_NAME\", \"probe_source\": \"in_cluster\", \"ts\": \"$TS\", \"attempts\": [${OUT%,}]}" \
+      | jq -c '. + { any_write_accepted: ([.attempts[] | select(.write_accepted)] | length > 0),
+                     any_read_ok:        ([.attempts[] | select(.read_ok)] | length > 0),
+                     servers_probed:     (.attempts | length) }'
+  register: write_probe
+  delegate_to: "{{ metrics_cp_host | default(groups['control_plane'][1]) }}"
+  run_once: true
+  ignore_errors: yes
+  ignore_unreachable: yes
+
 # ── Assemble and write snapshot ───────────────────────────────────────────────
 
 - name: Reset per-node accumulator before assembling this snapshot
@@ -883,6 +959,7 @@
         "nodes": {{ node_snapshots | to_json }},
         "observers": [ {{ observer_views | default([]) | reject('equalto', '') | join(', ') }} ],
         "external_probe": {{ service_probe.stdout | default('null', true) }},
+        "write_probe": {{ write_probe.stdout | default('null', true) }},
         "informer": {{ informer_view.stdout | default('null', true) }}
       }
   delegate_to: "{{ groups['observer'][0] }}"
