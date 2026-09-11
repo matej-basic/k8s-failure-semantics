@@ -95,6 +95,35 @@ while IFS= read -r h; do VMS+=("$h"); done < <(
 vm_ip()   { awk -v h="$1" '$1==h{sub(/.*ansible_host=/,""); print $1}' "$INVENTORY"; }
 vm_path() { echo "$VM_FOLDER/$1"; }
 
+# The nodes `kubectl get nodes` must list: every cp* and worker* host. The etcd
+# VMs never join the cluster.
+K8S_COUNT=0
+for _h in "${VMS[@]}"; do case "$_h" in cp*|worker*) K8S_COUNT=$((K8S_COUNT+1)) ;; esac; done
+
+# True if the VM has a snapshot named $SNAP_NAME anywhere in its tree.
+# `snapshot.tree` indents each child two spaces per level, so a snapshot taken
+# on top of another prints as "  NAME" and an exact-line match on the raw
+# output never sees it. Strip the indent, then match the whole name as a fixed
+# string. The tree is read in full before grep sees it, so `grep -q` quitting
+# early cannot SIGPIPE govc and trip pipefail.
+has_snapshot() {
+  local names
+  names="$(govc snapshot.tree -vm "$(vm_path "$1")" 2>/dev/null | sed 's/^[[:space:]]*//')"
+  grep -qxF -- "$SNAP_NAME" <<<"$names"
+}
+
+# Reads `kubectl get nodes --no-headers` on stdin and prints "<ready>/<listed>".
+# Succeeds only if exactly $1 nodes are listed and every one is Ready. Counting
+# the lines that are not Ready is not enough: with the API server down, or
+# kubectl failing, there are no lines at all, and zero not-Ready reads as
+# healthy. A cordoned node ("Ready,SchedulingDisabled") still counts as Ready.
+nodes_ready() {
+  awk -v want="$1" '
+    NF == 0 { next }
+    { n++; split($2, st, ","); if (st[1] == "Ready") r++ }
+    END { printf "%d/%d\n", r, n; exit !(want > 0 && n == want && r == want) }'
+}
+
 log "revert-baseline — $(date '+%Y-%m-%d %H:%M:%S %Z')"
 log "vCenter: $GOVC_URL   folder: $VM_FOLDER   snapshot: $SNAP_NAME"
 
@@ -104,7 +133,7 @@ log "vCenter: $GOVC_URL   folder: $VM_FOLDER   snapshot: $SNAP_NAME"
 sec "1. Checking '$SNAP_NAME' exists on all ${#VMS[@]} VMs"
 missing=()
 for vm in "${VMS[@]}"; do
-  if govc snapshot.tree -vm "$(vm_path "$vm")" 2>/dev/null | grep -qx "$SNAP_NAME"; then
+  if has_snapshot "$vm"; then
     ok "$vm"
   else
     bad "$vm — no snapshot named '$SNAP_NAME'"; missing+=("$vm")
@@ -198,21 +227,23 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
 deadline=$((SECONDS + 600))
 ready=0
+seen="0/0"
 while [ $SECONDS -lt $deadline ]; do
-  not_ready="$(ssh "${SSH_OPTS[@]}" "ansible@$CP1" \
-    'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --no-headers 2>/dev/null | grep -cv " Ready"' 2>/dev/null)"
-  case "${not_ready:-}" in
-    0) ready=1; break ;;
-  esac
+  nodes="$(ssh "${SSH_OPTS[@]}" "ansible@$CP1" \
+    'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --no-headers 2>/dev/null' 2>/dev/null)"
+  if seen="$(printf '%s\n' "$nodes" | nodes_ready "$K8S_COUNT")"; then
+    ready=1; break
+  fi
   sleep 15
 done
 
 if [ "$ready" = 1 ]; then
-  ok "all nodes Ready"
+  ok "all $K8S_COUNT nodes Ready"
   ssh "${SSH_OPTS[@]}" "ansible@$CP1" \
     'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes' 2>/dev/null | sed 's/^/      /'
 else
   warn "nodes did not all become Ready within 10 min — inspect the cluster before running a scenario"
+  log "         last seen: $seen Ready/listed, $K8S_COUNT expected"
   exit 1
 fi
 

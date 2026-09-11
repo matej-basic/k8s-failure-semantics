@@ -102,9 +102,38 @@ while IFS= read -r h; do VMS+=("$h"); done < <(
 ETCD_COUNT=0
 for _h in "${VMS[@]}"; do case "$_h" in etcd*) ETCD_COUNT=$((ETCD_COUNT+1)) ;; esac; done
 
+# The nodes `kubectl get nodes` must list: every cp* and worker* host. The etcd
+# VMs never join the cluster.
+K8S_COUNT=0
+for _h in "${VMS[@]}"; do case "$_h" in cp*|worker*) K8S_COUNT=$((K8S_COUNT+1)) ;; esac; done
+
 vm_ip() { awk -v h="$1" '$1==h{sub(/.*ansible_host=/,""); print $1}' "$INVENTORY"; }
 vm_path() { echo "$VM_FOLDER/$1"; }
 power_state() { govc vm.info "$(vm_path "$1")" 2>/dev/null | sed -n 's/^ *Power state: *//p'; }
+
+# True if the VM has a snapshot named $SNAP_NAME anywhere in its tree.
+# `snapshot.tree` indents each child two spaces per level, so a snapshot taken
+# on top of another prints as "  NAME" and an exact-line match on the raw
+# output never sees it. Strip the indent, then match the whole name as a fixed
+# string. The tree is read in full before grep sees it, so `grep -q` quitting
+# early cannot SIGPIPE govc and trip pipefail.
+has_snapshot() {
+  local names
+  names="$(govc snapshot.tree -vm "$(vm_path "$1")" 2>/dev/null | sed 's/^[[:space:]]*//')"
+  grep -qxF -- "$SNAP_NAME" <<<"$names"
+}
+
+# Reads `kubectl get nodes --no-headers` on stdin and prints "<ready>/<listed>".
+# Succeeds only if exactly $1 nodes are listed and every one is Ready. Counting
+# the lines that are not Ready is not enough: with the API server down, or
+# kubectl failing, there are no lines at all, and zero not-Ready reads as
+# healthy. A cordoned node ("Ready,SchedulingDisabled") still counts as Ready.
+nodes_ready() {
+  awk -v want="$1" '
+    NF == 0 { next }
+    { n++; split($2, st, ","); if (st[1] == "Ready") r++ }
+    END { printf "%d/%d\n", r, n; exit !(want > 0 && n == want && r == want) }'
+}
 
 log "snapshot-baseline — $(date '+%Y-%m-%d %H:%M:%S %Z')"
 log "vCenter: $GOVC_URL   folder: $VM_FOLDER   snapshot: $SNAP_NAME"
@@ -149,10 +178,11 @@ else
       || die "$vm ($ip) unreachable over SSH — refusing to snapshot"
   done
 
-  not_ready="$(ssh "${SSH_OPTS[@]}" "ansible@$CP1" \
-    'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --no-headers 2>/dev/null | grep -cv " Ready"')"
-  [ "${not_ready:-1}" = 0 ] || die "not every node is Ready (${not_ready:-?} not ready) — refusing to snapshot"
-  ok "all nodes Ready"
+  nodes="$(ssh "${SSH_OPTS[@]}" "ansible@$CP1" \
+    'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --no-headers 2>/dev/null')"
+  seen="$(printf '%s\n' "$nodes" | nodes_ready "$K8S_COUNT")" \
+    || die "not every node is Ready ($seen Ready/listed, $K8S_COUNT expected) — refusing to snapshot"
+  ok "all $K8S_COUNT nodes Ready"
 
   ETCD_ENDPOINTS="$(awk '/^etcd_endpoints=/{sub(/^etcd_endpoints=/,""); print; exit}' "$INVENTORY")"
   [ -n "$ETCD_ENDPOINTS" ] || die "etcd_endpoints not found in $INVENTORY"
@@ -174,7 +204,7 @@ fi
 sec "2. Existing '$SNAP_NAME' snapshots"
 existing=()
 for vm in "${VMS[@]}"; do
-  if govc snapshot.tree -vm "$(vm_path "$vm")" 2>/dev/null | grep -qx "$SNAP_NAME"; then
+  if has_snapshot "$vm"; then
     existing+=("$vm")
   fi
 done
