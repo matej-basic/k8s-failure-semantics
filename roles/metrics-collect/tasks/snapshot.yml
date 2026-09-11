@@ -893,15 +893,15 @@
       if [ "$S_RC" -eq 0 ] && [ -n "$SCOPED_LABEL" ]; then
         kubectl --request-timeout=10s -n "$SCOPED_NS" delete configmap "$S_NAME" >/dev/null 2>&1
         S_ERR=$(kubectl --request-timeout=15s -n "$SCOPED_NS" create -f - <<YAML 2>&1
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: $S_NAME
-  labels:
-    ${SCOPED_LABEL%%=*}: "${SCOPED_LABEL#*=}"
-data:
-  liveness-probe: "$TS"
-YAML
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: $S_NAME
+      labels:
+        ${SCOPED_LABEL%%=*}: "${SCOPED_LABEL#*=}"
+    data:
+      liveness-probe: "$TS"
+    YAML
         )
         S_RC=$?
       fi
