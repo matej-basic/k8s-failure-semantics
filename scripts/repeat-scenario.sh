@@ -75,6 +75,9 @@
 #
 #   target := sN        iterations from -n, else the plan, else the default
 #           | sN:K      exactly K iterations of sN
+#           | ID[:K]    any other id matching ^[a-z][a-z0-9-]*$, accepted
+#                       only when scenarios/ID/playbook.yml exists (a suite
+#                       that vendors this script, e.g. e1 or e1-freeze)
 #
 # Options:
 #   -n, --iterations K   iterations for targets that do not carry :K
@@ -98,6 +101,10 @@
 #                        own reset play — S6 has never had a fleet-wide fault
 #                        teardown between its iterations and does not get one
 #                        now unless you ask.
+#       --health-playbook F
+#                        the playbook --health-check runs (default: the
+#                        HEALTH_PLAYBOOK environment variable, else
+#                        playbooks/_health-check.yml)
 #       --no-invariants  do not backfill a missing invariant_report.json
 #       --extra "ARGS"   extra ansible-playbook args, appended verbatim.
 #                        Repeatable. e.g. --extra "-e s22_variant=kubelet"
@@ -126,7 +133,7 @@ set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SWEEP_PLAYBOOK="$REPO_DIR/playbooks/run-all-scenarios.yml"
-HEALTH_PLAYBOOK="$REPO_DIR/playbooks/_health-check.yml"
+HEALTH_PLAYBOOK="${HEALTH_PLAYBOOK:-$REPO_DIR/playbooks/_health-check.yml}"
 GROUP_VARS="$REPO_DIR/inventory/group_vars/all.yml"
 INVENTORY="$REPO_DIR/inventory/hosts.ini"
 HARNESS_VERSION=1
@@ -169,6 +176,7 @@ while [ $# -gt 0 ]; do
     --continue-on-error) STOP_ON_ERROR=0; shift ;;
     --health-check)    HEALTH_CHECK=1; HEALTH_CHECK_EXPLICIT=1; shift ;;
     --no-health-check) HEALTH_CHECK=0; HEALTH_CHECK_EXPLICIT=1; shift ;;
+    --health-playbook) HEALTH_PLAYBOOK="${2:-}"; shift 2 ;;
     --invariants)      BACKFILL_INVARIANTS=1; shift ;;
     --no-invariants)   BACKFILL_INVARIANTS=0; shift ;;
     --extra)           EXTRA_ARGS+=("${2:-}"); shift 2 ;;
@@ -188,17 +196,24 @@ case "$START_AT" in ''|*[!0-9]*) die "--start-at must be a positive integer, got
 [ "$START_AT" -lt 1 ] && die "--start-at must be >= 1"
 
 command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
-[ -f "$SWEEP_PLAYBOOK" ] || die "not a k8s-failure-semantics checkout: $SWEEP_PLAYBOOK missing"
+# Only --plan reads the sweep playbook. Explicit targets need nothing from it,
+# so a suite that vendors this script can run its scenarios before it has one.
+if [ "$USE_PLAN" -eq 1 ]; then
+  [ -f "$SWEEP_PLAYBOOK" ] || die "--plan reads its targets from $SWEEP_PLAYBOOK, which is missing"
+fi
 
 # ── The registered scenario list ─────────────────────────────────────────────
 # Single source of truth is playbooks/run-all-scenarios.yml — CLAUDE.md already
 # requires every new scenario tag to be registered there, so parsing it means
 # the harness can never drift behind the suite. Order is preserved, which
 # matters: S28 mutates etcd membership and is registered last on purpose.
+# A single-word tag is a scenario id unless it is one of Ansible's special
+# tags; add_target then rejects any that is not a scenario.
 registered_scenarios() {
   awk '
-    /^[[:space:]]*tags:[[:space:]]*s[0-9]+[[:space:]]*$/ {
+    /^[[:space:]]*tags:[[:space:]]*[a-z][a-z0-9-]*[[:space:]]*$/ {
       t = $2
+      if (t == "always" || t == "never" || t == "all" || t == "tagged" || t == "untagged") next
       if (!(t in seen)) { seen[t] = 1; order[++n] = t }
     }
     END { for (i = 1; i <= n; i++) print order[i] }
@@ -224,7 +239,7 @@ plan_count_for() {
   awk -v want="$1" '
     /^scenario_repeat_counts:/ { inblock = 1; next }
     inblock && /^[^[:space:]#]/ { inblock = 0 }
-    inblock && /^[[:space:]]+[a-z0-9]+:[[:space:]]*[0-9]+/ {
+    inblock && /^[[:space:]]+[a-z0-9-]+:[[:space:]]*[0-9]+/ {
       key = $1; sub(/:$/, "", key)
       if (key == want) { print $2; exit }
     }
@@ -245,9 +260,18 @@ add_target() {
     *:*) id="${tok%%:*}"; count="${tok##*:}" ;;
     *)   id="$tok";       count="" ;;
   esac
+  # Letters are spelled out: in a UTF-8 locale bash 3.2's [a-z] also matches
+  # upper-case and accented letters.
   case "$id" in
     s[0-9]|s[0-9][0-9]) : ;;
-    *) die "not a scenario id: '$id' (expected sN, e.g. s2 or s20)" ;;
+    [abcdefghijklmnopqrstuvwxyz]*)
+      case "$id" in
+        *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+          die "not a scenario id: '$id' (expected sN, e.g. s2 or s20, or an id matching ^[a-z][a-z0-9-]*\$)" ;;
+      esac
+      [ -f "$REPO_DIR/scenarios/$id/playbook.yml" ] ||
+        die "not a scenario id: '$id' (expected sN, e.g. s2 or s20, or an id with a scenarios/$id/playbook.yml)" ;;
+    *) die "not a scenario id: '$id' (expected sN, e.g. s2 or s20, or an id matching ^[a-z][a-z0-9-]*\$)" ;;
   esac
   [ -d "$REPO_DIR/scenarios/$id" ] || die "no such scenario: scenarios/$id"
 
@@ -334,6 +358,20 @@ i=0
 while [ $i -lt ${#SC_IDS[@]} ]; do
   printf '    %-4s N=%-3s unit=%s\n' \
     "${SC_IDS[$i]}" "${SC_COUNTS[$i]}" "$(iter_playbook_rel "${SC_IDS[$i]}")"
+  i=$(( i + 1 ))
+done
+
+# The health check runs between iterations, so a missing playbook would only
+# surface after the first one. Refuse now if any scenario will need it (the
+# same rule the iteration loop applies below).
+i=0
+while [ $i -lt ${#SC_IDS[@]} ]; do
+  if [ "$START_AT" -lt "${SC_COUNTS[$i]}" ] && [ "$HEALTH_CHECK" -eq 1 ]; then
+    case "$HEALTH_CHECK_EXPLICIT:$(iter_playbook "${SC_IDS[$i]}")" in
+      0:*/run-one.yml) : ;;
+      *) [ -f "$HEALTH_PLAYBOOK" ] || die "health check playbook not found: $HEALTH_PLAYBOOK (--health-playbook, or --no-health-check)" ;;
+    esac
+  fi
   i=$(( i + 1 ))
 done
 
