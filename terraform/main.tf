@@ -140,3 +140,39 @@ module "vms" {
   pod_ipv4_address = "${var.pod_ipv4_prefix}.${each.value.octet}"
   pod_netmask      = var.pod_netmask
 }
+
+# ---------------------------------------------------------------------------
+# The experiment controller (added 2026-10-06 for Paper 2's long campaigns).
+# It runs ansible-playbook against the eleven VMs from inside the lab, so a
+# campaign does not depend on a laptop's VPN staying up. It is deliberately
+# outside local.vm_specs: it is not part of the measured cluster, never takes
+# a fault, and must not appear in the generated inventory (hosts.ini), which
+# both papers' playbooks target. Octet 62, the next free address after etcd5.
+# ---------------------------------------------------------------------------
+
+module "ctl" {
+  source     = "./modules/vm"
+  depends_on = [vsphere_folder.vms]
+
+  vm_name          = "ctl"
+  template_id      = data.vsphere_virtual_machine.ubuntu_template.id
+  guest_id         = data.vsphere_virtual_machine.ubuntu_template.guest_id
+  resource_pool_id = data.vsphere_host.host.resource_pool_id
+  datastore_id     = data.vsphere_datastore.ds.id
+  vm_folder        = var.vm_folder
+
+  num_cpus  = 2
+  memory    = 4096
+  disk_size = 40
+
+  network_id   = data.vsphere_network.mgmt.id
+  ipv4_address = "${var.mgmt_ipv4_prefix}.62"
+  netmask      = var.mgmt_netmask
+  gateway      = var.mgmt_gateway
+  dns_server   = var.dns_server
+  domain       = var.domain
+
+  pod_network_id   = data.vsphere_network.pod.id
+  pod_ipv4_address = "${var.pod_ipv4_prefix}.62"
+  pod_netmask      = var.pod_netmask
+}
