@@ -162,9 +162,13 @@
       # sequential, not concurrent — but scoping the artefact to this run keeps
       # it readable as evidence.
       #
-      # Truncating rather than deleting: the sidecars hold the file open in
-      # append mode, and a delete would leave both of them writing to an
-      # unlinked inode nobody can collect.
+      # The sidecars do not hold either file open. Each record is a separate
+      # shell redirection (roles/k8s-install/files/postgres-stateful.yml,
+      # divergence-writer): `>>` opens divergence.log with O_APPEND, `>` opens
+      # owner.txt with O_TRUNC, one write each, then close, with no fsync.
+      # A delete would therefore not strand a writer; the next record, at most
+      # a second later, recreates the file. Truncation is used because it
+      # leaves the file in place for that second.
       shell: |
         : > {{ nfs_export_path }}/{{ nfs_divergence_log }}
         : > {{ nfs_export_path }}/{{ nfs_owner_file }}
